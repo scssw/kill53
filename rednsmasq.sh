@@ -30,6 +30,22 @@ server=/netflixdnstest8.com/156.229.167.246
 server=/netflixdnstest9.com/156.229.167.246
 server=/cinemax.com/156.229.167.246
 server=/forthethrone.com/156.229.167.246
+# ChatGPT DNS解锁
+server=/openai.com/156.229.167.246
+server=/chatgpt.com/156.229.167.246
+server=/chat.com/156.229.167.246
+server=/oaistatic.com/156.229.167.246
+server=/oaiusercontent.com/156.229.167.246
+server=/chat.comopenai.com.cdn.cloudflare.net/156.229.167.246
+server=/openaiapi-site.azureedge.net/156.229.167.246
+server=/openaicom-api-bdcpf8c6d2e9atf6.z01.azurefd.net/156.229.167.246
+server=/openaicomproductionae4b.blob.core.windows.net/156.229.167.246
+server=/production-openaicom-storage.azureedge.net/156.229.167.246
+server=/byteoversea.com/156.229.167.246
+server=/ibytedtos.com/156.229.167.246
+server=/ipstatp.com/156.229.167.246
+server=/muscdn.com/156.229.167.246
+server=/musical.ly/156.229.167.246
 
 # 迪士尼+ 域名通过解锁 DNS 解析
 server=/disneyplus.com/156.229.167.246
