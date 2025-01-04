@@ -1,5 +1,4 @@
 #!/bin/bash
-clear
 echo "设置你的ROOT密码"
 passwd
 sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
