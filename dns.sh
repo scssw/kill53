@@ -16,6 +16,6 @@ sudo chmod 444 /etc/resolv.conf
 echo "禁用 systemd-resolved 服务 ..."
 sudo systemctl stop systemd-resolved
 sudo systemctl disable systemd-resolved
-
+sudo chattr +i /etc/resolv.conf
 # 完成提示
 echo "DNS 配置已更新，systemd-resolved 服务已禁用。"
