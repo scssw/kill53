@@ -6,10 +6,6 @@ cat <<EOF | sudo tee /etc/dnsmasq.conf > /dev/null
 address=/fast.com/127.0.0.1
 address=/.fast.com/127.0.0.1
 
-# 禁止测速
-address=/fast.com/127.0.0.1
-address=/.fast.com/127.0.0.1
-
 # Netflix 专用 DNS
 server=/netflix.ca/5.231.70.121
 server=/netflix.com/5.231.70.121
@@ -40,6 +36,13 @@ server=/disneyplus.com/5.231.70.121
 server=/dssott.com/5.231.70.121
 server=/bamgrid.com/5.231.70.121
 server=/akamaized.net/5.231.70.121
+
+# Gemini DNS解锁
+server=/gemini.google.com/5.231.70.121
+server=/proactivebackend-pa.googleapis.com/5.231.70.121
+server=/alkalimakersuite-pa.clients6.google.com/5.231.70.121
+server=/aistudio.google.com/5.231.70.121
+server=/generativelanguage.googleapis.com/5.231.70.121
 
 # 其他域名通过 Google DNS 解析
 server=8.8.8.8
