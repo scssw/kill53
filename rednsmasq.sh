@@ -38,11 +38,11 @@ server=/bamgrid.com/107.173.39.53
 server=/akamaized.net/107.173.39.53
 
 # Gemini DNS解锁
-server=/gemini.google.com/107.173.39.53
-server=/proactivebackend-pa.googleapis.com/107.173.39.53
-server=/alkalimakersuite-pa.clients6.google.com/107.173.39.53
-server=/aistudio.google.com/107.173.39.53
-server=/generativelanguage.googleapis.com/107.173.39.53
+server=/gemini.google.com/142.171.209.200
+server=/proactivebackend-pa.googleapis.com/142.171.209.200
+server=/alkalimakersuite-pa.clients6.google.com/142.171.209.200
+server=/aistudio.google.com/142.171.209.200
+server=/generativelanguage.googleapis.com/142.171.209.200
 
 # 其他域名通过 Google DNS 解析
 server=8.8.8.8
