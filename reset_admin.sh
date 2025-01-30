@@ -12,7 +12,7 @@ reset_password() {
         echo "正在重置systemd安装的H UI密码..."
         export HUI_DATA="/usr/local/h-ui/"
         reset_output=$("${HUI_DATA}h-ui" reset)
-        echo "$reset_output"
+        echo -e "\033[33m${reset_output}\033[0m"
     fi
 
     # 检查Docker安装方式
@@ -23,7 +23,7 @@ reset_password() {
         fi
         echo "正在重置Docker安装的H UI密码..."
         reset_output=$(docker exec h-ui ./h-ui reset)
-        echo "$reset_output"
+        echo -e "\033[33m${reset_output}\033[0m"
     fi
 
     # 如果都没有安装
