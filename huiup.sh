@@ -32,14 +32,27 @@ get_latest_version() {
   echo "$latest_version"
 }
 
+check_version_exists() {
+  local version=$1
+  local exists=$(curl -sL https://api.github.com/repos/scssw/h-ui/releases/tags/${version} | grep '"message":' | grep -q "Not Found" && echo "false" || echo "true")
+  [[ "$exists" == "false" ]] && { echo_content red "版本 ${version} 不存在"; exit 1; }
+}
+
 upgrade_h_ui() {
   check_sys
   current_version=$(/usr/local/h-ui/h-ui -v | awk '{print $3}')
-  latest_version=$(get_latest_version)
+  
+  # 检查是否指定了版本
+  if [[ -n "$1" ]]; then
+    target_version="$1"
+    check_version_exists "$target_version"
+  else
+    target_version=$(get_latest_version)
+  fi
 
-  [[ "$latest_version" == "$current_version" ]] && { echo_content skyBlue "当前已是最新版本: ${current_version}"; exit 0; }
+  [[ "$target_version" == "$current_version" ]] && { echo_content skyBlue "当前已是最新版本: ${current_version}"; exit 0; }
 
-  echo_content green "正在升级 H UI (${current_version} -> ${latest_version})"
+  echo_content green "正在升级 H UI (${current_version} -> ${target_version})"
   
   systemctl stop h-ui || { echo_content red "停止服务失败"; exit 1; }
 
@@ -49,7 +62,7 @@ upgrade_h_ui() {
     *)       echo_content red "不支持的架构"; exit 1 ;;
   esac
 
-  download_url="https://github.com/scssw/h-ui/releases/download/${latest_version}/h-ui-linux-${arch_name}"
+  download_url="https://github.com/scssw/h-ui/releases/download/${target_version}/h-ui-linux-${arch_name}"
   if ! curl -fsSL "$download_url" -o "/usr/local/h-ui/h-ui"; then
     echo_content red "下载失败: $download_url"
     exit 1
@@ -63,7 +76,7 @@ upgrade_h_ui() {
 
 main() {
   init_var
-  upgrade_h_ui
+  upgrade_h_ui "$1"
 }
 
-main
+main "$1"
