@@ -42,9 +42,9 @@ upgrade_h_ui() {
   check_sys
   current_version=$(/usr/local/h-ui/h-ui -v | awk '{print $3}')
   
-  # 检查是否指定了版本
-  if [[ -n "$1" ]]; then
-    target_version="$1"
+  # 检查是否通过环境变量指定了版本
+  if [[ -n "$HUI_VERSION" ]]; then
+    target_version="$HUI_VERSION"
     check_version_exists "$target_version"
   else
     target_version=$(get_latest_version)
@@ -76,7 +76,7 @@ upgrade_h_ui() {
 
 main() {
   init_var
-  upgrade_h_ui "$1"
+  upgrade_h_ui
 }
 
-main "$1"
+main
