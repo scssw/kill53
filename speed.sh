@@ -26,35 +26,51 @@ fi
 
 # 网络接口名称（请根据实际情况修改）
 IFACE="eth0"
-# 限速值，单位 Mbps
-LIMIT=80
+# 下载限速值，单位 Mbps
+DOWNLOAD_LIMIT=80
+# 上传限速值，单位 Mbps
+UPLOAD_LIMIT=20
 
 # systemd 单元文件路径
 UNIT_FILE="/etc/systemd/system/limit_tc.service"
 
 # 以下部分为 systemd 调用接口（支持 start|stop|status 参数）
 if [ "$1" == "start" ]; then
-    echo "设置 $IFACE 限速为 ${LIMIT} Mbps..."
+    echo "设置 $IFACE 限速：下载 ${DOWNLOAD_LIMIT} Mbps，上传 ${UPLOAD_LIMIT} Mbps..."
+    # 清除已有规则
     tc qdisc del dev "$IFACE" root 2>/dev/null
-    tc qdisc add dev "$IFACE" root tbf rate ${LIMIT}mbit burst 32kbit latency 400ms
+    tc qdisc del dev "$IFACE" ingress 2>/dev/null
+    
+    # 设置下载限速（出站流量）
+    tc qdisc add dev "$IFACE" root handle 1: htb default 10
+    tc class add dev "$IFACE" parent 1: classid 1:1 htb rate ${DOWNLOAD_LIMIT}mbit ceil ${DOWNLOAD_LIMIT}mbit
+    tc class add dev "$IFACE" parent 1:1 classid 1:10 htb rate ${DOWNLOAD_LIMIT}mbit ceil ${DOWNLOAD_LIMIT}mbit
+    
+    # 设置上传限速（入站流量）
+    tc qdisc add dev "$IFACE" ingress
+    tc filter add dev "$IFACE" parent ffff: protocol ip u32 match u32 0 0 police rate ${UPLOAD_LIMIT}mbit burst 10k drop flowid :1
+    
     exit 0
 fi
 
 if [ "$1" == "stop" ]; then
     echo "取消 $IFACE 限速..."
     tc qdisc del dev "$IFACE" root 2>/dev/null
+    tc qdisc del dev "$IFACE" ingress 2>/dev/null
     exit 0
 fi
 
 if [ "$1" == "status" ]; then
-    echo "当前 $IFACE 限速配置："
-    tc qdisc show dev "$IFACE"
+    echo "当前 $IFACE 出站（下载）限速配置："
+    tc -s qdisc show dev "$IFACE"
+    echo "当前 $IFACE 入站（上传）限速配置："
+    tc -s qdisc show dev "$IFACE" ingress
     exit 0
 fi
 
 # 交互式菜单
 echo "请选择一个选项："
-echo "1. 设置限速并启用开机自启动 (限速 ${LIMIT} Mbps)"
+echo "1. 设置限速并启用开机自启动 (下载限速 ${DOWNLOAD_LIMIT} Mbps，上传限速 ${UPLOAD_LIMIT} Mbps)"
 echo "2. 取消限速并关闭开机自启动"
 echo "3. 查看当前限速配置"
 read -p "输入选项编号: " OPTION
