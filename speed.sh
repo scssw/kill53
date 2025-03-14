@@ -3,19 +3,16 @@
 # 本脚本用于设置/取消限速，并自动配置/取消开机自启动，无需手动保存到指定位置。
 # 请根据实际情况修改 IFACE 为您使用的网络接口名称。
 
-# 默认保存路径，当脚本非从本地文件运行时，会自动保存到此路径供 systemd 使用
+# 默认保存路径（用于 process substitution 运行时自动保存）
 DEFAULT_SCRIPT_PATH="/usr/local/bin/speed.sh"
 
-# 自动获取当前脚本的绝对路径
-SCRIPT_PATH=$(readlink -f "$0")
-
-# 如果 SCRIPT_PATH 中包含 "pipe:"（说明脚本是通过 process substitution 运行），则自动保存到 DEFAULT_SCRIPT_PATH
-if [[ "$SCRIPT_PATH" == *"pipe:"* ]]; then
+# 判断脚本是否以文件形式运行
+if [ ! -f "$0" ]; then
+    # $0 不存在表示是以管道方式运行
     SCRIPT_PATH="$DEFAULT_SCRIPT_PATH"
     if [ ! -f "$SCRIPT_PATH" ]; then
-        echo "当前脚本是临时运行模式，正在自动保存到 $SCRIPT_PATH ..."
-        # 重新下载保存脚本内容到指定位置
-        curl -sSL https://raw.githubusercontent.com/scssw/kill53/refs/heads/main/speed.sh -o "$SCRIPT_PATH"
+        echo "当前脚本以临时方式运行，正在自动保存到 $SCRIPT_PATH ..."
+        curl -sSL "https://raw.githubusercontent.com/scssw/kill53/refs/heads/main/speed.sh" -o "$SCRIPT_PATH"
         if [ $? -ne 0 ]; then
             echo "保存脚本到 $SCRIPT_PATH 失败，请检查网络连接及权限。"
             exit 1
@@ -23,6 +20,8 @@ if [[ "$SCRIPT_PATH" == *"pipe:"* ]]; then
         chmod +x "$SCRIPT_PATH"
         echo "脚本已保存到 $SCRIPT_PATH"
     fi
+else
+    SCRIPT_PATH=$(readlink -f "$0")
 fi
 
 # 网络接口名称（请根据实际情况修改）
@@ -53,7 +52,7 @@ if [ "$1" == "status" ]; then
     exit 0
 fi
 
-# 如果没有参数，则进入交互式菜单
+# 交互式菜单
 echo "请选择一个选项："
 echo "1. 设置限速并启用开机自启动 (限速 ${LIMIT} Mbps)"
 echo "2. 取消限速并关闭开机自启动"
