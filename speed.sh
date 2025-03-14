@@ -43,12 +43,13 @@ if [ "$1" == "start" ]; then
     
     # 设置下载限速（出站流量）
     tc qdisc add dev "$IFACE" root handle 1: htb default 10
-    tc class add dev "$IFACE" parent 1: classid 1:1 htb rate ${DOWNLOAD_LIMIT}mbit ceil ${DOWNLOAD_LIMIT}mbit
-    tc class add dev "$IFACE" parent 1:1 classid 1:10 htb rate ${DOWNLOAD_LIMIT}mbit ceil ${DOWNLOAD_LIMIT}mbit
+    tc class add dev "$IFACE" parent 1: classid 1:1 htb rate ${DOWNLOAD_LIMIT}mbit ceil ${DOWNLOAD_LIMIT}mbit burst 15k cburst 15k
+    tc class add dev "$IFACE" parent 1:1 classid 1:10 htb rate ${DOWNLOAD_LIMIT}mbit ceil ${DOWNLOAD_LIMIT}mbit burst 15k cburst 15k
+    tc qdisc add dev "$IFACE" parent 1:10 handle 10: sfq perturb 10 quantum 1514
     
     # 设置上传限速（入站流量）
     tc qdisc add dev "$IFACE" ingress
-    tc filter add dev "$IFACE" parent ffff: protocol ip u32 match u32 0 0 police rate ${UPLOAD_LIMIT}mbit burst 10k drop flowid :1
+    tc filter add dev "$IFACE" parent ffff: protocol ip u32 match u32 0 0 police rate ${UPLOAD_LIMIT}mbit burst 20k drop flowid :1
     
     exit 0
 fi
