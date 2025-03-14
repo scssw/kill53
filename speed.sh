@@ -2,8 +2,24 @@
 # speed.sh
 # 本脚本用于设置/取消限速，并自动配置/取消开机自启动
 
+# 自动检测主要网络接口
+get_main_interface() {
+    # 尝试通过默认路由获取主要网络接口
+    MAIN_IF=$(ip route | grep default | awk '{print $5}' | head -n1)
+    if [ -z "$MAIN_IF" ]; then
+        # 如果通过默认路由无法获取，则获取第一个启用的网络接口（排除lo）
+        MAIN_IF=$(ip link show | grep "state UP" | grep -v "lo:" | head -n1 | awk -F: '{print $2}' | tr -d ' ')
+    fi
+    echo "$MAIN_IF"
+}
+
 # 网络接口名称
-IFACE="eth0"
+IFACE=$(get_main_interface)
+if [ -z "$IFACE" ]; then
+    echo "错误：无法检测到可用的网络接口"
+    exit 1
+fi
+
 # 限速值，单位 Mbps
 LIMIT=80
 
