@@ -85,14 +85,15 @@ configure_compatibility() {
     # 确保 iptables 已安装
     apt install -y iptables
     
-    # 创建兼容性配置
-    cat > /etc/modprobe.d/blacklist-nft.conf << EOF
-blacklist nf_tables
-blacklist nfnetlink
-EOF
+    # 卸载可能冲突的模块
+    modprobe -r nf_tables
+    modprobe -r nfnetlink
     
-    # 更新 initramfs
-    update-initramfs -u
+    # 加载必要的模块
+    modprobe nf_nat
+    modprobe nf_conntrack
+    modprobe iptable_nat
+    modprobe iptable_filter
     
     # 确保 legacy 版本的 iptables 可用
     update-alternatives --set iptables /usr/sbin/iptables-legacy
@@ -140,8 +141,15 @@ EOF
     systemctl enable iptables
     systemctl start iptables
     
+    # 修改 nftables 配置，调整优先级
+    if [ -f "$RULES_FILE" ]; then
+        sed -i 's/priority -100/priority 0/' "$RULES_FILE"
+        sed -i 's/priority 100/priority 200/' "$RULES_FILE"
+        nft -f "$RULES_FILE"
+    fi
+    
     echo -e "${GREEN}兼容性配置完成！${NC}"
-    echo -e "${WHITE}请重启系统以使配置生效。${NC}"
+    echo -e "${WHITE}nftables 和 iptables 现在可以同时运行了。${NC}"
 }
 
 # 修改 add_forward_rule 函数
@@ -172,7 +180,7 @@ table ip forward2jp {
     }
 
     chain postrouting {
-        type nat hook postrouting priority 100;
+        type nat hook postrouting priority 200;
     }
 }
 EOF
@@ -186,7 +194,7 @@ EOF
 
     # 确保 postrouting 链中有对应的 masquerade 规则
     if ! grep -q "ip daddr ${target_ip} masquerade" "$TEMP_RULES"; then
-        sed -i "/type nat hook postrouting priority 100;/a\\        ip daddr ${target_ip} masquerade" "$TEMP_RULES"
+        sed -i "/type nat hook postrouting priority 200;/a\\        ip daddr ${target_ip} masquerade" "$TEMP_RULES"
     fi
 
     # 测试新配置是否有效
@@ -427,6 +435,44 @@ uninstall_nftables() {
     echo -e "${GREEN}nftables 已卸载！${NC}"
 }
 
+# 添加启用 nftables 函数
+enable_nftables() {
+    echo -e "${WHITE}正在启用 nftables...${NC}"
+    
+    # 启动 nftables 服务
+    systemctl start nftables
+    systemctl enable nftables
+    
+    # 检查是否有配置文件
+    if [ -f "$RULES_FILE" ]; then
+        echo -e "${WHITE}正在加载现有规则...${NC}"
+        nft -f "$RULES_FILE"
+    else
+        echo -e "${WHITE}创建基础配置...${NC}"
+        cat > "$RULES_FILE" << EOF
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table ip forward2jp {
+    chain prerouting {
+        type nat hook prerouting priority 0;
+        # 确保 SSH 端口可访问
+        tcp dport 22 accept
+        udp dport 22 accept
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority 100;
+    }
+}
+EOF
+        nft -f "$RULES_FILE"
+    fi
+    
+    echo -e "${GREEN}nftables 已启用！${NC}"
+}
+
 # 修改主菜单
 main_menu() {
     while true; do
@@ -441,10 +487,11 @@ main_menu() {
         echo -e "${BLUE}│${NC}  ${WHITE}5${NC}. 配置与iptables兼容性                ${BLUE}│${NC}"
         echo -e "${BLUE}│${NC}  ${WHITE}6${NC}. 停用 nftables                       ${BLUE}│${NC}"
         echo -e "${BLUE}│${NC}  ${WHITE}7${NC}. 卸载 nftables                       ${BLUE}│${NC}"
+        echo -e "${BLUE}│${NC}  ${WHITE}8${NC}. 启用 nftables                       ${BLUE}│${NC}"
         echo -e "${BLUE}│${NC}  ${WHITE}0${NC}. 退出程序                            ${BLUE}│${NC}"
         echo -e "${BLUE}└────────────────────────────────────────┘${NC}"
         echo
-        echo -n -e "${CYAN}请选择操作 [0-7]${NC}: "
+        echo -n -e "${CYAN}请选择操作 [0-8]${NC}: "
         read -r choice
 
         case $choice in
@@ -506,6 +553,19 @@ main_menu() {
                     uninstall_nftables
                 else
                     echo "已取消卸载操作"
+                fi
+                echo -e "\n${WHITE}按回车键返回主菜单...${NC}"
+                read -r
+                ;;
+            8)
+                clear_screen
+                echo -e "${CYAN}=== 启用 nftables ===${NC}\n"
+                echo -n "确定要启用 nftables 吗？(y/n): "
+                read -r confirm
+                if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+                    enable_nftables
+                else
+                    echo "已取消启用操作"
                 fi
                 echo -e "\n${WHITE}按回车键返回主菜单...${NC}"
                 read -r
