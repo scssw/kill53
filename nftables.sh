@@ -85,11 +85,24 @@ configure_compatibility() {
     # 确保 iptables 已安装
     apt install -y iptables
     
+    # 停止 nftables 服务
+    echo -e "${WHITE}正在停止 nftables 服务...${NC}"
+    systemctl stop nftables
+    systemctl disable nftables
+    
+    # 清空 nftables 规则
+    nft flush ruleset
+    
+    # 等待服务完全停止
+    sleep 2
+    
     # 卸载可能冲突的模块
+    echo -e "${WHITE}正在卸载冲突模块...${NC}"
     modprobe -r nf_tables
     modprobe -r nfnetlink
     
     # 加载必要的模块
+    echo -e "${WHITE}正在加载必要模块...${NC}"
     modprobe nf_nat
     modprobe nf_conntrack
     modprobe iptable_nat
@@ -141,15 +154,18 @@ EOF
     systemctl enable iptables
     systemctl start iptables
     
-    # 修改 nftables 配置，调整优先级
-    if [ -f "$RULES_FILE" ]; then
-        sed -i 's/priority -100/priority 0/' "$RULES_FILE"
-        sed -i 's/priority 100/priority 200/' "$RULES_FILE"
-        nft -f "$RULES_FILE"
+    # 配置 UFW
+    echo -e "${WHITE}配置 UFW 设置...${NC}"
+    if [ -f "/etc/default/ufw" ]; then
+        sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
     fi
     
+    # 启用 UFW
+    echo "正在启用 UFW..."
+    ufw --force enable
+    
     echo -e "${GREEN}兼容性配置完成！${NC}"
-    echo -e "${WHITE}nftables 和 iptables 现在可以同时运行了。${NC}"
+    echo -e "${WHITE}UFW 和 iptables 现在可以同时运行了。${NC}"
 }
 
 # 修改 add_forward_rule 函数
@@ -164,49 +180,45 @@ add_forward_rule() {
     read -r target_port
     echo -e "${BLUE}----------------------------------------${NC}"
 
-    # 如果配置文件不存在，创建基础配置
-    if [ ! -f "$RULES_FILE" ] || ! grep -q "table ip forward2jp" "$RULES_FILE"; then
-        cat > "$RULES_FILE" << EOF
-#!/usr/sbin/nft -f
-
-flush ruleset
-
-table ip forward2jp {
-    chain prerouting {
-        type nat hook prerouting priority 0;
-        # 确保 SSH 端口可访问
-        tcp dport 22 accept
-        udp dport 22 accept
-    }
-
-    chain postrouting {
-        type nat hook postrouting priority 200;
-    }
-}
-EOF
-    fi
-
-    # 创建临时文件
-    cp "$RULES_FILE" "$TEMP_RULES"
-
-    # 在 prerouting 链的末尾添加新规则
-    sed -i "/type nat hook prerouting priority 0;/a\\        tcp dport ${local_port} dnat to ${target_ip}:${target_port}\\n        udp dport ${local_port} dnat to ${target_ip}:${target_port}" "$TEMP_RULES"
-
-    # 确保 postrouting 链中有对应的 masquerade 规则
-    if ! grep -q "ip daddr ${target_ip} masquerade" "$TEMP_RULES"; then
-        sed -i "/type nat hook postrouting priority 200;/a\\        ip daddr ${target_ip} masquerade" "$TEMP_RULES"
-    fi
-
-    # 测试新配置是否有效
-    if nft -c -f "$TEMP_RULES"; then
-        mv "$TEMP_RULES" "$RULES_FILE"
-        nft -f "$RULES_FILE"
-        echo -e "${GREEN}转发规则添加成功！${NC}"
+    # 检查是否是端口范围
+    if [[ $local_port == *"-"* ]] && [[ $target_port == *"-"* ]]; then
+        # 提取端口范围的起始和结束值
+        local_start=$(echo $local_port | cut -d'-' -f1)
+        local_end=$(echo $local_port | cut -d'-' -f2)
+        target_start=$(echo $target_port | cut -d'-' -f1)
+        target_end=$(echo $target_port | cut -d'-' -f2)
+        
+        # 计算端口范围
+        local_range=$((local_end - local_start))
+        target_range=$((target_end - target_start))
+        
+        if [ $local_range -ne $target_range ]; then
+            echo -e "${RED}错误：本地端口范围和目标端口范围必须相同！${NC}"
+            return 1
+        fi
+        
+        # 添加端口范围规则
+        echo -e "${WHITE}正在添加 iptables 规则...${NC}"
+        for ((i=0; i<=$local_range; i++)); do
+            current_local=$((local_start + i))
+            current_target=$((target_start + i))
+            iptables -t nat -A PREROUTING -p tcp --dport $current_local -j DNAT --to-destination ${target_ip}:$current_target
+            iptables -t nat -A PREROUTING -p udp --dport $current_local -j DNAT --to-destination ${target_ip}:$current_target
+        done
     else
-        echo -e "${RED}转发规则添加失败！配置无效${NC}"
-        rm -f "$TEMP_RULES"
-        return 1
+        # 单个端口转发
+        echo -e "${WHITE}正在添加 iptables 规则...${NC}"
+        iptables -t nat -A PREROUTING -p tcp --dport ${local_port} -j DNAT --to-destination ${target_ip}:${target_port}
+        iptables -t nat -A PREROUTING -p udp --dport ${local_port} -j DNAT --to-destination ${target_ip}:${target_port}
     fi
+    
+    # 添加 MASQUERADE 规则
+    iptables -t nat -A POSTROUTING -d ${target_ip} -j MASQUERADE
+    
+    # 保存规则
+    iptables-save > /etc/iptables.rules
+    
+    echo -e "${GREEN}转发规则添加成功！${NC}"
 }
 
 # 修改 delete_rules 函数
@@ -231,35 +243,25 @@ delete_rules() {
             read -r rule_number
             if [[ "$rule_number" =~ ^[0-9]+$ ]]; then
                 # 获取要删除的规则信息
-                rule_info=$(nft list table ip forward2jp | grep 'dnat to' | grep 'tcp' | sed -n "${rule_number}p")
+                rule_info=$(iptables -t nat -L PREROUTING | grep DNAT | sed -n "${rule_number}p")
                 if [ -n "$rule_info" ]; then
                     # 从规则信息中提取端口和IP
-                    local_port=$(echo "$rule_info" | awk '{for(i=1;i<=NF;i++) if($i=="dport") print $(i+1)}' | tr -d ',')
-                    target_info=$(echo "$rule_info" | awk '{for(i=1;i<=NF;i++) if($i=="to") print $(i+1)}')
+                    local_port=$(echo "$rule_info" | awk '{for(i=1;i<=NF;i++) if($i=="dpt:") print $(i+1)}')
+                    target_info=$(echo "$rule_info" | awk '{for(i=1;i<=NF;i++) if($i=="to:") print $(i+1)}')
                     
-                    # 创建临时文件
-                    cp "$RULES_FILE" "$TEMP_RULES"
-                    
-                    # 删除指定的规则（TCP和UDP）
-                    sed -i "/tcp dport ${local_port} dnat to ${target_info}/d" "$TEMP_RULES"
-                    sed -i "/udp dport ${local_port} dnat to ${target_info}/d" "$TEMP_RULES"
+                    # 删除规则
+                    iptables -t nat -D PREROUTING -p tcp --dport ${local_port} -j DNAT --to-destination ${target_info}
+                    iptables -t nat -D PREROUTING -p udp --dport ${local_port} -j DNAT --to-destination ${target_info}
                     
                     # 检查是否还有其他使用相同目标IP的规则
                     target_ip=$(echo "$target_info" | cut -d: -f1)
-                    if ! grep -q "dnat to.*${target_ip}" "$TEMP_RULES"; then
-                        # 如果没有，删除对应的 masquerade 规则
-                        sed -i "/ip daddr ${target_ip} masquerade/d" "$TEMP_RULES"
+                    if ! iptables -t nat -L PREROUTING | grep -q "to:${target_ip}"; then
+                        iptables -t nat -D POSTROUTING -d ${target_ip} -j MASQUERADE
                     fi
                     
-                    # 应用新配置
-                    if nft -c -f "$TEMP_RULES"; then
-                        mv "$TEMP_RULES" "$RULES_FILE"
-                        nft -f "$RULES_FILE"
-                        echo -e "${GREEN}规则删除成功！${NC}"
-                    else
-                        echo -e "${RED}规则删除失败！配置无效${NC}"
-                        rm -f "$TEMP_RULES"
-                    fi
+                    # 保存规则
+                    iptables-save > /etc/iptables.rules
+                    echo -e "${GREEN}规则删除成功！${NC}"
                 else
                     echo -e "${RED}未找到指定序号的规则${NC}"
                 fi
@@ -271,15 +273,11 @@ delete_rules() {
             echo -n "确定要删除所有转发规则吗？(y/n): "
             read -r confirm
             if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-                # 删除 nftables 规则
-                if nft list tables | grep -q "forward2jp"; then
-                    nft flush table ip forward2jp
-                    nft delete table ip forward2jp
-                    rm -f "$RULES_FILE"
-                    echo -e "${GREEN}所有转发规则已删除！${NC}"
-                else
-                    echo -e "${WHITE}没有找到任何 nftables 规则${NC}"
-                fi
+                # 清空 NAT 规则
+                iptables -t nat -F PREROUTING
+                iptables -t nat -F POSTROUTING
+                iptables-save > /etc/iptables.rules
+                echo -e "${GREEN}所有转发规则已删除！${NC}"
             else
                 echo "取消删除操作"
             fi
@@ -313,27 +311,22 @@ check_ufw_status() {
 # 修改 show_rules 函数
 show_rules() {
     echo -e "${BLUE}----------------------------------------${NC}"
-    if nft list ruleset | grep -q "table ip forward2jp"; then
-        echo -e "${WHITE}当前转发规则：${NC}"
-        nft list table ip forward2jp | grep 'dnat to' | grep 'tcp' | awk '
-        {
-            for(i=1; i<=NF; i++) {
-                if($i == "dport") local_port = $(i+1)
-                if($i == "to") {
-                    split($(i+1), dest, ":")
-                    target_ip = dest[1]
-                    target_port = dest[2]
-                }
+    echo -e "${WHITE}当前转发规则：${NC}"
+    iptables -t nat -L PREROUTING | grep DNAT | awk '
+    {
+        for(i=1; i<=NF; i++) {
+            if($i == "dpt:") local_port = $(i+1)
+            if($i == "to:") {
+                split($(i+1), dest, ":")
+                target_ip = dest[1]
+                target_port = dest[2]
             }
-            if(local_port && target_ip && target_port) {
-                gsub(/,/, "", local_port)
-                printf "%d. 本地端口: %s, 目标IP: %s, 目标端口: %s\n", 
-                    NR, local_port, target_ip, target_port
-            }
-        }'
-    else
-        echo -e "  ${WHITE}当前没有配置任何转发规则${NC}"
-    fi
+        }
+        if(local_port && target_ip && target_port) {
+            printf "%d. 本地端口: %s, 目标IP: %s, 目标端口: %s\n", 
+                NR, local_port, target_ip, target_port
+        }
+    }'
     echo -e "${BLUE}----------------------------------------${NC}"
 }
 
