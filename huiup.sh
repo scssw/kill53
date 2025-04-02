@@ -27,14 +27,14 @@ check_sys() {
 }
 
 get_latest_version() {
-  latest_version=$(curl -sL https://api.github.com/repos/scssw/huiup/releases/latest | grep '"tag_name":' | cut -d'"' -f4)
+  latest_version=$(curl -sL https://api.github.com/repos/scssw/uiup/releases/latest | grep '"tag_name":' | cut -d'"' -f4)
   [[ -z "$latest_version" ]] && { echo_content red "无法获取最新版本号"; exit 1; }
   echo "$latest_version"
 }
 
 check_version_exists() {
   local version=$1
-  local exists=$(curl -sL https://api.github.com/repos/scssw/huiup/releases/tags/${version} | grep '"message":' | grep -q "Not Found" && echo "false" || echo "true")
+  local exists=$(curl -sL https://api.github.com/repos/scssw/uiup/releases/tags/${version} | grep '"message":' | grep -q "Not Found" && echo "false" || echo "true")
   [[ "$exists" == "false" ]] && { echo_content red "版本 ${version} 不存在"; exit 1; }
 }
 
@@ -62,7 +62,7 @@ upgrade_h_ui() {
     *)       echo_content red "不支持的架构"; exit 1 ;;
   esac
 
-  download_url="https://github.com/scssw/huiup/releases/download/${target_version}/h-ui-linux-${arch_name}"
+  download_url="https://github.com/scssw/uiup/releases/download/${target_version}/h-ui-linux-${arch_name}"
   if ! curl -fsSL "$download_url" -o "/usr/local/h-ui/h-ui"; then
     echo_content red "下载失败: $download_url"
     exit 1
