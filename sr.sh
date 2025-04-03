@@ -361,9 +361,12 @@ sed -i "s/sspanelv2/mudbjson/g" /usr/local/shadowsocksr/userapiconfig.py
 sed -i "s/UPDATE_TIME = 60/UPDATE_TIME = 10/g" /usr/local/shadowsocksr/userapiconfig.py
 sed -i "s/SERVER_PUB_ADDR = '${nowip}'/SERVER_PUB_ADDR = '$(wget -qO- -t1 -T2 ipinfo.io/ip)'/" /usr/local/shadowsocksr/userapiconfig.py
 
-# 直接获取IP并写入文件（移除交互式输入）
-ipname=$(wget -qO- -t1 -T2 ipinfo.io/ip)
-echo "$ipname" > /usr/local/shadowsocksr/myip.txt
+# 添加域名检测逻辑
+if [ ! -f /usr/local/shadowsocksr/myip.txt ] || ! grep -qE '^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,6}$' /usr/local/shadowsocksr/myip.txt; then
+    ipname=$(wget -qO- -t1 -T2 ipinfo.io/ip)
+    echo "$ipname" > /usr/local/shadowsocksr/myip.txt
+fi
+
 
 # 删除开发模式相关代码
 if [[ -e /etc/sysconfig/iptables-config ]];then
