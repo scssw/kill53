@@ -206,6 +206,8 @@ if [ -e /usr/local/bin/ssr ];then
         rm -rf /usr/local/shadowsocksr
         echo "删除:${PWD}/install.sh"
         rm -f ${PWD}/install.sh
+        echo "删除:${PWD}/sr.sh"
+        rm -f ${PWD}/sr.sh
         echo "清理杂项!"
         crontab -l > ~/crontab.bak 1>/dev/null 2>&1
         sed -i "/timelimit.sh/d" ~/crontab.bak 1>/dev/null 2>&1
