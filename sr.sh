@@ -206,8 +206,6 @@ if [ -e /usr/local/bin/ssr ];then
         rm -rf /usr/local/shadowsocksr
         echo "删除:${PWD}/install.sh"
         rm -f ${PWD}/install.sh
-        echo "删除:${PWD}/sr.sh"
-        rm -f ${PWD}/sr.sh
         echo "清理杂项!"
         crontab -l > ~/crontab.bak 1>/dev/null 2>&1
         sed -i "/timelimit.sh/d" ~/crontab.bak 1>/dev/null 2>&1
@@ -362,56 +360,19 @@ nowip=$(grep -E -o "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]
 sed -i "s/sspanelv2/mudbjson/g" /usr/local/shadowsocksr/userapiconfig.py
 sed -i "s/UPDATE_TIME = 60/UPDATE_TIME = 10/g" /usr/local/shadowsocksr/userapiconfig.py
 sed -i "s/SERVER_PUB_ADDR = '${nowip}'/SERVER_PUB_ADDR = '$(wget -qO- -t1 -T2 ipinfo.io/ip)'/" /usr/local/shadowsocksr/userapiconfig.py
-#INstall Success
-read -t 20 -p "输入与您主机绑定的域名(请在20秒内输入，超时将哈哈哈跳过本步骤.默认填入本机IP): " ipname
-if [[ -z ${ipname} ]];then
-    ipname=$(wget -qO- -t1 -T2 ipinfo.io/ip)
-fi
+
+# 直接获取IP并写入文件（移除交互式输入）
+ipname=$(wget -qO- -t1 -T2 ipinfo.io/ip)
 echo "$ipname" > /usr/local/shadowsocksr/myip.txt
-if [[ $1 == develop ]];then
-    if [[ -e /usr/local/SSR-Bash-Python/check.log ]];then
-        cd /usr/local/SSR-Bash-Python
-        read -n 1 -t 3 -p "你是否想要重新配置服务器巡检配置（注意，这将会清空你的日志）[Y/N]" yn
-        if [[ $yn == [Yy] ]];then
-            bash servercheck.sh reconf
-            nohup bash servercheck.sh run 2>/dev/null &
-        else
-            bash servercheck.sh stop
-            nohup bash servercheck.sh run 2>/dev/null &
-            echo "服务已重启"
-        fi
-    else
-        read -t 10 -p "是否设置服务器自检，实验型功能！[Y/N]" yn
-        if [[ $yn == [yY] ]];then
-            cd /usr/local/SSR-Bash-Python
-            bash servercheck.sh conf
-            nohup bash servercheck.sh run 2>/dev/null &
-            PID=$(ps -ef |grep -v grep | grep "bash" | grep "servercheck.sh" | grep "run" | awk '{print $2}')
-            if [[ -z ${PID} ]];then
-                echo "程序启动失败,请联系作者"
-            fi
-        else
-            echo "你居然拒绝了T.T"
-        fi
-    fi
-    checkcron=$(crontab -l 2>/dev/null | grep "timelimit.sh")
-    if [[ -z ${checkcron} ]];then
-        crontab -l > ~/crontab.bak 1>/dev/null 2>&1
-        sed -i "/timelimit.sh/d" ~/crontab.tmp 1>/dev/null 2>&1
-        echo -e "\n*/5 * * * * /bin/bash /usr/local/SSR-Bash-Python/timelimit.sh c" >> ~/crontab.bak
-        crontab ~/crontab.bak
-        rm -r ~/crontab.bak 
-    fi
-fi
+
+# 删除开发模式相关代码
 if [[ -e /etc/sysconfig/iptables-config ]];then
-        ipconf=$(cat /etc/sysconfig/iptables-config | grep 'IPTABLES_MODULES_UNLOAD="no"')
-        if [[ -z ${ipconf} ]];then
-                sed -i 's/IPTABLES_MODULES_UNLOAD="yes"/IPTABLES_MODULES_UNLOAD="no"/g' /etc/sysconfig/iptables-config
-                echo "安装完成，跳过重启"
-                sleep 1s
-         
-        fi
+    ipconf=$(cat /etc/sysconfig/iptables-config | grep 'IPTABLES_MODULES_UNLOAD="no"')
+    if [[ -z ${ipconf} ]];then
+        sed -i 's/IPTABLES_MODULES_UNLOAD="yes"/IPTABLES_MODULES_UNLOAD="no"/g' /etc/sysconfig/iptables-config
+    fi
 fi
+
 bash /usr/local/SSR-Bash-Python/self-check.sh
 echo '安装完成！输入 ssr 即可使用本程序~'
 if [[ ${check} != "yes" ]] ;then
