@@ -128,9 +128,13 @@ analyze_route() {
     echo "✅ 检测到使用了电信 CN2 GT 线路"
     route_info_quality_route="${route_info_quality_route} CN2-GT"
   fi
-  if grep -qE 'softbank|IIJ' "$trace_output"; then
-    echo "✅ 检测到软银/IIJ优质线路"
-    route_info_quality_route="${route_info_quality_route} 软银/IIJ"
+  if grep -qE 'IIJ\.Net|58\.138\.' "$trace_output"; then
+    echo "✅ 检测到IIJ优质线路"
+    route_info_quality_route="${route_info_quality_route} IIJ"
+  fi
+  if grep -qE '210\.173\.173\.|softbank' "$trace_output"; then
+    echo "✅ 检测到软银优质线路"
+    route_info_quality_route="${route_info_quality_route} 软银"
   fi
   
   # 存储路由信息用于总结
