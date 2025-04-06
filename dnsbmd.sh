@@ -36,14 +36,45 @@ add_whitelist() {
         return
     fi
     
-    # 添加允许规则
-    iptables -A INPUT -s $ip_address/32 -p tcp -m tcp --dport 53 -j ACCEPT
-    iptables -A INPUT -s $ip_address/32 -p udp -m udp --dport 53 -j ACCEPT
+    # 确保DROP规则存在，这样我们可以在它们之前插入白名单规则
+    # 先检查是否已有阻止规则，如果没有则添加
+    tcp_drop_exists=false
+    udp_drop_exists=false
     
-    # 检查是否已有阻止规则，如果没有则添加
-    if ! iptables -C INPUT -p tcp -m state --state NEW -m tcp --dport 53 -j DROP 2>/dev/null; then
+    if iptables -C INPUT -p tcp -m state --state NEW -m tcp --dport 53 -j DROP 2>/dev/null; then
+        tcp_drop_exists=true
+    fi
+    
+    if iptables -C INPUT -p udp -m state --state NEW -m udp --dport 53 -j DROP 2>/dev/null; then
+        udp_drop_exists=true
+    fi
+    
+    # 如果DROP规则不存在，先添加它们
+    if ! $tcp_drop_exists; then
         iptables -A INPUT -p tcp -m state --state NEW -m tcp --dport 53 -j DROP
+    fi
+    
+    if ! $udp_drop_exists; then
         iptables -A INPUT -p udp -m state --state NEW -m udp --dport 53 -j DROP
+    fi
+    
+    # 获取DROP规则的位置
+    tcp_rule_num=$(iptables -L INPUT --line-numbers | grep "tcp dpt:53" | grep "DROP" | awk '{print $1}' | head -n 1)
+    udp_rule_num=$(iptables -L INPUT --line-numbers | grep "udp dpt:53" | grep "DROP" | awk '{print $1}' | head -n 1)
+    
+    # 在DROP规则之前插入白名单规则
+    if [ -n "$tcp_rule_num" ]; then
+        iptables -I INPUT $tcp_rule_num -s $ip_address/32 -p tcp -m tcp --dport 53 -j ACCEPT
+    else
+        # 如果找不到DROP规则位置，使用-I插入到链的开头
+        iptables -I INPUT 1 -s $ip_address/32 -p tcp -m tcp --dport 53 -j ACCEPT
+    fi
+    
+    if [ -n "$udp_rule_num" ]; then
+        iptables -I INPUT $udp_rule_num -s $ip_address/32 -p udp -m udp --dport 53 -j ACCEPT
+    else
+        # 如果找不到DROP规则位置，使用-I插入到链的开头
+        iptables -I INPUT 1 -s $ip_address/32 -p udp -m udp --dport 53 -j ACCEPT
     fi
     
     echo "IP地址 $ip_address 已添加到白名单"
@@ -87,12 +118,30 @@ remove_whitelist() {
     # 获取选择的IP地址
     selected_ip=${ip_list[$((ip_number-1))]}
     
-    # 删除规则
-    iptables -D INPUT -s $selected_ip/32 -p tcp -m tcp --dport 53 -j ACCEPT
-    iptables -D INPUT -s $selected_ip/32 -p udp -m udp --dport 53 -j ACCEPT
+    # 删除规则并检查是否成功
+    if iptables -C INPUT -s $selected_ip/32 -p tcp -m tcp --dport 53 -j ACCEPT 2>/dev/null; then
+        iptables -D INPUT -s $selected_ip/32 -p tcp -m tcp --dport 53 -j ACCEPT
+        tcp_success=$?
+    else
+        echo "警告: TCP规则不存在，无法删除"
+        tcp_success=1
+    fi
     
-    echo "IP地址 $selected_ip 已从白名单中删除"
-    save_rules
+    if iptables -C INPUT -s $selected_ip/32 -p udp -m udp --dport 53 -j ACCEPT 2>/dev/null; then
+        iptables -D INPUT -s $selected_ip/32 -p udp -m udp --dport 53 -j ACCEPT
+        udp_success=$?
+    else
+        echo "警告: UDP规则不存在，无法删除"
+        udp_success=1
+    fi
+    
+    # 只有当至少一个规则成功删除时才保存规则
+    if [ $tcp_success -eq 0 ] || [ $udp_success -eq 0 ]; then
+        echo "IP地址 $selected_ip 已从白名单中删除"
+        save_rules
+    else
+        echo "错误: 无法删除IP地址 $selected_ip，可能已被其他方式移除"
+    fi
 }
 
 # 获取白名单IP列表的函数
@@ -120,10 +169,15 @@ view_whitelist() {
     fi
     
     # 检查是否有阻止规则（同时检查TCP和UDP规则）
-    tcp_drop_exists=$(iptables-save | grep -E "^-A INPUT.*-p tcp.*--dport 53.*-j DROP" | wc -l)
-    udp_drop_exists=$(iptables-save | grep -E "^-A INPUT.*-p udp.*--dport 53.*-j DROP" | wc -l)
+    # 使用更灵活的方式检测DROP规则，适应不同系统的iptables输出格式
+    tcp_drop_exists=$(iptables-save | grep "INPUT" | grep "tcp" | grep "dport 53" | grep "DROP" | wc -l)
+    udp_drop_exists=$(iptables-save | grep "INPUT" | grep "udp" | grep "dport 53" | grep "DROP" | wc -l)
     
-    if [ "$tcp_drop_exists" -gt 0 ] || [ "$udp_drop_exists" -gt 0 ]; then
+    # 也可以直接检查iptables规则
+    tcp_drop_direct=$(iptables -L INPUT -n | grep "tcp dpt:53" | grep "DROP" | wc -l)
+    udp_drop_direct=$(iptables -L INPUT -n | grep "udp dpt:53" | grep "DROP" | wc -l)
+    
+    if [ "$tcp_drop_exists" -gt 0 ] || [ "$udp_drop_exists" -gt 0 ] || [ "$tcp_drop_direct" -gt 0 ] || [ "$udp_drop_direct" -gt 0 ]; then
         echo "53端口当前状态: 仅允许白名单IP访问"
     else
         echo "53端口当前状态: 允许所有IP访问"
@@ -151,6 +205,11 @@ manage_port() {
             2)
                 # 添加阻止规则（如果不存在）
                 if ! iptables -C INPUT -p tcp -m state --state NEW -m tcp --dport 53 -j DROP 2>/dev/null; then
+                    # 先删除可能存在的旧规则
+                    iptables -D INPUT -p tcp -m state --state NEW -m tcp --dport 53 -j DROP 2>/dev/null
+                    iptables -D INPUT -p udp -m state --state NEW -m udp --dport 53 -j DROP 2>/dev/null
+                    
+                    # 重新添加DROP规则，确保它们在所有白名单规则之后
                     iptables -A INPUT -p tcp -m state --state NEW -m tcp --dport 53 -j DROP
                     iptables -A INPUT -p udp -m state --state NEW -m udp --dport 53 -j DROP
                     echo "53端口已禁用，仅允许白名单IP访问"
@@ -172,7 +231,7 @@ manage_port() {
 # 主菜单
 main_menu() {
     while true; do
-        echo "==== 流媒体解锁IP管理 ===="
+        echo "==== 流媒体解锁IP白名单管理 ===="
         echo "1. 添加IP白名单"
         echo "2. 删除IP白名单"
         echo "3. 查看IP白名单"
