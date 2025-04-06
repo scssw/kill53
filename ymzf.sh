@@ -251,29 +251,34 @@ else
     fi
 fi
 
-# 获取当前转发规则中的IP
-try_get_current_ip() {
-    current_ip=$(iptables -t nat -vnL PREROUTING 2>/dev/null | grep "${local_port}" | grep "dpt:${local_port//:/}" | head -n 1 | awk -F "to:" '{print $2}' | cut -d: -f1)
-    return $?
+# 获取当前转发规则中的IP和端口
+try_get_current_rules() {
+    # 获取所有匹配的规则
+    current_rules=$(iptables -t nat -vnL PREROUTING 2>/dev/null | grep -E "dpt:${local_port//:/}.*to:.*:${forwarding_port//:/}")
+    if [[ -z "${current_rules}" ]]; then
+        return 1
+    fi
+    # 提取第一条规则的IP
+    current_ip=$(echo "${current_rules}" | head -n 1 | awk -F "to:" '{print $2}' | cut -d: -f1)
+    return 0
 }
 
-# 尝试执行iptables命令
-if ! try_get_current_ip; then
-    echo "[警告] 执行iptables命令失败，可能是权限不足或规则不存在"
-    # 检查是否以root权限运行
-    if [ "$(id -u)" != "0" ]; then
-        echo "[错误] 此脚本需要root权限运行，请使用sudo或切换到root用户"
-        exit 1
-    fi
-fi
-
-if [[ -z "${current_ip}" ]]; then
-    echo "[警告] 未找到与端口 ${local_port} 相关的转发规则"
-    echo "[信息] 将尝试创建新的转发规则而不是更新现有规则"
-    # 继续执行，但将使用新IP创建规则而不是更新
+# 尝试获取当前规则
+if ! try_get_current_rules; then
+    echo "[信息] 未找到完全匹配的转发规则，将创建新规则"
     create_new_rule=true
+    # 删除所有可能存在的部分匹配规则
+    echo "[信息] 清理可能存在的旧规则..."
+    iptables -t nat -F PREROUTING
+    iptables -t nat -F POSTROUTING
 else
-    create_new_rule=false
+    if [[ "${current_ip}" == "${new_ip}" ]]; then
+        echo "[信息] 已存在完全相同的转发规则，无需更新"
+        exit 0
+    else
+        echo "[信息] 发现IP变化，将更新规则"
+        create_new_rule=false
+    fi
 fi
 
 # 安全执行iptables命令的函数
@@ -307,63 +312,66 @@ save_iptables_rules() {
     return 0
 }
 
-# 如果需要创建新规则或IP变化了，更新规则
-if [[ "${create_new_rule}" == "true" || "${current_ip}" != "${new_ip}" ]]; then
-    if [[ "${create_new_rule}" == "true" ]]; then
-        echo "[信息] 正在为域名 ${forwarding_domain} 创建新的转发规则，IP: ${new_ip}"
-    else
-        echo "[信息] 域名 ${forwarding_domain} 的IP已变化: ${current_ip} -> ${new_ip}"
-        
-        # 删除旧规则 - 使用端口和IP匹配，避免删除其他域名的规则
-        echo "[信息] 正在删除旧的转发规则..."
-        prerouting_rules=$(iptables -t nat -vnL PREROUTING --line-numbers 2>/dev/null | grep "${current_ip}" | grep "dpt:${local_port//:/}" | awk '{print $1}' | sort -r)
-        if [[ ! -z "${prerouting_rules}" ]]; then
-            for rule_num in $prerouting_rules; do
-                if ! execute_iptables iptables -t nat -D PREROUTING $rule_num; then
-                    echo "[警告] 删除PREROUTING规则 $rule_num 失败，继续处理其他规则"
-                fi
-            done
-        else
-            echo "[警告] 未找到匹配的PREROUTING规则，可能已被删除"
-        fi
-        
-        postrouting_rules=$(iptables -t nat -vnL POSTROUTING --line-numbers 2>/dev/null | grep "${current_ip}" | grep "dpt:${forwarding_port_1//:/}" | awk '{print $1}' | sort -r)
-        if [[ ! -z "${postrouting_rules}" ]]; then
-            for rule_num in $postrouting_rules; do
-                if ! execute_iptables iptables -t nat -D POSTROUTING $rule_num; then
-                    echo "[警告] 删除POSTROUTING规则 $rule_num 失败，继续处理其他规则"
-                fi
-            done
-        else
-            echo "[警告] 未找到匹配的POSTROUTING规则，可能已被删除"
-        fi
-    fi
+# 如果需要创建新规则，更新规则
+if [[ "${create_new_rule}" == "true" ]]; then
+    echo "[信息] 正在为域名 ${forwarding_domain} 创建新的转发规则，IP: ${new_ip}"
+else
+    echo "[信息] 域名 ${forwarding_domain} 的IP已变化: ${current_ip} -> ${new_ip}"
+    # 清空所有转发规则
+    echo "[信息] 正在清空所有转发规则..."
+    iptables -t nat -F PREROUTING
+    iptables -t nat -F POSTROUTING
+    echo "[信息] 已清空所有转发规则"
+fi
     
     # 添加新规则
     echo "[信息] 正在添加新的转发规则..."
     success=true
     
-    if [[ "${forwarding_type}" == "TCP" || "${forwarding_type}" == "TCP+UDP" ]]; then
-        if ! execute_iptables iptables -t nat -A PREROUTING -p tcp --dport ${local_port} -j DNAT --to-destination ${new_ip}:${forwarding_port}; then
-            echo "[错误] 添加TCP PREROUTING规则失败"
-            success=false
-        fi
+    # 检查规则是否已存在
+    check_rule_exists() {
+        local proto=$1
+        local port=$2
+        local ip=$3
+        local target_port=$4
         
-        if ! execute_iptables iptables -t nat -A POSTROUTING -p tcp -d ${new_ip} --dport ${forwarding_port_1} -j SNAT --to-source ${local_ip}; then
-            echo "[错误] 添加TCP POSTROUTING规则失败"
-            success=false
+        # 检查PREROUTING规则
+        if iptables -t nat -vnL PREROUTING 2>/dev/null | grep -qE "dpt:${port//:/}.*to:${ip}:${target_port}"; then
+            return 0  # 规则已存在
+        fi
+        return 1  # 规则不存在
+    }
+
+    # 添加规则前先检查是否已存在
+    if [[ "${forwarding_type}" == "TCP" || "${forwarding_type}" == "TCP+UDP" ]]; then
+        if ! check_rule_exists "tcp" "${local_port}" "${new_ip}" "${forwarding_port}"; then
+            if ! execute_iptables iptables -t nat -A PREROUTING -p tcp --dport ${local_port} -j DNAT --to-destination ${new_ip}:${forwarding_port}; then
+                echo "[错误] 添加TCP PREROUTING规则失败"
+                success=false
+            fi
+            
+            if ! execute_iptables iptables -t nat -A POSTROUTING -p tcp -d ${new_ip} --dport ${forwarding_port_1} -j SNAT --to-source ${local_ip}; then
+                echo "[错误] 添加TCP POSTROUTING规则失败"
+                success=false
+            fi
+        else
+            echo "[信息] TCP规则已存在，跳过添加"
         fi
     fi
-    
+
     if [[ "${forwarding_type}" == "UDP" || "${forwarding_type}" == "TCP+UDP" ]]; then
-        if ! execute_iptables iptables -t nat -A PREROUTING -p udp --dport ${local_port} -j DNAT --to-destination ${new_ip}:${forwarding_port}; then
-            echo "[错误] 添加UDP PREROUTING规则失败"
-            success=false
-        fi
-        
-        if ! execute_iptables iptables -t nat -A POSTROUTING -p udp -d ${new_ip} --dport ${forwarding_port_1} -j SNAT --to-source ${local_ip}; then
-            echo "[错误] 添加UDP POSTROUTING规则失败"
-            success=false
+        if ! check_rule_exists "udp" "${local_port}" "${new_ip}" "${forwarding_port}"; then
+            if ! execute_iptables iptables -t nat -A PREROUTING -p udp --dport ${local_port} -j DNAT --to-destination ${new_ip}:${forwarding_port}; then
+                echo "[错误] 添加UDP PREROUTING规则失败"
+                success=false
+            fi
+            
+            if ! execute_iptables iptables -t nat -A POSTROUTING -p udp -d ${new_ip} --dport ${forwarding_port_1} -j SNAT --to-source ${local_ip}; then
+                echo "[错误] 添加UDP POSTROUTING规则失败"
+                success=false
+            fi
+        else
+            echo "[信息] UDP规则已存在，跳过添加"
         fi
     fi
     
@@ -618,10 +626,18 @@ Set_iptables(){
 		chmod +x /etc/network/if-pre-up.d/iptables
 	fi
 }
+Update_Shell(){
+	sh_new_ver=$(wget --no-check-certificate -qO- -t1 -T3 "https://raw.githubusercontent.com/ToyoDAdoubiBackup/doubi/master/iptables-pf.sh"|grep 'sh_ver="'|awk -F "=" '{print $NF}'|sed 's/\"//g'|head -1)
+	[[ -z ${sh_new_ver} ]] && echo -e "${Error} 无法链接到 Github !" && exit 0
+	wget -N --no-check-certificate "https://raw.githubusercontent.com/ToyoDAdoubiBackup/doubi/master/iptables-pf.sh" && chmod +x iptables-pf.sh
+	echo -e "脚本已更新为最新版本[ ${sh_new_ver} ] !(注意：因为更新方式为直接覆盖当前运行的脚本，所以可能下面会提示一些报错，无视即可)" && exit 0
+}
 # 修改主菜单部分
 check_sys
 while true; do
-    echo && echo -e " ${Cyan_font_prefix}--Sun_^的端口转发--${Font_color_suffix}
+    echo && echo -e " ${Cyan_font_prefix}----Sun_^的端口转发----${Font_color_suffix}
+
+ ${Green_font_prefix}0.${Font_color_suffix} 升级脚本
 ————————————————
  ${Green_font_prefix}1.${Font_color_suffix} 安装iptables
  ${Green_font_prefix}2.${Font_color_suffix} 清空端口转发
