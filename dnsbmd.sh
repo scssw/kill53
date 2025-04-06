@@ -99,12 +99,12 @@ remove_whitelist() {
 
 # 获取白名单IP列表的函数
 get_whitelist_ips() {
-    # 使用iptables-save获取规则，使用更基础的命令组合来提取IP地址
-    iptables-save | grep "INPUT" | grep "\-\-dport 53" | grep "ACCEPT" | grep -o "\-s [0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}/32" | awk '{print $2}' | sed 's|/32||g' | sort | uniq
-    
-    # 如果上面的方法失败，尝试从保存的规则文件中读取
-    if [ $? -ne 0 ] && [ -f "/etc/iptables.up.rules" ]; then
-        grep "INPUT" /etc/iptables.up.rules | grep "\-\-dport 53" | grep "ACCEPT" | grep -o "\-s [0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}/32" | awk '{print $2}' | sed 's|/32||g' | sort | uniq
+    if [ -f "/etc/iptables.up.rules" ]; then
+        # 直接从规则文件中读取并提取IP地址
+        cat /etc/iptables.up.rules | grep "INPUT" | grep "dport 53" | grep "ACCEPT" | awk '{for(i=1;i<=NF;i++) if($i=="-s") print $(i+1)}' | sed 's|/32||g' | sort | uniq
+    else
+        # 如果规则文件不存在，使用iptables-save
+        iptables-save | grep "INPUT" | grep "dport 53" | grep "ACCEPT" | awk '{for(i=1;i<=NF;i++) if($i=="-s") print $(i+1)}' | sed 's|/32||g' | sort | uniq
     fi
 }
 
@@ -121,8 +121,11 @@ view_whitelist() {
         done
     fi
     
-    # 检查是否有阻止规则
-    if iptables -C INPUT -p tcp -m state --state NEW -m tcp --dport 53 -j DROP 2>/dev/null; then
+    # 检查是否有阻止规则（同时检查TCP和UDP规则）
+    tcp_drop_exists=$(iptables-save | grep -E "^-A INPUT.*-p tcp.*--dport 53.*-j DROP" | wc -l)
+    udp_drop_exists=$(iptables-save | grep -E "^-A INPUT.*-p udp.*--dport 53.*-j DROP" | wc -l)
+    
+    if [ "$tcp_drop_exists" -gt 0 ] || [ "$udp_drop_exists" -gt 0 ]; then
         echo "53端口当前状态: 仅允许白名单IP访问"
     else
         echo "53端口当前状态: 允许所有IP访问"
