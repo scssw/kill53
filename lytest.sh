@@ -1,192 +1,160 @@
 #!/bin/bash
 
-# ========= 配置部分 =========
-# 定义目标IP和名称
-target_names="China_Telecom China_Unicom China_Mobile"
-target_China_Telecom="220.167.102.34"
-target_China_Unicom="112.85.238.89"
-target_China_Mobile="120.196.165.24"
-# ===========================
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+BG_BLUE='\033[48;5;42m'
+CYAN='\033[1;36m'  # 亮青色
+NC='\033[0m' # No Color
 
+# 测试目标IP
+declare -A targets=(
+  ["China Telecom"]="220.167.102.34"
+  ["China Unicom"]="112.85.238.89"
+  ["China Mobile"]="120.196.165.24"
+)
+
+# 检查是否安装了必要的工具
 check_dependencies() {
-  for cmd in traceroute whois; do
-    if ! command -v $cmd &>/dev/null; then
-      echo "[!] 正在安装 $cmd..."
-      if [ -f /etc/debian_version ]; then
-        sudo apt-get install -y $cmd
-      elif [ -f /etc/redhat-release ]; then
-        sudo yum install -y $cmd
-      else
-        echo "[!] 无法自动安装，请手动安装 $cmd"
-        exit 1
-      fi
+    if ! command -v traceroute &> /dev/null; then
+        echo -e "${RED}错误: 未安装 traceroute${NC}"
+        echo "正在安装 traceroute..."
+        apt-get update && apt-get install -y traceroute
     fi
-  done
 }
 
-get_as_info() {
-  ip=$1
-  whois $ip 2>/dev/null | grep -Ei 'AS|OrgName|descr|netname' | head -n 1 | sed 's/^/    → /'
-}
-
+# 分析路由结果
 analyze_route() {
-  name=$1
-  ip=$2
-  direct_connect=true
-  previous_as=""
-  # 初始化路由信息
-  route_info_hop_count=0
-  route_info_valid_hops=0
-  route_info_total_latency=0
-  route_info_backbone_route=""
-  route_info_quality_route=""
-  last_hop_number=0
-
-  echo -e "\n==============【$name】=============="
-  echo "目标 IP: $ip"
-  echo "--------------------------------------"
-  
-  # 使用临时文件存储traceroute结果
-  trace_output=$(mktemp)
-  traceroute -n -w 2 -q 3 -m 30 $ip > "$trace_output"
-  
-  # 获取最后一跳的跳数（从最后一行提取）
-  last_line=$(grep -E '^[[:space:]]*[0-9]+' "$trace_output" | tail -n 1)
-  if [[ $last_line =~ ^[[:space:]]*([0-9]+) ]]; then
-    last_hop_number=${BASH_REMATCH[1]}
-  fi
-  
-  while IFS= read -r line; do
-    # 检查是否为跳数行（包含数字开头）
-    if [[ $line =~ ^[[:space:]]*[0-9]+ ]]; then
-      ((route_info_hop_count++))
-      if [[ $line =~ ([0-9]{1,3}\.){3}[0-9]{1,3} ]]; then
-        ((route_info_valid_hops++))
-        hop_ip=$(echo $line | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
-        # 获取所有延迟值
-        latencies=($(echo $line | grep -Eo '[0-9]+\.[0-9]+ ms' | cut -d' ' -f1))
-        
-        # 累加所有延迟值
-        for latency in "${latencies[@]}"; do
-          if [[ -n $latency ]]; then
-            route_info_total_latency=$(echo "${route_info_total_latency} + $latency" | bc)
-          fi
-        done
-        
-        if [[ $hop_ip == 10.* || $hop_ip == 192.168.* || $hop_ip == 172.16.* ]]; then
-          echo "  ${route_info_hop_count}. $hop_ip  [内网地址]"
+    local route_output="$1"
+    local carrier="$2"
+    
+    echo -e "\n${BG_BLUE}[${carrier} 路由分析]${NC}"
+    
+    # 检查是否直连
+    local is_direct=true
+    if echo "$route_output" | grep -q "hk\|jp\|sg\|us\|kr\|tw"; then
+        is_direct=false
+    fi
+    
+    # 检查骨干网类型
+    local backbone=""
+    local is_cn2=false
+    local is_softbank=false
+    local is_iij=false
+    local is_cmi=false
+    
+    # 检测骨干网变换
+    local backbone_changes=()
+    if echo "$route_output" | grep -q "59.43"; then
+        backbone_changes+=("电信CN2")
+        is_cn2=true
+    fi
+    if echo "$route_output" | grep -q "202.97"; then
+        backbone_changes+=("电信163")
+    fi
+    if echo "$route_output" | grep -q "219.158"; then
+        backbone_changes+=("联通169")
+    fi
+    if echo "$route_output" | grep -q "223.120"; then
+        backbone_changes+=("移动CMI")
+        is_cmi=true
+    fi
+    if echo "$route_output" | grep -q "221.111\|210.171.224\|210.171.225\|210.171.226\|210.171.227"; then
+        backbone_changes+=("SoftBank")
+        is_softbank=true
+    fi
+    if echo "$route_output" | grep -q "210.130\|210.131\|210.132\|210.133"; then
+        backbone_changes+=("IIJ")
+        is_iij=true
+    fi
+    
+    # 设置主要骨干网类型
+    if [ ${#backbone_changes[@]} -gt 0 ]; then
+        backbone=${backbone_changes[-1]}
+    fi
+    
+    # 检查延迟
+    local avg_delay=$(echo "$route_output" | grep -o "[0-9]*\.[0-9]* ms" | tail -n 1 | cut -d' ' -f1)
+    
+    # 输出分析结果
+    echo -e "${CYAN}[路由质量分析]${NC}"
+    echo -e "去程是否直连: $([ "$is_direct" = true ] && echo -e "${GREEN}[是]${NC}" || echo -e "${RED}[否]${NC}")"
+    echo -e "骨干网类型: ${YELLOW}[$backbone]${NC}"
+    
+    # 显示骨干网变换
+    if [ ${#backbone_changes[@]} -gt 1 ]; then
+        echo -e "骨干网变换: ${YELLOW}[${backbone_changes[*]}]${NC}"
+    fi
+    
+    # 显示特殊线路
+    if [ "$is_cn2" = true ]; then
+        echo -e "特殊线路: ${GREEN}[CN2]${NC}"
+    fi
+    if [ "$is_softbank" = true ]; then
+        echo -e "特殊线路: ${GREEN}[SoftBank]${NC}"
+    fi
+    if [ "$is_iij" = true ]; then
+        echo -e "特殊线路: ${GREEN}[IIJ]${NC}"
+    fi
+    if [ "$is_cmi" = true ]; then
+        echo -e "特殊线路: ${GREEN}[CMI]${NC}"
+    fi
+    
+    echo -e "平均延迟: ${YELLOW}[$avg_delay ms]${NC}"
+    
+    # 综合评估
+    echo -e "\n${CYAN}[综合评估]${NC}"
+    if [ "$is_direct" = true ] && [ -n "$backbone" ]; then
+        if [ "$is_cn2" = true ] || [ "$is_softbank" = true ] || [ "$is_iij" = true ]; then
+            echo -e "${GREEN}[优质线路]${NC}"
         else
-          as_info=$(get_as_info $hop_ip)
-          current_as=$(echo "$as_info" | grep -Eo 'AS[0-9]+' | head -n1)
-          
-          if [[ $previous_as != "" && $current_as != "" && $current_as != $previous_as ]]; then
-            direct_connect=false
-          fi
-          previous_as=$current_as
-          
-          echo "  ${route_info_hop_count}. $hop_ip"
-          echo "$as_info"
+            echo -e "${YELLOW}[一般线路]${NC}"
         fi
-      fi
+    else
+        echo -e "${RED}[较差线路]${NC}"
     fi
-  done < "$trace_output"
-  
-  # 计算总延迟
-  if [[ ${route_info_valid_hops} -gt 0 ]]; then
-    route_info_total_latency=$(echo "scale=2; ${route_info_total_latency}" | bc)
-  fi
-  
-  echo "--------------------------------------"
-  echo "总延迟: ${route_info_total_latency} ms"
-  
-  # 线路质量分析
-  if [ "$direct_connect" = true ]; then
-    echo "✅ 检测到直连路由"
-    route_info_quality_route="直连"
-  fi
-  
-  if grep -q '219.158' "$trace_output"; then
-    echo "⚠️ 检测到使用了联通 169 骨干网"
-    route_info_backbone_route="${route_info_backbone_route} 联通169"
-  fi
-  if grep -q '202.97' "$trace_output"; then
-    echo "✅ 检测到进入电信 163 骨干网"
-    route_info_backbone_route="${route_info_backbone_route} 电信163"
-  fi
-  if grep -q '59.43' "$trace_output"; then
-    echo "✅ 检测到使用了电信 CN2 优质线路"
-    route_info_quality_route="${route_info_quality_route} CN2"
-  fi
-  if grep -q '223.120' "$trace_output"; then
-    echo "✅ 检测到使用了移动 CMI 线路"
-    route_info_quality_route="${route_info_quality_route} CMI"
-  fi
-  if grep -qE '香港|HK|Singapore|海外' "$trace_output"; then
-    echo "⚠️ 可能绕路至境外"
-  fi
-  if grep -q '202.77' "$trace_output"; then
-    echo "✅ 检测到使用了电信 CN2 GT 线路"
-    route_info_quality_route="${route_info_quality_route} CN2-GT"
-  fi
-  if grep -qE 'IIJ\.Net|58\.138\.' "$trace_output"; then
-    echo "✅ 检测到IIJ优质线路"
-    route_info_quality_route="${route_info_quality_route} IIJ"
-  fi
-  if grep -qE '210\.173\.173\.|softbank' "$trace_output"; then
-    echo "✅ 检测到软银优质线路"
-    route_info_quality_route="${route_info_quality_route} 软银"
-  fi
-  
-  # 存储路由信息用于总结
-  eval "${name//' '/_}_info_hop_count='$route_info_hop_count'"
-  eval "${name//' '/_}_info_total_latency='$route_info_total_latency'"
-  eval "${name//' '/_}_info_backbone_route='$route_info_backbone_route'"
-  eval "${name//' '/_}_info_quality_route='$route_info_quality_route'"
-  
-  rm -f "$trace_output"
+    
+    # 保存结果到数组
+    results+=("$carrier|$backbone|$avg_delay|$is_direct|${backbone_changes[*]}")
 }
 
-# 定义颜色代码
-GREEN="\033[0;32m"
-YELLOW="\033[0;33m"
-NC="\033[0m" # 恢复默认颜色
-
-print_summary() {
-  echo -e "\n============== 路由分析总结 =============="
-  for name in $target_names; do
-    echo -e "\n【${name/_/ }】"
-    eval "hop_count=\"\${${name}_info_hop_count}\""
-    eval "total_latency=\"\${${name}_info_total_latency}\""
-    eval "quality_route=\"\${${name}_info_quality_route}\""
-    eval "backbone_route=\"\${${name}_info_backbone_route}\""
-    
-    echo "总延迟: $total_latency ms"
-    
-    if [[ -n "$quality_route" ]]; then
-      # 为优质线路添加绿色显示
-      echo -e "${GREEN}优质线路: $quality_route${NC}"
-    fi
-    if [[ -n "$backbone_route" ]]; then
-      # 检查骨干网络是否包含两个或更多网络（通过检查空格数量）
-      space_count=$(echo "$backbone_route" | tr -cd ' ' | wc -c)
-      if [[ $space_count -ge 2 ]]; then
-        # 有两个或更多骨干网络，使用黄色显示
-        echo -e "${YELLOW}骨干网络: $backbone_route${NC}"
-      else
-        echo "骨干网络: $backbone_route"
-      fi
-    fi
-  done
-  echo -e "\n======================================"
-}
-
+# 主函数
 main() {
-  check_dependencies
-  for name in $target_names; do
-    target_ip="target_$name"
-    analyze_route "${name/_/ }" "${!target_ip}"
-  done
-  print_summary
+    check_dependencies
+    local results=()
+    
+    echo -e "${GREEN}[开始三网路由检测]${NC}\n"
+    
+    for carrier in "${!targets[@]}"; do
+        ip=${targets[$carrier]}
+        echo -e "${YELLOW}[正在检测 ${carrier} (${ip}) 的路由]${NC}"
+        
+        # 执行traceroute并保存结果
+        route_output=$(traceroute -n -m 30 $ip)
+        echo "$route_output"
+        
+        # 分析路由结果
+        analyze_route "$route_output" "$carrier"
+        echo "----------------------------------------"
+    done
+    
+    # 输出汇总结果
+    echo -e "\n${BG_BLUE}[三网路由检测汇总]${NC}"
+    echo -e "${CYAN}运营商\t\t骨干网\t\t延迟\t\t直连\t\t骨干网变换${NC}"
+    echo "---------------------------------------------------------------------------------"
+    for result in "${results[@]}"; do
+        IFS='|' read -r carrier backbone delay is_direct backbone_changes <<< "$result"
+        # 格式化输出，使用printf确保对齐
+        printf "%-15s %-17s %-16s %-20s %s\n" \
+            "$carrier" \
+            "$backbone" \
+            "$delay ms" \
+            "$([ "$is_direct" = true ] && echo -e "${GREEN}是${NC}" || echo -e "${RED}否${NC}")" \
+            "$backbone_changes"
+    done
 }
 
-main
+# 运行主函数
+main 
