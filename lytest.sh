@@ -147,7 +147,7 @@ main() {
     for result in "${results[@]}"; do
         IFS='|' read -r carrier backbone delay is_direct backbone_changes <<< "$result"
         # 格式化输出，使用printf确保对齐
-        printf "%-15s %-17s %-16s %-23s %s\n" \
+        printf "%-15s %-17s %-16s %-25s %s\n" \
             "$carrier" \
             "$backbone" \
             "$delay ms" \
