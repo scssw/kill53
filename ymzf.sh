@@ -618,18 +618,10 @@ Set_iptables(){
 		chmod +x /etc/network/if-pre-up.d/iptables
 	fi
 }
-Update_Shell(){
-	sh_new_ver=$(wget --no-check-certificate -qO- -t1 -T3 "https://raw.githubusercontent.com/ToyoDAdoubiBackup/doubi/master/iptables-pf.sh"|grep 'sh_ver="'|awk -F "=" '{print $NF}'|sed 's/\"//g'|head -1)
-	[[ -z ${sh_new_ver} ]] && echo -e "${Error} 无法链接到 Github !" && exit 0
-	wget -N --no-check-certificate "https://raw.githubusercontent.com/ToyoDAdoubiBackup/doubi/master/iptables-pf.sh" && chmod +x iptables-pf.sh
-	echo -e "脚本已更新为最新版本[ ${sh_new_ver} ] !(注意：因为更新方式为直接覆盖当前运行的脚本，所以可能下面会提示一些报错，无视即可)" && exit 0
-}
 # 修改主菜单部分
 check_sys
 while true; do
-    echo && echo -e " ${Cyan_font_prefix}----Sun_^的端口转发----${Font_color_suffix}
-
- ${Green_font_prefix}0.${Font_color_suffix} 升级脚本
+    echo && echo -e " ${Cyan_font_prefix}--Sun_^的端口转发--${Font_color_suffix}
 ————————————————
  ${Green_font_prefix}1.${Font_color_suffix} 安装iptables
  ${Green_font_prefix}2.${Font_color_suffix} 清空端口转发
