@@ -1,7 +1,5 @@
 #!/bin/bash
 
-# 流媒体解锁IP白名单管理脚本
-# 用于管理允许访问53端口的IP地址
 
 # 检查是否以root权限运行
 if [ "$(id -u)" -ne 0 ]; then
@@ -174,7 +172,7 @@ manage_port() {
 # 主菜单
 main_menu() {
     while true; do
-        echo "==== 流媒体解锁IP白名单管理 ===="
+        echo "==== 流媒体解锁IP管理 ===="
         echo "1. 添加IP白名单"
         echo "2. 删除IP白名单"
         echo "3. 查看IP白名单"
