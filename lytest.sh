@@ -32,9 +32,32 @@ analyze_route() {
     
     echo -e "\n${BG_BLUE}[${carrier} 路由分析]${NC}"
     
-    # 检查是否直连
+    # 检查是否直连（通过AS归属判断）
     local is_direct=true
-    if echo "$route_output" | grep -q "hk\|jp\|sg\|us\|kr\|tw"; then
+    local current_as=""
+    local previous_as=""
+    
+    # 根据运营商设置对应的AS号
+    case "$carrier" in
+        "China Telecom")
+            current_as="4134|4809|4812|4816|4837|9929"  # 电信AS号
+            ;;
+        "China Unicom")
+            current_as="4837|9929|17621|17622|17623"    # 联通AS号
+            ;;
+        "China Mobile")
+            current_as="9808|58453|58461"               # 移动AS号
+            ;;
+    esac
+    
+    # 检查路由中是否出现其他运营商的AS
+    if echo "$route_output" | grep -q "219.158" && [ "$carrier" != "China Unicom" ]; then
+        is_direct=false
+    fi
+    if echo "$route_output" | grep -q "202.97" && [ "$carrier" != "China Telecom" ]; then
+        is_direct=false
+    fi
+    if echo "$route_output" | grep -q "223.120" && [ "$carrier" != "China Mobile" ]; then
         is_direct=false
     fi
     
@@ -48,7 +71,7 @@ analyze_route() {
     # 检测骨干网变换
     local backbone_changes=()
     
-    # 检测 IIJ 线路（增加更多 IIJ 特征）
+    # 检测 IIJ 线路
     if echo "$route_output" | grep -q "IIJ\.Net\|210.173\|210.130\|210.131\|210.132\|210.133\|58.138"; then
         backbone_changes+=("IIJ")
         is_iij=true
@@ -147,7 +170,7 @@ main() {
     # 输出汇总结果
     echo -e "\n${BG_BLUE}[三网路由检测汇总]${NC}"
     echo -e "${CYAN}运营商\t\t骨干网\t\t延迟\t\t直连\t\t骨干网变换${NC}"
-    echo "----------------------------------------------------------------"
+    echo "-----------------------------------------------------------------------"
     for result in "${results[@]}"; do
         IFS='|' read -r carrier backbone delay is_direct backbone_changes <<< "$result"
         # 格式化输出，使用printf确保对齐
