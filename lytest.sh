@@ -47,6 +47,14 @@ analyze_route() {
     
     # 检测骨干网变换
     local backbone_changes=()
+    
+    # 检测 IIJ 线路（增加更多 IIJ 特征）
+    if echo "$route_output" | grep -q "IIJ\.Net\|210.173\|210.130\|210.131\|210.132\|210.133\|58.138"; then
+        backbone_changes+=("IIJ")
+        is_iij=true
+    fi
+    
+    # 检测其他骨干网
     if echo "$route_output" | grep -q "59.43"; then
         backbone_changes+=("电信CN2")
         is_cn2=true
@@ -64,10 +72,6 @@ analyze_route() {
     if echo "$route_output" | grep -q "221.111\|210.171.224\|210.171.225\|210.171.226\|210.171.227"; then
         backbone_changes+=("SoftBank")
         is_softbank=true
-    fi
-    if echo "$route_output" | grep -q "210.130\|210.131\|210.132\|210.133"; then
-        backbone_changes+=("IIJ")
-        is_iij=true
     fi
     
     # 设置主要骨干网类型
@@ -143,7 +147,7 @@ main() {
     # 输出汇总结果
     echo -e "\n${BG_BLUE}[三网路由检测汇总]${NC}"
     echo -e "${CYAN}运营商\t\t骨干网\t\t延迟\t\t直连\t\t骨干网变换${NC}"
-    echo "---------------------------------------------------------------------------------"
+    echo "----------------------------------------------------------------"
     for result in "${results[@]}"; do
         IFS='|' read -r carrier backbone delay is_direct backbone_changes <<< "$result"
         # 格式化输出，使用printf确保对齐
