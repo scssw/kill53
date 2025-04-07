@@ -636,8 +636,6 @@ Update_Shell(){
 check_sys
 while true; do
     echo && echo -e " ${Cyan_font_prefix}----Sun_^的端口转发----${Font_color_suffix}
-
- ${Green_font_prefix}0.${Font_color_suffix} 升级脚本
 ————————————————
  ${Green_font_prefix}1.${Font_color_suffix} 安装iptables
  ${Green_font_prefix}2.${Font_color_suffix} 清空端口转发
