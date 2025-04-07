@@ -99,13 +99,16 @@ Set_local_port(){
 	echo && echo -e "	本地监听端口 : ${Red_font_prefix}${local_port}${Font_color_suffix}" && echo
 }
 Set_local_ip(){
-	read -e -p "请输入 本服务器的 网卡IP(注意是网卡绑定的IP，而仅仅是公网IP，回车自动检测外网IP):" local_ip
+	read -e -p "请输入 本服务器的 网卡IP(注意是网卡绑定的IP，而不仅仅是公网IP，回车自动检测网卡IP):" local_ip
 	if [[ -z "${local_ip}" ]]; then
-		local_ip=$(wget -qO- -t1 -T2 ipinfo.io/ip)
+		# 尝试使用ifconfig获取物理网卡的IP，排除docker和lo网卡
+		local_ip=$(ifconfig | grep -E "^(eth|enp)" -A 1 | grep "inet " | head -n 1 | awk '{print $2}')
 		if [[ -z "${local_ip}" ]]; then
-			echo "${Error} 无法检测到本服务器的公网IP，请手动输入"
-			read -e -p "请输入 本服务器的 网卡IP(注意是网卡绑定的IP，而仅仅是公网IP):" local_ip
+			echo "${Error} 无法检测到物理网卡IP，请手动输入"
+			read -e -p "请输入 本服务器的 网卡IP(注意是网卡绑定的IP，而不仅仅是公网IP):" local_ip
 			[[ -z "${local_ip}" ]] && echo "取消..." && exit 1
+		else
+			echo -e "${Info} 检测到物理网卡IP: ${local_ip}"
 		fi
 	fi
 	echo && echo -e "	本服务器IP : ${Red_font_prefix}${local_ip}${Font_color_suffix}" && echo
@@ -473,17 +476,13 @@ Uninstall_forwarding(){
 	read -e -p "(默认: n):" unyn
 	[[ -z ${unyn} ]] && unyn="n"
 	if [[ ${unyn} == [Yy] ]]; then
-		forwarding_text=$(iptables -t nat -vnL PREROUTING|tail -n +3)
-		[[ -z ${forwarding_text} ]] && echo -e "${Error} 没有发现 iptables 端口转发规则，请检查 !" && exit 1
-		forwarding_total=$(echo -e "${forwarding_text}"|wc -l)
-		for((integer = 1; integer <= ${forwarding_total}; integer++))
-		do
-			forwarding_type=$(echo -e "${forwarding_text}"|awk '{print $4}'|sed -n "${integer}p")
-			forwarding_listen=$(echo -e "${forwarding_text}"|awk '{print $11}'|sed -n "${integer}p"|awk -F "dpt:" '{print $2}')
-			[[ -z ${forwarding_listen} ]] && forwarding_listen=$(echo -e "${forwarding_text}"| awk '{print $11}'|sed -n "${integer}p"|awk -F "dpts:" '{print $2}')
-			# echo -e "${forwarding_text} ${forwarding_type} ${forwarding_listen}"
-			Del_iptables "${forwarding_type}" "${integer}"
-		done
+		# 清空PREROUTING链
+		iptables -t nat -F PREROUTING
+		# 清空POSTROUTING链
+		iptables -t nat -F POSTROUTING
+		# 清空INPUT链中相关的规则
+		iptables -F INPUT
+		# 保存规则
 		Save_iptables
 		echo && echo -e "${Info} iptables 已清空 所有端口转发规则 !" && echo
 	else
@@ -636,6 +635,7 @@ Update_Shell(){
 check_sys
 while true; do
     echo && echo -e " ${Cyan_font_prefix}----Sun_^的端口转发----${Font_color_suffix}
+
 ————————————————
  ${Green_font_prefix}1.${Font_color_suffix} 安装iptables
  ${Green_font_prefix}2.${Font_color_suffix} 清空端口转发
