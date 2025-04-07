@@ -133,8 +133,8 @@ analyze_route() {
     
     # 综合评估
     echo -e "\n${CYAN}[综合评估]${NC}"
-    if [ "$is_direct" = true ] && [ -n "$backbone" ]; then
-        if [ "$is_cn2" = true ] || [ "$is_softbank" = true ] || [ "$is_iij" = true ]; then
+    if [ -n "$backbone" ]; then
+        if [ "$is_cn2" = true ] || [ "$is_softbank" = true ] || [ "$is_iij" = true ] || [ "$is_cmi" = true ]; then
             echo -e "${GREEN}[优质线路]${NC}"
         else
             echo -e "${YELLOW}[一般线路]${NC}"
@@ -170,7 +170,7 @@ main() {
     # 输出汇总结果
     echo -e "\n${BG_BLUE}[三网路由检测汇总]${NC}"
     echo -e "${CYAN}运营商\t\t骨干网\t\t延迟\t\t直连\t\t骨干网变换${NC}"
-    echo "-----------------------------------------------------------------------"
+    echo "----------------------------------------------------------------"
     for result in "${results[@]}"; do
         IFS='|' read -r carrier backbone delay is_direct backbone_changes <<< "$result"
         # 格式化输出，使用printf确保对齐
