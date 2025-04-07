@@ -67,9 +67,23 @@ analyze_route() {
     local is_softbank=false
     local is_iij=false
     local is_cmi=false
+    local is_gtt=false
+    local is_ntt=false
     
     # 检测骨干网变换
     local backbone_changes=()
+    
+    # 检测 NTT 线路
+    if echo "$route_output" | grep -q "ntt\.net\|129.250"; then
+        backbone_changes+=("NTT")
+        is_ntt=true
+    fi
+    
+    # 检测 GTT 线路
+    if echo "$route_output" | grep -q "gtt\.net\|209.120\|89.149\|207.162\|213.200"; then
+        backbone_changes+=("GTT")
+        is_gtt=true
+    fi
     
     # 检测 IIJ 线路
     if echo "$route_output" | grep -q "IIJ\.Net\|210.173\|210.130\|210.131\|210.132\|210.133\|58.138"; then
@@ -111,7 +125,7 @@ analyze_route() {
     echo -e "骨干网类型: ${YELLOW}[$backbone]${NC}"
     
     # 显示骨干网变换
-    if [ ${#backbone_changes[@]} -gt 1 ]; then
+    if [ ${#backbone_changes[@]} -gt 0 ]; then
         echo -e "骨干网变换: ${YELLOW}[${backbone_changes[*]}]${NC}"
     fi
     
@@ -126,7 +140,7 @@ analyze_route() {
         echo -e "特殊线路: ${GREEN}[IIJ]${NC}"
     fi
     if [ "$is_cmi" = true ]; then
-        echo -e "特殊线路: ${GREEN}[CMI]${NC}"
+        echo -e "特殊线路: ${YELLOW}[CMI]${NC}"
     fi
     
     echo -e "平均延迟: ${YELLOW}[$avg_delay ms]${NC}"
@@ -134,7 +148,11 @@ analyze_route() {
     # 综合评估
     echo -e "\n${CYAN}[综合评估]${NC}"
     if [ -n "$backbone" ]; then
-        if [ "$is_cn2" = true ] || [ "$is_softbank" = true ] || [ "$is_iij" = true ] || [ "$is_cmi" = true ]; then
+        if [ "$is_cn2" = true ] || [ "$is_softbank" = true ] || [ "$is_iij" = true ]; then
+            echo -e "${GREEN}[优质线路]${NC}"
+        elif [ "$is_cmi" = true ] && [ "$carrier" = "China Mobile" ]; then
+            echo -e "${YELLOW}[一般线路]${NC}"
+        elif [ "$is_cmi" = true ]; then
             echo -e "${GREEN}[优质线路]${NC}"
         else
             echo -e "${YELLOW}[一般线路]${NC}"
@@ -170,7 +188,7 @@ main() {
     # 输出汇总结果
     echo -e "\n${BG_BLUE}[三网路由检测汇总]${NC}"
     echo -e "${CYAN}运营商\t\t骨干网\t\t延迟\t\t直连\t\t骨干网变换${NC}"
-    echo "-------------------------------------------------------------------------"
+    echo "--------------------------------------------------------------------------"
     for result in "${results[@]}"; do
         IFS='|' read -r carrier backbone delay is_direct backbone_changes <<< "$result"
         # 格式化输出，使用printf确保对齐
