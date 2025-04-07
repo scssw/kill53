@@ -450,24 +450,26 @@ Del_forwarding(){
 	check_iptables
 	while true
 	do
-	View_forwarding
-	read -e -p "请输入数字 来选择要删除的 iptables 端口转发规则(默认回车取消):" Del_forwarding_num
-	[[ -z "${Del_forwarding_num}" ]] && Del_forwarding_num="0"
-	echo $((${Del_forwarding_num}+0)) &>/dev/null
-	if [[ $? -eq 0 ]]; then
-		if [[ ${Del_forwarding_num} -ge 1 ]] && [[ ${Del_forwarding_num} -le ${forwarding_total} ]]; then
-			forwarding_type=$(echo -e "${forwarding_text}"| awk '{print $4}' | sed -n "${Del_forwarding_num}p")
-			forwarding_listen=$(echo -e "${forwarding_text}"| awk '{print $11}' | sed -n "${Del_forwarding_num}p" | awk -F "dpt:" '{print $2}' | sed 's/-/:/g')
-			[[ -z ${forwarding_listen} ]] && forwarding_listen=$(echo -e "${forwarding_text}"| awk '{print $11}' |sed -n "${Del_forwarding_num}p" | awk -F "dpts:" '{print $2}')
-			Del_iptables "${forwarding_type}" "${Del_forwarding_num}"
-			Save_iptables
-			echo && echo -e "${Info} iptables 端口转发规则删除完成 !" && echo
+		View_forwarding
+		read -e -p "请输入数字 来选择要删除的 iptables 端口转发规则(默认回车取消):" Del_forwarding_num
+		[[ -z "${Del_forwarding_num}" ]] && echo "取消..." && break
+		
+		# 检查输入是否为数字
+		if [[ ${Del_forwarding_num} =~ ^[0-9]+$ ]]; then
+			if [[ ${Del_forwarding_num} -ge 1 ]] && [[ ${Del_forwarding_num} -le ${forwarding_total} ]]; then
+				forwarding_type=$(echo -e "${forwarding_text}"| awk '{print $4}' | sed -n "${Del_forwarding_num}p")
+				forwarding_listen=$(echo -e "${forwarding_text}"| awk '{print $11}' | sed -n "${Del_forwarding_num}p" | awk -F "dpt:" '{print $2}' | sed 's/-/:/g')
+				[[ -z ${forwarding_listen} ]] && forwarding_listen=$(echo -e "${forwarding_text}"| awk '{print $11}' |sed -n "${Del_forwarding_num}p" | awk -F "dpts:" '{print $2}')
+				Del_iptables "${forwarding_type}" "${Del_forwarding_num}"
+				Save_iptables
+				echo && echo -e "${Info} iptables 端口转发规则删除完成 !" && echo
+				break
+			else
+				echo -e "${Error} 请输入正确的数字 !"
+			fi
 		else
 			echo -e "${Error} 请输入正确的数字 !"
 		fi
-	else
-		break && echo "取消..."
-	fi
 	done
 }
 Uninstall_forwarding(){
