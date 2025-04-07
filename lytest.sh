@@ -170,7 +170,7 @@ main() {
     # 输出汇总结果
     echo -e "\n${BG_BLUE}[三网路由检测汇总]${NC}"
     echo -e "${CYAN}运营商\t\t骨干网\t\t延迟\t\t直连\t\t骨干网变换${NC}"
-    echo "----------------------------------------------------------------"
+    echo "-------------------------------------------------------------------------"
     for result in "${results[@]}"; do
         IFS='|' read -r carrier backbone delay is_direct backbone_changes <<< "$result"
         # 格式化输出，使用printf确保对齐
