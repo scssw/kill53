@@ -102,7 +102,7 @@ analyze_route() {
     if echo "$route_output" | grep -q "219.158"; then
         backbone_changes+=("联通169")
     fi
-    if echo "$route_output" | grep -q "223.120"; then
+    if echo "$route_output" | grep -q "223.120\|223.118"; then
         backbone_changes+=("移动CMI")
         is_cmi=true
     fi
