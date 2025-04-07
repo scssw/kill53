@@ -102,7 +102,7 @@ Set_local_ip(){
 	read -e -p "请输入 本服务器的 网卡IP(注意是网卡绑定的IP，而不仅仅是公网IP，回车自动检测网卡IP):" local_ip
 	if [[ -z "${local_ip}" ]]; then
 		# 尝试使用ifconfig获取物理网卡的IP，排除docker和lo网卡
-		local_ip=$(ifconfig | grep -E "^(eth|enp)" -A 1 | grep "inet " | head -n 1 | awk '{print $2}')
+		local_ip=$(ifconfig | grep -E "^(eth|enp|ens)" -A 1 | grep "inet " | head -n 1 | awk '{print $2}')
 		if [[ -z "${local_ip}" ]]; then
 			echo "${Error} 无法检测到物理网卡IP，请手动输入"
 			read -e -p "请输入 本服务器的 网卡IP(注意是网卡绑定的IP，而不仅仅是公网IP):" local_ip
