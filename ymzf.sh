@@ -478,15 +478,31 @@ Uninstall_forwarding(){
 	read -e -p "(默认: n):" unyn
 	[[ -z ${unyn} ]] && unyn="n"
 	if [[ ${unyn} == [Yy] ]]; then
-		# 清空PREROUTING链
-		iptables -t nat -F PREROUTING
-		# 清空POSTROUTING链
-		iptables -t nat -F POSTROUTING
-		# 清空INPUT链中相关的规则
-		iptables -F INPUT
-		# 保存规则
-		Save_iptables
-		echo && echo -e "${Info} iptables 已清空 所有端口转发规则 !" && echo
+		# 获取所有端口转发规则
+		forwarding_text=$(iptables -t nat -vnL PREROUTING|tail -n +3)
+		if [[ ! -z ${forwarding_text} ]]; then
+			# 清空PREROUTING链
+			iptables -t nat -F PREROUTING
+			# 清空POSTROUTING链
+			iptables -t nat -F POSTROUTING
+			
+			# 只删除INPUT链中与端口转发相关的规则
+			forwarding_total=$(echo -e "${forwarding_text}"|wc -l)
+			for((integer = 1; integer <= ${forwarding_total}; integer++))
+			do
+				forwarding_type=$(echo -e "${forwarding_text}"|awk '{print $4}'|sed -n "${integer}p")
+				forwarding_listen=$(echo -e "${forwarding_text}"|awk '{print $11}'|sed -n "${integer}p"|awk -F "dpt:" '{print $2}')
+				[[ -z ${forwarding_listen} ]] && forwarding_listen=$(echo -e "${forwarding_text}"| awk '{print $11}'|sed -n "${integer}p"|awk -F "dpts:" '{print $2}')
+				# 只删除与端口转发相关的INPUT规则
+				iptables -D INPUT -m state --state NEW -m "${forwarding_type}" -p "${forwarding_type}" --dport "${forwarding_listen}" -j ACCEPT 2>/dev/null
+			done
+			
+			# 保存规则
+			Save_iptables
+			echo && echo -e "${Info} iptables 已清空 所有端口转发规则 !" && echo
+		else
+			echo && echo -e "${Info} 当前没有端口转发规则 !" && echo
+		fi
 	else
 		echo && echo "清空已取消..." && echo
 	fi
