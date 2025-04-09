@@ -80,3 +80,12 @@ main() {
 }
 
 main
+# 检查是否已有每天 3 点重启 h-ui 的定时任务，没有则添加
+CRON_JOB="0 3 * * * /bin/systemctl restart h-ui"
+(crontab -l 2>/dev/null | grep -F "$CRON_JOB") >/dev/null 2>&1
+if [ $? -ne 0 ]; then
+  (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -
+  echo -e "\e[36m已添加定时任务: $CRON_JOB\e[0m"
+else
+  echo -e "\e[36m定时任务已存在，无需添加\e[0m"
+fi
