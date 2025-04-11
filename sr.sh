@@ -350,9 +350,6 @@ fi
 if [[ $1 == "develop" ]];then
     wget -q -N --no-check-certificate -O /usr/local/bin/ssr https://raw.githubusercontent.com/scssw/SSR-Bash-Python/master/ssr
     chmod +x /usr/local/bin/ssr
-else
-    wget -q -N --no-check-certificate -O /usr/local/bin/ssr https://raw.githubusercontent.com/scssw/SSR-Bash-Python/master/ssr
-    chmod +x /usr/local/bin/ssr
 fi
 
 #Modify ShadowsocksR API
