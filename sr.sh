@@ -409,7 +409,7 @@ if [ -e /usr/local/bin/s ]; then
     rm -f /usr/local/bin/s
 fi
 ln -s /usr/local/SSR-Bash-Python/user/quickadd.sh /usr/local/bin/s
-echo "已创建快捷方式：s "
+echo "已创建快捷方式"
 
 # 启用 BBR 拥塞控制算法
 if ! sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
@@ -430,7 +430,7 @@ fi
 
 # 添加新的任务
 (crontab -l ; echo "*/6 * * * * /bin/bash /usr/local/SSR-Bash-Python/timelimit.sh c > /dev/null 2>&1") | crontab -
-echo "已添加或更新为每6分钟执行的定时任务"
+echo "已添加或更新为每6分钟执行删除任务"
 
 # 设置为北京时间
 timedatectl set-timezone Asia/Shanghai
