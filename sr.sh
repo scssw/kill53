@@ -404,8 +404,12 @@ fi
 # 添加 quickadd.sh 执行权限
 chmod +x /usr/local/SSR-Bash-Python/user/quickadd.sh
 
-# 创建快捷方式
+# 创建 /usr/local/bin/s 的快捷方式（若已存在则覆盖）
+if [ -e /usr/local/bin/s ]; then
+    rm -f /usr/local/bin/s
+fi
 ln -s /usr/local/SSR-Bash-Python/user/quickadd.sh /usr/local/bin/s
+echo "已创建快捷方式：s "
 
 # 启用 BBR 拥塞控制算法
 if ! sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
