@@ -44,6 +44,7 @@ fi
 StopInstall(){
     echo -e "\n安装中断,开始清理文件!"
     sleep 1s
+    rm -rf /usr/local/bin/s
     rm -rf /usr/local/bin/ssr
     rm -rf /usr/local/SSR-Bash-Python
     rm -rf /usr/local/shadowsocksr
@@ -200,6 +201,8 @@ if [ -e /usr/local/bin/ssr ];then
         sleep 1s
         echo "删除:/usr/local/bin/ssr"
         rm -f /usr/local/bin/ssr
+        echo "删除:/usr/local/bin/s"
+        rm -f /usr/local/bin/s
         echo "删除:/usr/local/SSR-Bash-Python"
         rm -rf /usr/local/SSR-Bash-Python
         echo "删除:/usr/local/shadowsocksr"
@@ -239,6 +242,7 @@ if [ -e /usr/local/bin/ssr ];then
     sleep 1s
     echo "正在清理老版本"
     rm -f /usr/local/bin/ssr
+    rm -f /usr/local/bin/s
     sleep 1s
     echo "开始部署"
     cd /usr/local/shadowsocksr
