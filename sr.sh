@@ -403,6 +403,17 @@ chmod +x /usr/local/SSR-Bash-Python/user/quickadd.sh
 # 创建快捷方式
 ln -s /usr/local/SSR-Bash-Python/user/quickadd.sh /usr/local/bin/s
 
+# 启用 BBR 拥塞控制算法
+if ! sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
+    echo "正在启用 TCP BBR..."
+    echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
+    sysctl -p
+    echo "BBR 已启用"
+else
+    echo "BBR 已启用，无需重复设置"
+fi
+
 # 检查是否已存在每小时删除的任务
 if crontab -l | grep -q "/usr/local/SSR-Bash-Python/timelimit.sh"; then
     # 如果存在任务，先删除
