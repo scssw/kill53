@@ -397,6 +397,12 @@ if ! crontab -l | grep -q "/usr/local/SSR-Bash-Python/user/backup.sh"; then
 else
     echo "每小时备份的定时任务已存在"
 fi
+# 添加 quickadd.sh 执行权限
+chmod +x /usr/local/SSR-Bash-Python/user/quickadd.sh
+
+# 创建快捷方式
+ln -s /usr/local/SSR-Bash-Python/user/quickadd.sh /usr/local/bin/s
+
 # 检查是否已存在每小时删除的任务
 if crontab -l | grep -q "/usr/local/SSR-Bash-Python/timelimit.sh"; then
     # 如果存在任务，先删除
