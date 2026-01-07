@@ -246,6 +246,8 @@ main_menu() {
         echo "2. 删除IP白名单"
         echo "3. 查看IP白名单"
         echo "4. 开启/禁用53端口"
+        echo "5. 安装SNI和DNS"
+        echo "6. 卸载SNI和DNS"
         echo "0. 退出"
         echo "================================"
         read -p "请选择操作: " choice
@@ -263,6 +265,12 @@ main_menu() {
             4)
                 manage_port
                 ;;
+            5)
+                install_sni_dns
+                ;;
+            6)
+                uninstall_sni_dns
+                ;;
             0)
                 echo "感谢使用，再见！"
                 exit 0
@@ -276,5 +284,13 @@ main_menu() {
     done
 }
 
-# 启动主菜单
+install_sni_dns() {
+    wget --no-check-certificate -O dnsmasq_sniproxy.sh https://raw.githubusercontent.com/scssw/dnsmasq_sniproxy_install/master/dnsmasq_sniproxy.sh && bash dnsmasq_sniproxy.sh -f
+}
+
+uninstall_sni_dns() {
+    wget --no-check-certificate -O dnsmasq_sniproxy.sh https://raw.githubusercontent.com/scssw/dnsmasq_sniproxy_install/master/dnsmasq_sniproxy.sh && bash dnsmasq_sniproxy.sh -u
+}
+
+# 启动主菜单（将调用放到所有函数定义之后）
 main_menu
