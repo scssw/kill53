@@ -208,7 +208,17 @@ manage_port() {
                     # 先删除可能存在的旧规则
                     iptables -D INPUT -p tcp -m state --state NEW -m tcp --dport 53 -j DROP 2>/dev/null
                     iptables -D INPUT -p udp -m state --state NEW -m udp --dport 53 -j DROP 2>/dev/null
-                    
+
+                    # 删除所有旧的53开放规则（不含白名单）
+                    # TCP
+                    while read -r line; do
+                        iptables -D INPUT ${line#-A INPUT }
+                    done < <(iptables -S INPUT | grep -E "^-A INPUT" | grep -E " -p tcp " | grep -- "--dport 53" | grep -- " -j ACCEPT" | grep -v -- " -s ")
+                    # UDP
+                    while read -r line; do
+                        iptables -D INPUT ${line#-A INPUT }
+                    done < <(iptables -S INPUT | grep -E "^-A INPUT" | grep -E " -p udp " | grep -- "--dport 53" | grep -- " -j ACCEPT" | grep -v -- " -s ")
+
                     # 重新添加DROP规则，确保它们在所有白名单规则之后
                     iptables -A INPUT -p tcp -m state --state NEW -m tcp --dport 53 -j DROP
                     iptables -A INPUT -p udp -m state --state NEW -m udp --dport 53 -j DROP
