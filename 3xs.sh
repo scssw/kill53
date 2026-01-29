@@ -12,7 +12,7 @@ xui_folder="${XUI_MAIN_FOLDER:=/usr/local/x-ui}"
 xui_service="${XUI_SERVICE:=/etc/systemd/system}"
 
 # check root
-[[ $EUID -ne 0 ]] && echo -e "${red}致命错误：${plain} 请使用 root 权限运行此脚本 \n " && exit 1
+[[ $EUID -ne 0 ]] && echo -e "${red}Fatal error: ${plain} Please run this script with root privilege \n " && exit 1
 
 # Check OS and set release variable
 if [[ -f /etc/os-release ]]; then
@@ -22,10 +22,10 @@ if [[ -f /etc/os-release ]]; then
     source /usr/lib/os-release
     release=$ID
 else
-    echo "无法检测系统 OS，请联系作者！" >&2
+    echo "Failed to check the system OS, please contact the author!" >&2
     exit 1
 fi
-echo "系统发行版：$release"
+echo "The OS release is: $release"
 
 arch() {
     case "$(uname -m)" in
@@ -36,11 +36,11 @@ arch() {
         armv6* | armv6) echo 'armv6' ;;
         armv5* | armv5) echo 'armv5' ;;
         s390x) echo 's390x' ;;
-        *) echo -e "${green}不支持的 CPU 架构！ ${plain}" && rm -f install.sh && exit 1 ;;
+        *) echo -e "${green}Unsupported CPU architecture! ${plain}" && rm -f install.sh && exit 1 ;;
     esac
 }
 
-echo "架构：$(arch)"
+echo "Arch: $(arch)"
 
 # Simple helpers
 is_ipv4() {
@@ -110,14 +110,14 @@ gen_random_string() {
 }
 
 install_acme() {
-    echo -e "${green}正在安装 acme.sh 用于 SSL 证书管理...${plain}"
+    echo -e "${green}Installing acme.sh for SSL certificate management...${plain}"
     cd ~ || return 1
     curl -s https://get.acme.sh | sh >/dev/null 2>&1
     if [ $? -ne 0 ]; then
-        echo -e "${red}安装 acme.sh 失败${plain}"
+        echo -e "${red}Failed to install acme.sh${plain}"
         return 1
     else
-        echo -e "${green}acme.sh 安装成功${plain}"
+        echo -e "${green}acme.sh installed successfully${plain}"
     fi
     return 0
 }
@@ -128,13 +128,13 @@ setup_ssl_certificate() {
     local existing_port="$3"
     local existing_webBasePath="$4"
     
-    echo -e "${green}正在配置 SSL 证书...${plain}"
+    echo -e "${green}Setting up SSL certificate...${plain}"
     
     # Check if acme.sh is installed
     if ! command -v ~/.acme.sh/acme.sh &>/dev/null; then
         install_acme
         if [ $? -ne 0 ]; then
-            echo -e "${yellow}安装 acme.sh 失败，跳过 SSL 配置${plain}"
+            echo -e "${yellow}Failed to install acme.sh, skipping SSL setup${plain}"
             return 1
         fi
     fi
@@ -144,15 +144,15 @@ setup_ssl_certificate() {
     mkdir -p "$certPath"
     
     # Issue certificate
-    echo -e "${green}正在签发 SSL 证书：${domain}...${plain}"
-    echo -e "${yellow}注意：80 端口必须开放并可从公网访问${plain}"
+    echo -e "${green}Issuing SSL certificate for ${domain}...${plain}"
+    echo -e "${yellow}Note: Port 80 must be open and accessible from the internet${plain}"
     
     ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt --force >/dev/null 2>&1
     ~/.acme.sh/acme.sh --issue -d ${domain} --listen-v6 --standalone --httpport 80 --force
     
     if [ $? -ne 0 ]; then
-        echo -e "${yellow}证书签发失败：${domain}${plain}"
-        echo -e "${yellow}请确保 80 端口已开放，并稍后使用 x-ui 重试${plain}"
+        echo -e "${yellow}Failed to issue certificate for ${domain}${plain}"
+        echo -e "${yellow}Please ensure port 80 is open and try again later with: x-ui${plain}"
         rm -rf ~/.acme.sh/${domain} 2>/dev/null
         rm -rf "$certPath" 2>/dev/null
         return 1
@@ -165,7 +165,7 @@ setup_ssl_certificate() {
         --reloadcmd "systemctl restart x-ui" >/dev/null 2>&1
     
     if [ $? -ne 0 ]; then
-        echo -e "${yellow}安装证书失败${plain}"
+        echo -e "${yellow}Failed to install certificate${plain}"
         return 1
     fi
     
@@ -181,10 +181,10 @@ setup_ssl_certificate() {
     
     if [[ -f "$webCertFile" && -f "$webKeyFile" ]]; then
         ${xui_folder}/x-ui cert -webCert "$webCertFile" -webCertKey "$webKeyFile" >/dev/null 2>&1
-        echo -e "${green}SSL 证书安装并配置成功！${plain}"
+        echo -e "${green}SSL certificate installed and configured successfully!${plain}"
         return 0
     else
-        echo -e "${yellow}未找到证书文件${plain}"
+        echo -e "${yellow}Certificate files not found${plain}"
         return 1
     fi
 }
@@ -195,15 +195,15 @@ setup_ip_certificate() {
     local ipv4="$1"
     local ipv6="$2"  # optional
 
-    echo -e "${green}正在配置 Let's Encrypt IP 证书（短期 profile）...${plain}"
-    echo -e "${yellow}注意：IP 证书有效期约 6 天，并会自动续期。${plain}"
-    echo -e "${yellow}默认监听端口为 80。如选择其他端口，请确保外部 80 端口已转发到该端口。${plain}"
+    echo -e "${green}Setting up Let's Encrypt IP certificate (shortlived profile)...${plain}"
+    echo -e "${yellow}Note: IP certificates are valid for ~6 days and will auto-renew.${plain}"
+    echo -e "${yellow}Default listener is port 80. If you choose another port, ensure external port 80 forwards to it.${plain}"
 
     # Check for acme.sh
     if ! command -v ~/.acme.sh/acme.sh &>/dev/null; then
         install_acme
         if [ $? -ne 0 ]; then
-            echo -e "${red}安装 acme.sh 失败${plain}"
+            echo -e "${red}Failed to install acme.sh${plain}"
             return 1
         fi
     fi
@@ -235,7 +235,7 @@ setup_ip_certificate() {
 
     # Choose port for HTTP-01 listener (default 80, prompt override)
     local WebPort=""
-    read -rp "ACME HTTP-01 监听端口（默认 80）：" WebPort
+    read -rp "Port to use for ACME HTTP-01 listener (default 80): " WebPort
     WebPort="${WebPort:-80}"
     if ! [[ "${WebPort}" =~ ^[0-9]+$ ]] || ((WebPort < 1 || WebPort > 65535)); then
         echo -e "${red}Invalid port provided. Falling back to 80.${plain}"
@@ -252,7 +252,7 @@ setup_ip_certificate() {
             echo -e "${yellow}Port ${WebPort} is in use.${plain}"
 
             local alt_port=""
-            read -rp "请输入 acme.sh 独立监听的其他端口（留空取消）：" alt_port
+            read -rp "Enter another port for acme.sh standalone listener (leave empty to abort): " alt_port
             alt_port="${alt_port// /}"
             if [[ -z "${alt_port}" ]]; then
                 echo -e "${red}Port ${WebPort} is busy; cannot proceed.${plain}"
@@ -285,7 +285,7 @@ setup_ip_certificate() {
 
     if [ $? -ne 0 ]; then
         echo -e "${red}Failed to issue IP certificate${plain}"
-        echo -e "${yellow}请确保端口 ${WebPort} 可访问（或已从外部 80 端口转发）${plain}"
+        echo -e "${yellow}Please ensure port ${WebPort} is reachable (or forwarded from external port 80)${plain}"
         # Cleanup acme.sh data for both IPv4 and IPv6 if specified
         rm -rf ~/.acme.sh/${ipv4} 2>/dev/null
         [[ -n "$ipv6" ]] && rm -rf ~/.acme.sh/${ipv6} 2>/dev/null
@@ -305,7 +305,7 @@ setup_ip_certificate() {
 
     # Verify certificate files exist (don't rely on exit code - reloadcmd failure causes non-zero)
     if [[ ! -f "${certDir}/fullchain.pem" || ! -f "${certDir}/privkey.pem" ]]; then
-        echo -e "${red}安装后未找到证书文件${plain}"
+        echo -e "${red}Certificate files not found after installation${plain}"
         # Cleanup acme.sh data for both IPv4 and IPv6 if specified
         rm -rf ~/.acme.sh/${ipv4} 2>/dev/null
         [[ -n "$ipv6" ]] && rm -rf ~/.acme.sh/${ipv6} 2>/dev/null
@@ -336,8 +336,8 @@ setup_ip_certificate() {
     fi
 
     echo -e "${green}IP certificate installed and configured successfully!${plain}"
-    echo -e "${green}证书有效期约 6 天，将通过 acme.sh 定时任务自动续期。${plain}"
-    echo -e "${yellow}acme.sh 将在到期前自动续期并重载 x-ui。${plain}"
+    echo -e "${green}Certificate valid for ~6 days, auto-renews via acme.sh cron job.${plain}"
+    echo -e "${yellow}acme.sh will automatically renew and reload x-ui before expiry.${plain}"
     return 0
 }
 
@@ -348,30 +348,30 @@ ssl_cert_issue() {
     
     # check for acme.sh first
     if ! command -v ~/.acme.sh/acme.sh &>/dev/null; then
-        echo "未找到 acme.sh，正在安装..."
+        echo "acme.sh could not be found. Installing now..."
         cd ~ || return 1
         curl -s https://get.acme.sh | sh
         if [ $? -ne 0 ]; then
-            echo -e "${red}安装 acme.sh 失败${plain}"
+            echo -e "${red}Failed to install acme.sh${plain}"
             return 1
         else
-            echo -e "${green}acme.sh 安装成功${plain}"
+            echo -e "${green}acme.sh installed successfully${plain}"
         fi
     fi
 
     # get the domain here, and we need to verify it
     local domain=""
     while true; do
-        read -rp "请输入你的域名：" domain
+        read -rp "Please enter your domain name: " domain
         domain="${domain// /}"  # Trim whitespace
         
         if [[ -z "$domain" ]]; then
-            echo -e "${red}域名不能为空，请重试。${plain}"
+            echo -e "${red}Domain name cannot be empty. Please try again.${plain}"
             continue
         fi
         
         if ! is_domain "$domain"; then
-            echo -e "${red}域名格式无效：${domain}。请输入有效域名。${plain}"
+            echo -e "${red}Invalid domain format: ${domain}. Please enter a valid domain name.${plain}"
             continue
         fi
         
@@ -402,12 +402,12 @@ ssl_cert_issue() {
 
     # get the port number for the standalone server
     local WebPort=80
-    read -rp "请选择要使用的端口（默认 80）：" WebPort
+    read -rp "Please choose which port to use (default is 80): " WebPort
     if [[ ${WebPort} -gt 65535 || ${WebPort} -lt 1 ]]; then
         echo -e "${yellow}Your input ${WebPort} is invalid, will use default port 80.${plain}"
         WebPort=80
     fi
-    echo -e "${green}将使用端口 ${WebPort} 签发证书，请确保该端口已开放。${plain}"
+    echo -e "${green}Will use port: ${WebPort} to issue certificates. Please make sure this port is open.${plain}"
 
     # Stop panel temporarily
     echo -e "${yellow}Stopping panel temporarily...${plain}"
@@ -427,14 +427,14 @@ ssl_cert_issue() {
 
     # Setup reload command
     reloadCmd="systemctl restart x-ui || rc-service x-ui restart"
-    echo -e "${green}ACME 默认 --reloadcmd：${yellow}systemctl restart x-ui || rc-service x-ui restart${plain}"
+    echo -e "${green}Default --reloadcmd for ACME is: ${yellow}systemctl restart x-ui || rc-service x-ui restart${plain}"
     echo -e "${green}This command will run on every certificate issue and renew.${plain}"
-    read -rp "是否修改 ACME 的 --reloadcmd？(y/n)：" setReloadcmd
+    read -rp "Would you like to modify --reloadcmd for ACME? (y/n): " setReloadcmd
     if [[ "$setReloadcmd" == "y" || "$setReloadcmd" == "Y" ]]; then
         echo -e "\n${green}\t1.${plain} Preset: systemctl reload nginx ; systemctl restart x-ui"
         echo -e "${green}\t2.${plain} Input your own command"
-        echo -e "${green}\t0.${plain} 保留默认 reloadcmd"
-        read -rp "请选择一个选项：" choice
+        echo -e "${green}\t0.${plain} Keep default reloadcmd"
+        read -rp "Choose an option: " choice
         case "$choice" in
         1)
             echo -e "${green}Reloadcmd is: systemctl reload nginx ; systemctl restart x-ui${plain}"
@@ -442,11 +442,11 @@ ssl_cert_issue() {
             ;;
         2)
             echo -e "${yellow}It's recommended to put x-ui restart at the end${plain}"
-            read -rp "请输入自定义的 reloadcmd：" reloadCmd
+            read -rp "Please enter your custom reloadcmd: " reloadCmd
             echo -e "${green}Reloadcmd is: ${reloadCmd}${plain}"
             ;;
         *)
-            echo -e "${green}已保留默认 reloadcmd${plain}"
+            echo -e "${green}Keeping default reloadcmd${plain}"
             ;;
         esac
     fi
@@ -485,7 +485,7 @@ ssl_cert_issue() {
     systemctl start x-ui 2>/dev/null || rc-service x-ui start 2>/dev/null
 
     # Prompt user to set panel paths after successful certificate installation
-    read -rp "是否将此证书设置为面板证书？(y/n)：" setPanel
+    read -rp "Would you like to set this certificate for the panel? (y/n): " setPanel
     if [[ "$setPanel" == "y" || "$setPanel" == "Y" ]]; then
         local webCertFile="/root/cert/${domain}/fullchain.pem"
         local webKeyFile="/root/cert/${domain}/privkey.pem"
@@ -523,7 +523,7 @@ prompt_and_setup_ssl() {
     echo -e "${green}2.${plain} Let's Encrypt for IP Address (6-day validity, auto-renews)"
     echo -e "${green}3.${plain} Custom SSL Certificate (Path to existing files)"
     echo -e "${blue}Note:${plain} Options 1 & 2 require port 80 open. Option 3 requires manual paths."
-    read -rp "请选择一个选项（默认 2：IP）：" ssl_choice
+    read -rp "Choose an option (default 2 for IP): " ssl_choice
     ssl_choice="${ssl_choice// /}"  # Trim whitespace
     
     # Default to 2 (IP cert) if input is empty or invalid (not 1 or 3)
@@ -540,7 +540,7 @@ prompt_and_setup_ssl() {
         local cert_domain=$(~/.acme.sh/acme.sh --list 2>/dev/null | tail -1 | awk '{print $1}')
         if [[ -n "${cert_domain}" ]]; then
             SSL_HOST="${cert_domain}"
-            echo -e "${green}鉁?SSL certificate configured successfully with domain: ${cert_domain}${plain}"
+            echo -e "${green}✓ SSL certificate configured successfully with domain: ${cert_domain}${plain}"
         else
             echo -e "${yellow}SSL setup may have completed, but domain extraction failed${plain}"
             SSL_HOST="${server_ip}"
@@ -552,7 +552,7 @@ prompt_and_setup_ssl() {
         
         # Ask for optional IPv6
         local ipv6_addr=""
-        read -rp "是否有 IPv6 地址需要包含？（留空跳过）：" ipv6_addr
+        read -rp "Do you have an IPv6 address to include? (leave empty to skip): " ipv6_addr
         ipv6_addr="${ipv6_addr// /}"  # Trim whitespace
         
         # Stop panel if running (port 80 needed)
@@ -565,9 +565,9 @@ prompt_and_setup_ssl() {
         setup_ip_certificate "${server_ip}" "${ipv6_addr}"
         if [ $? -eq 0 ]; then
             SSL_HOST="${server_ip}"
-            echo -e "${green}鉁?Let's Encrypt IP certificate configured successfully${plain}"
+            echo -e "${green}✓ Let's Encrypt IP certificate configured successfully${plain}"
         else
-            echo -e "${red}IP 证书配置失败，请检查 80 端口是否开放。${plain}"
+            echo -e "${red}✗ IP certificate setup failed. Please check port 80 is open.${plain}"
             SSL_HOST="${server_ip}"
         fi
         ;;
@@ -579,12 +579,12 @@ prompt_and_setup_ssl() {
         local custom_domain=""
 
         # 3.1 Request Domain to compose Panel URL later
-        read -rp "请输入证书所对应的域名：" custom_domain
-        custom_domain="${custom_domain// /}" # 校斜懈褉邪械屑 锌褉芯斜械谢褘
+        read -rp "Please enter domain name certificate issued for: " custom_domain
+        custom_domain="${custom_domain// /}" # Убираем пробелы
 
         # 3.2 Loop for Certificate Path
         while true; do
-            read -rp "请输入证书文件路径（关键词：.crt / fullchain）：" custom_cert
+            read -rp "Input certificate path (keywords: .crt / fullchain): " custom_cert
             # Strip quotes if present
             custom_cert=$(echo "$custom_cert" | tr -d '"' | tr -d "'")
 
@@ -601,7 +601,7 @@ prompt_and_setup_ssl() {
 
         # 3.3 Loop for Private Key Path
         while true; do
-            read -rp "请输入私钥文件路径（关键词：.key / privatekey）：" custom_key
+            read -rp "Input private key path (keywords: .key / privatekey): " custom_key
             # Strip quotes if present
             custom_key=$(echo "$custom_key" | tr -d '"' | tr -d "'")
 
@@ -626,7 +626,7 @@ prompt_and_setup_ssl() {
             SSL_HOST="${server_ip}"
         fi
 
-        echo -e "${green}鉁?Custom certificate paths applied.${plain}"
+        echo -e "${green}✓ Custom certificate paths applied.${plain}"
         echo -e "${yellow}Note: You are responsible for renewing these files externally.${plain}"
 
         systemctl restart x-ui >/dev/null 2>&1 || rc-service x-ui restart >/dev/null 2>&1
@@ -666,9 +666,9 @@ config_after_install() {
             local config_username=$(gen_random_string 10)
             local config_password=$(gen_random_string 10)
             
-            read -rp "是否自定义面板端口？（否则将使用随机端口）[y/n]：" config_confirm
+            read -rp "Would you like to customize the Panel Port settings? (If not, a random port will be applied) [y/n]: " config_confirm
             if [[ "${config_confirm}" == "y" || "${config_confirm}" == "Y" ]]; then
-                read -rp "请设置面板端口：" config_port
+                read -rp "Please set up the panel port: " config_port
                 echo -e "${yellow}Your Panel Port is: ${config_port}${plain}"
             else
                 local config_port=$(shuf -i 1024-62000 -n 1)
@@ -678,9 +678,9 @@ config_after_install() {
             ${xui_folder}/x-ui setting -username "${config_username}" -password "${config_password}" -port "${config_port}" -webBasePath "${config_webBasePath}"
             
             echo ""
-            echo -e "${green}鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?{plain}"
+            echo -e "${green}═══════════════════════════════════════════${plain}"
             echo -e "${green}     SSL Certificate Setup (MANDATORY)     ${plain}"
-            echo -e "${green}鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?{plain}"
+            echo -e "${green}═══════════════════════════════════════════${plain}"
             echo -e "${yellow}For security, SSL certificate is required for all panels.${plain}"
             echo -e "${yellow}Let's Encrypt now supports both domains and IP addresses!${plain}"
             echo ""
@@ -689,17 +689,17 @@ config_after_install() {
             
             # Display final credentials and access information
             echo ""
-            echo -e "${green}鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?{plain}"
+            echo -e "${green}═══════════════════════════════════════════${plain}"
             echo -e "${green}     Panel Installation Complete!         ${plain}"
-            echo -e "${green}鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?{plain}"
+            echo -e "${green}═══════════════════════════════════════════${plain}"
             echo -e "${green}Username:    ${config_username}${plain}"
             echo -e "${green}Password:    ${config_password}${plain}"
             echo -e "${green}Port:        ${config_port}${plain}"
             echo -e "${green}WebBasePath: ${config_webBasePath}${plain}"
             echo -e "${green}Access URL:  https://${SSL_HOST}:${config_port}/${config_webBasePath}${plain}"
-            echo -e "${green}鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?{plain}"
-            echo -e "${yellow}鈿?IMPORTANT: Save these credentials securely!${plain}"
-            echo -e "${yellow}鈿?SSL Certificate: Enabled and configured${plain}"
+            echo -e "${green}═══════════════════════════════════════════${plain}"
+            echo -e "${yellow}⚠ IMPORTANT: Save these credentials securely!${plain}"
+            echo -e "${yellow}⚠ SSL Certificate: Enabled and configured${plain}"
         else
             local config_webBasePath=$(gen_random_string 18)
             echo -e "${yellow}WebBasePath is missing or too short. Generating a new one...${plain}"
@@ -709,9 +709,9 @@ config_after_install() {
             # If the panel is already installed but no certificate is configured, prompt for SSL now
             if [[ -z "${existing_cert}" ]]; then
                 echo ""
-                echo -e "${green}鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?{plain}"
+                echo -e "${green}═══════════════════════════════════════════${plain}"
                 echo -e "${green}     SSL Certificate Setup (RECOMMENDED)   ${plain}"
-                echo -e "${green}鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?{plain}"
+                echo -e "${green}═══════════════════════════════════════════${plain}"
                 echo -e "${yellow}Let's Encrypt now supports both domains and IP addresses!${plain}"
                 echo ""
                 prompt_and_setup_ssl "${existing_port}" "${config_webBasePath}" "${server_ip}"
@@ -742,9 +742,9 @@ config_after_install() {
         existing_cert=$(${xui_folder}/x-ui setting -getCert true | grep 'cert:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
         if [[ -z "$existing_cert" ]]; then
             echo ""
-            echo -e "${green}鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?{plain}"
+            echo -e "${green}═══════════════════════════════════════════${plain}"
             echo -e "${green}     SSL Certificate Setup (RECOMMENDED)   ${plain}"
-            echo -e "${green}鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?{plain}"
+            echo -e "${green}═══════════════════════════════════════════${plain}"
             echo -e "${yellow}Let's Encrypt now supports both domains and IP addresses!${plain}"
             echo ""
             prompt_and_setup_ssl "${existing_port}" "${existing_webBasePath}" "${server_ip}"
@@ -783,7 +783,7 @@ install_x-ui() {
         min_version="2.3.5"
         
         if [[ "$(printf '%s\n' "$min_version" "$tag_version_numeric" | sort -V | head -n1)" != "$min_version" ]]; then
-            echo -e "${red}请使用更新版本（至少 v2.3.5），安装已退出。${plain}"
+            echo -e "${red}Please use a newer version (at least v2.3.5). Exiting installation.${plain}"
             exit 1
         fi
         
@@ -936,7 +936,24 @@ install_x-ui() {
     
     echo -e "${green}x-ui ${tag_version}${plain} installation finished, it is running now..."
     echo -e ""
-    echo -e "鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹? ${blue}x-ui control menu usages (subcommands):${plain}              鈹?鈹?                                                      鈹?鈹? ${blue}x-ui${plain}              - Admin Management Script          鈹?鈹? ${blue}x-ui start${plain}        - Start                            鈹?鈹? ${blue}x-ui stop${plain}         - Stop                             鈹?鈹? ${blue}x-ui restart${plain}      - Restart                          鈹?鈹? ${blue}x-ui status${plain}       - Current Status                   鈹?鈹? ${blue}x-ui settings${plain}     - Current Settings                 鈹?鈹? ${blue}x-ui enable${plain}       - Enable Autostart on OS Startup   鈹?鈹? ${blue}x-ui disable${plain}      - Disable Autostart on OS Startup  鈹?鈹? ${blue}x-ui log${plain}          - Check logs                       鈹?鈹? ${blue}x-ui banlog${plain}       - Check Fail2ban ban logs          鈹?鈹? ${blue}x-ui update${plain}       - Update                           鈹?鈹? ${blue}x-ui legacy${plain}       - Legacy version                   鈹?鈹? ${blue}x-ui install${plain}      - Install                          鈹?鈹? ${blue}x-ui uninstall${plain}    - Uninstall                        鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?
+    echo -e "┌───────────────────────────────────────────────────────┐
+│  ${blue}x-ui 控制菜单用法（子命令）:${plain}                   │
+│                                                       │
+│  ${blue}x-ui${plain}              - 管理脚本                         │
+│  ${blue}x-ui start${plain}        - 启动                             │
+│  ${blue}x-ui stop${plain}         - 停止                             │
+│  ${blue}x-ui restart${plain}      - 重启                             │
+│  ${blue}x-ui status${plain}       - 当前状态                         │
+│  ${blue}x-ui settings${plain}     - 当前设置                         │
+│  ${blue}x-ui enable${plain}       - 开机启动时启用自启动             │
+│  ${blue}x-ui disable${plain}      - 开机启动时禁用自启动             │
+│  ${blue}x-ui log${plain}          - 查看日志                         │
+│  ${blue}x-ui banlog${plain}       - 查看 Fail2ban 封禁日志           │
+│  ${blue}x-ui update${plain}       - 更新                             │
+│  ${blue}x-ui legacy${plain}       - 旧版本                           │
+│  ${blue}x-ui install${plain}      - 安装                             │
+│  ${blue}x-ui uninstall${plain}    - 卸载                             │
+└───────────────────────────────────────────────────────┘"
 }
 
 echo -e "${green}Running...${plain}"
