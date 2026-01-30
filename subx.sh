@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PREFIX_HOST="clash.ssrr.today"
-PREFIX_PORT="12345"
+PREFIX_HOST="${PREFIX_HOST:-clash.ssrr.today}"
+PREFIX_PORT="${PREFIX_PORT:-12345}"
 PREFIX_SCHEME="${PREFIX_SCHEME:-http}"
 PREFIX="${PREFIX_SCHEME}://${PREFIX_HOST}:${PREFIX_PORT}"
-
-# Public HTTPS endpoint (usually reverse proxy on 443). Leave PUBLIC_PORT empty to omit port.
-PUBLIC_HOST="${PUBLIC_HOST:-${PREFIX_HOST}}"
-PUBLIC_SCHEME="${PUBLIC_SCHEME:-https}"
-PUBLIC_PORT="${PUBLIC_PORT:-}"
 
 IMAGE="${IMAGE:-asdlokj1qpi23/subconverter:latest}"
 CONTAINER_NAME="subconverter"
@@ -24,9 +19,9 @@ need_root() {
 }
 
 install_deps() {
-  echo "[1/4] Installing dependencies (docker / curl / python3)..."
+  echo "[1/4] Installing dependencies (docker / python3)..."
   apt-get update -y
-  apt-get install -y docker.io curl python3 ca-certificates
+  apt-get install -y docker.io python3
   systemctl enable --now docker
 }
 
@@ -69,7 +64,17 @@ open_firewall() {
 
 health_check() {
   echo "[4/4] Local connectivity check..."
-  if curl -fsS "http://127.0.0.1:${HOST_PORT}/sub?target=clash&url=ssr%3A%2F%2Ftest" >/dev/null 2>&1; then
+  if python3 - <<PY >/dev/null 2>&1
+import urllib.request
+url = "http://127.0.0.1:${HOST_PORT}/sub?target=clash&url=ssr%3A%2F%2Ftest"
+try:
+  with urllib.request.urlopen(url, timeout=3) as r:
+    r.read(1)
+  raise SystemExit(0)
+except Exception:
+  raise SystemExit(1)
+PY
+  then
     echo "Local OK: /sub reachable"
   else
     echo "Hint: /sub check failed (test SSR may be invalid). Service may still be OK."
@@ -109,7 +114,6 @@ interactive() {
   echo "----------------------------"
   echo "Paste SSR or VLESS link (starts with ssr:// or vless://), press Enter to generate; type exit to quit"
   echo "Prefix: ${PREFIX}"
-  echo "Public: ${PUBLIC_SCHEME}://${PUBLIC_HOST}${PUBLIC_PORT:+:${PUBLIC_PORT}}"
   echo "----------------------------"
 
   while true; do
@@ -127,11 +131,8 @@ interactive() {
     if [[ "${link}" == ssr://* ]]; then
       enc="$(urlencode "${link}")"
       echo
-      echo "Generated (subconverter):"
+      echo "Generated:"
       make_url "${PREFIX_SCHEME}" "${PREFIX_HOST}" "${PREFIX_PORT}" "${enc}"
-      echo
-      echo "Generated (public https):"
-      make_url "${PUBLIC_SCHEME}" "${PUBLIC_HOST}" "${PUBLIC_PORT}" "${enc}"
       echo
       echo "Tip: if external access fails, check DNS resolution and firewall for ${HOST_PORT}/tcp"
       continue
@@ -139,11 +140,8 @@ interactive() {
     if [[ "${link}" == vless://* ]]; then
       enc="$(urlencode "${link}")"
       echo
-      echo "Generated (subconverter):"
+      echo "Generated:"
       make_url "${PREFIX_SCHEME}" "${PREFIX_HOST}" "${PREFIX_PORT}" "${enc}"
-      echo
-      echo "Generated (public https):"
-      make_url "${PUBLIC_SCHEME}" "${PUBLIC_HOST}" "${PUBLIC_PORT}" "${enc}"
       echo
       echo "Generated (Clash proxy YAML):"
       python3 - "$link" <<'PY'
@@ -230,6 +228,22 @@ PY
   done
 }
 
+prompt_config() {
+  echo "----------------------------"
+  echo "Setup: enter domain and port for the HTTP conversion link."
+  echo "Press Enter to keep defaults."
+  echo "----------------------------"
+  read -rp "Domain (e.g. example.com) [${PREFIX_HOST}]: " _host || true
+  read -rp "Port (e.g. 12345) [${PREFIX_PORT}]: " _port || true
+  _host="${_host:-${PREFIX_HOST}}"
+  _port="${_port:-${PREFIX_PORT}}"
+  PREFIX_HOST="${_host}"
+  PREFIX_PORT="${_port}"
+  PREFIX_SCHEME="http"
+  PREFIX="${PREFIX_SCHEME}://${PREFIX_HOST}:${PREFIX_PORT}"
+  HOST_PORT="${PREFIX_PORT}"
+}
+
 main() {
   if [[ "${1:-}" == "--install-cli" ]]; then
     install_cli
@@ -242,6 +256,7 @@ main() {
   fi
 
   need_root
+  prompt_config
   install_deps
   start_container
   open_firewall
