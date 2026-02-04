@@ -67,13 +67,6 @@ ensure_ssh_key() {
   fi
 }
 
-ensure_sshpass() {
-  if ! need_cmd sshpass; then
-    echo "sshpass not found; installing..."
-    install_pkg sshpass
-  fi
-}
-
 try_key_auth() {
   local user="$1"
   local host="$2"
@@ -90,17 +83,15 @@ setup_key_auth() {
     return 0
   fi
 
-  read -r -s -p "Remote password for ${user}@${host}: " pass
-  echo
-
   if need_cmd ssh-copy-id; then
-    ensure_sshpass
-    sshpass -p "$pass" ssh-copy-id -o StrictHostKeyChecking=accept-new "${user}@${host}"
+    echo "Password will be requested to install key..."
+    ssh-copy-id -o StrictHostKeyChecking=accept-new "${user}@${host}"
   else
-    ensure_sshpass
-    sshpass -p "$pass" ssh -o StrictHostKeyChecking=accept-new "${user}@${host}" \
-      "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys" \
-      < "$HOME/.ssh/id_rsa.pub"
+    echo "Password will be requested to install key..."
+    ssh -o StrictHostKeyChecking=accept-new "${user}@${host}" \
+      "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
+    ssh -o StrictHostKeyChecking=accept-new "${user}@${host}" \
+      "cat >> ~/.ssh/authorized_keys" < "$HOME/.ssh/id_rsa.pub"
   fi
 }
 
