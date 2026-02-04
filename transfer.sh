@@ -103,6 +103,10 @@ require_file() {
   fi
 }
 
+run_backup() {
+  sudo /bin/bash /usr/local/SSR-Bash-Python/user/backup.sh
+}
+
 main() {
   if [[ "$(id -u)" -ne 0 ]]; then
     echo "Warning: not running as root. You may need sudo for installs or file access."
@@ -128,11 +132,13 @@ main() {
 
   case "$choice" in
     1)
+      run_backup
       require_file "$LOCAL_SSR"
       ssh "${remote_user}@${remote_ip}" "mkdir -p /root/backup"
       rsync -avz -e ssh "$LOCAL_SSR" "${remote_user}@${remote_ip}:$REMOTE_SSR"
       ;;
     2)
+      run_backup
       require_file "$LOCAL_HUI"
       ssh "${remote_user}@${remote_ip}" "mkdir -p /usr/local/h-ui/data"
       rsync -avz -e ssh "$LOCAL_HUI" "${remote_user}@${remote_ip}:$REMOTE_HUI"
