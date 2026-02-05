@@ -5,6 +5,8 @@ LOCAL_SSR="/root/backup/ssr-conf.tar.gz"
 REMOTE_SSR="/root/backup/ssr-conf.tar.gz"
 LOCAL_HUI="/usr/local/h-ui/data/h_ui.db"
 REMOTE_HUI="/usr/local/h-ui/data/h_ui.db"
+LOCAL_CERT_DIR="/root/cert"
+REMOTE_CERT_DIR="/root/cert"
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1
@@ -128,7 +130,8 @@ main() {
   echo "Select transfer:"
   echo "1) ssr package"
   echo "2) hui package"
-  read -r -p "Enter 1 or 2: " choice
+  echo "3) cert directory"
+  read -r -p "Enter 1, 2, or 3: " choice
 
   case "$choice" in
     1)
@@ -142,6 +145,14 @@ main() {
       require_file "$LOCAL_HUI"
       ssh "${remote_user}@${remote_ip}" "mkdir -p /usr/local/h-ui/data"
       rsync -avz -e ssh "$LOCAL_HUI" "${remote_user}@${remote_ip}:$REMOTE_HUI"
+      ;;
+    3)
+      if [[ ! -d "$LOCAL_CERT_DIR" ]]; then
+        echo "Local directory not found: $LOCAL_CERT_DIR" >&2
+        exit 1
+      fi
+      ssh "${remote_user}@${remote_ip}" "mkdir -p $REMOTE_CERT_DIR"
+      rsync -avz --delete -e ssh "${LOCAL_CERT_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_CERT_DIR}/"
       ;;
     *)
       echo "Invalid choice." >&2
