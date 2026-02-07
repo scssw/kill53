@@ -5,7 +5,7 @@ IPSET_V4="chnroute"
 IPSET_V6="chnroute6"
 IPTABLES_FILE="/etc/iptables.up.rules"
 URL_V4="https://ruleset.skk.moe/Clash/ip/china_ip.txt"
-URL_V6="https://ruleset.skk.moe/Clash/ip/china_ipv6.txt"
+URL_V6="https://raw.githubusercontent.com/gaoyifan/china-operator-ip/ip-lists/china6.txt"
 FIX_MARKER="/etc/nocn_fixed_marker"
 
 # 检查 root 权限
