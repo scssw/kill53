@@ -5,6 +5,8 @@ LOCAL_SSR="/root/backup/ssr-conf.tar.gz"
 REMOTE_SSR="/root/backup/ssr-conf.tar.gz"
 LOCAL_HUI="/usr/local/h-ui/data/h_ui.db"
 REMOTE_HUI="/usr/local/h-ui/data/h_ui.db"
+LOCAL_XUI="/etc/x-ui/x-ui.db"
+REMOTE_XUI="/etc/x-ui/x-ui.db"
 LOCAL_CERT_DIR="/root/cert"
 REMOTE_CERT_DIR="/root/cert"
 
@@ -131,7 +133,8 @@ main() {
   echo "1) ssr package"
   echo "2) hui package"
   echo "3) cert directory"
-  read -r -p "Enter 1, 2, or 3: " choice
+  echo "4) xui database"
+  read -r -p "Enter 1, 2, 3, or 4: " choice
 
   case "$choice" in
     1)
@@ -153,6 +156,11 @@ main() {
       fi
       ssh "${remote_user}@${remote_ip}" "mkdir -p $REMOTE_CERT_DIR"
       rsync -avz --delete -e ssh "${LOCAL_CERT_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_CERT_DIR}/"
+      ;;
+    4)
+      require_file "$LOCAL_XUI"
+      ssh "${remote_user}@${remote_ip}" "mkdir -p /etc/x-ui"
+      rsync -avz -e ssh "$LOCAL_XUI" "${remote_user}@${remote_ip}:$REMOTE_XUI"
       ;;
     *)
       echo "Invalid choice." >&2
