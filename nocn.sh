@@ -1,66 +1,74 @@
 #!/bin/bash
 
-# 配置变量 (使用 skk.moe 优化源)
+# 配置变量
 IPSET_V4="chnroute"
 IPSET_V6="chnroute6"
 IPTABLES_FILE="/etc/iptables.up.rules"
 URL_V4="https://ruleset.skk.moe/Clash/ip/china_ip.txt"
 URL_V6="https://ruleset.skk.moe/Clash/ip/china_ipv6.txt"
+FIX_MARKER="/etc/nocn_fixed_marker"
 
 # 检查 root 权限
 [[ $EUID -ne 0 ]] && echo "错误: 请使用 root 权限运行" && exit 1
 
-# --- 修复软件源函数 ---
-fix_debian_sources() {
-    echo "检测到 Debian 11 或软件源异常，正在尝试修复..."
-    # 移除报错的 backports 源
-    sed -i '/bullseye-backports/d' /etc/apt/sources.list 2>/dev/null
-    rm -f /etc/apt/sources.list.d/backports.list 2>/dev/null
-    # 更新索引
-    apt-get update --fix-missing
-}
-
-# --- 依赖检查与安装 ---
+# --- 智能环境检查 ---
 ensure_env() {
-    # 如果是 Debian 11，主动预防
-    if grep -q "bullseye" /etc/os-release 2>/dev/null; then
-        echo "系统确认: Debian 11 (Bullseye)，执行源优化..."
-        fix_debian_sources
+    # 1. 优先检查 ipset 是否已存在。如果存在，说明环境是好的，直接跳过所有修复。
+    if command -v ipset &> /dev/null; then
+        echo "✅ 检测到 ipset 已安装，跳过源修复步骤..."
+        return
     fi
 
-    if ! command -v ipset &> /dev/null || ! command -v curl &> /dev/null; then
-        echo "正在安装必要组件 (ipset/curl)..."
-        if ! apt-get install -y ipset curl; then
-            echo "安装失败，尝试修复源后重试..."
-            fix_debian_sources
-            apt-get install -y ipset curl
+    # 2. 如果 ipset 不存在，且没有修复过，则执行修复
+    if [[ -f "$FIX_MARKER" ]]; then
+        echo "检测到已执行过修复，正在重试安装..."
+    else
+        # 只有在 Debian 11 且未修复过时才执行
+        if grep -q "bullseye" /etc/os-release 2>/dev/null; then
+            echo "检测到 Debian 11，正在执行源修复..."
+            sed -i '/bullseye-backports/d' /etc/apt/sources.list 2>/dev/null
+            rm -f /etc/apt/sources.list.d/backports.list 2>/dev/null
+            # 创建标记文件，下次不再运行
+            touch "$FIX_MARKER"
         fi
     fi
 
-    # 最终确认
-    if ! command -v ipset &> /dev/null; then
-        echo "❌ 无法安装 ipset，请手动检查 VPS 联网状态或软件源。"
-        exit 1
-    fi
+    # 3. 安装依赖
+    echo "正在安装依赖..."
+    apt-get update --fix-missing -y
+    apt-get install -y ipset curl
 }
 
 block_cn() {
     ensure_env
-    echo "1. 正在获取 IPv4 列表 (skk.moe)..."
+    
+    echo "1. 正在获取 IPv4 列表..."
     ipset create $IPSET_V4 hash:net -exist
     ipset flush $IPSET_V4
     
-    # 抓取数据：过滤空行、剔除空格、只保留合规 IP 格式
-    data_v4=$(curl -f -L -s $URL_V4 | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}' | sed 's/[[:space:]]//g')
-    if [ -z "$data_v4" ]; then echo "❌ IPv4 数据获取失败"; exit 1; fi
+    # 增加超时和重试机制
+    data_v4=$(curl --retry 3 --connect-timeout 10 -f -L -s $URL_V4 | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}' | sed 's/[[:space:]]//g')
+    
+    if [ -z "$data_v4" ]; then 
+        echo "❌ IPv4 数据下载失败，请检查网络连接！"
+        exit 1
+    fi
     echo "$data_v4" | sed "s|^|add $IPSET_V4 |" | ipset restore -!
 
     echo "2. 正在获取 IPv6 列表..."
+    # 允许 IPv6 失败而不退出脚本
     ipset create $IPSET_V6 hash:net family inet6 -exist
     ipset flush $IPSET_V6
-    data_v6=$(curl -f -L -s $URL_V6 | grep ':' | sed 's/[[:space:]]//g')
-    if [ -z "$data_v6" ]; then echo "❌ IPv6 数据获取失败"; exit 1; fi
-    echo "$data_v6" | sed "s|^|add $IPSET_V6 |" | ipset restore -!
+    
+    data_v6=$(curl --retry 3 --connect-timeout 10 -f -L -s $URL_V6 | grep ':' | sed 's/[[:space:]]//g')
+    
+    if [ -n "$data_v6" ]; then
+        echo "$data_v6" | sed "s|^|add $IPSET_V6 |" | ipset restore -!
+        ENABLE_V6=true
+    else
+        echo "⚠️ IPv6 列表下载失败 (或为空)，将仅启用 IPv4 拦截..."
+        ENABLE_V6=false
+    fi
 
     echo "3. 部署拦截策略..."
     # 清理旧规则
@@ -69,26 +77,34 @@ block_cn() {
     ip6tables -D OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
     ip6tables -D OUTPUT -m set --match-set $IPSET_V6 dst -j REJECT 2>/dev/null
 
-    # 关键：允许 ESTABLISHED 保证 SSR 连接不断开
+    # 应用 IPv4 规则
     iptables -I OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
     iptables -A OUTPUT -m set --match-set $IPSET_V4 dst -j REJECT --reject-with icmp-port-unreachable
     
-    ip6tables -I OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-    ip6tables -A OUTPUT -m set --match-set $IPSET_V6 dst -j REJECT
+    # 应用 IPv6 规则 (如果下载成功)
+    if [ "$ENABLE_V6" = true ]; then
+        ip6tables -I OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+        ip6tables -A OUTPUT -m set --match-set $IPSET_V6 dst -j REJECT
+    fi
 
-    # 4. 强制拦截国内公共 DNS
+    # 拦截国内公共 DNS
     iptables -I OUTPUT -d 114.114.114.114,223.5.5.5,119.29.29.29 -j REJECT 2>/dev/null
 
-    # 5. 保存规则
+    # 保存
     iptables-save > $IPTABLES_FILE
+    
     echo "========================================"
     echo "✅ 拦截已开启！"
-    echo "VPS 已拒绝连接中国 IP 段，百度等国内站已封锁。"
+    if [ "$ENABLE_V6" = true ]; then
+        echo "   状态: IPv4 + IPv6 双栈封锁"
+    else
+        echo "   状态: 仅 IPv4 封锁 (IPv6 获取失败)"
+    fi
     echo "========================================"
 }
 
 unblock_cn() {
-    echo "正在恢复系统访问..."
+    echo "正在还原设置..."
     iptables -D OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
     while iptables -D OUTPUT -m set --match-set $IPSET_V4 dst -j REJECT 2>/dev/null; do :; done
     iptables -D OUTPUT -d 114.114.114.114,223.5.5.5,119.29.29.29 -j REJECT 2>/dev/null
@@ -103,19 +119,11 @@ unblock_cn() {
     echo "✅ 拦截已解除。"
 }
 
-# --- 菜单 ---
 clear
-echo "#############################################"
-echo "#    VPS 拒绝中国流量 (Debian 11 适配版)     #"
-echo "#############################################"
-echo ""
-echo "1. 开启拦截 (拒绝回国流量)"
+echo "1. 开启拦截"
 echo "2. 取消拦截"
-echo ""
-read -p "请输入数字 [1-2]: " choice
-
+read -p "选择 [1-2]: " choice
 case $choice in
     1) block_cn ;;
     2) unblock_cn ;;
-    *) echo "退出" ;;
 esac
