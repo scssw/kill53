@@ -5,8 +5,8 @@ IPSET_V4="chnroute"
 IPSET_V6="chnroute6"
 IPTABLES_FILE="/etc/iptables.up.rules"
 # 列表源
-URL_V4="https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
-URL_V6="https://raw.githubusercontent.com/gaoyifan/china-operator-ip/ip-lists/china6.txt"
+URL_V4="https://ruleset.skk.moe/Clash/ip/china_ip.txt"
+URL_V6="https://ruleset.skk.moe/Clash/ip/china_ipv6.txt"
 
 if [[ $EUID -ne 0 ]]; then
    echo "请使用 root 权限运行" 
