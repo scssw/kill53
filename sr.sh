@@ -74,6 +74,244 @@ StopInstall(){
 #Get Current Directory
 workdir=$(pwd)
 
+InstallPython3(){
+    if command -v python3 >/dev/null 2>&1;then
+        echo "检测到 python3，跳过安装: $(command -v python3)"
+        return 0
+    fi
+    echo "未检测到 python3，开始安装..."
+    if [[ ${OS} == Ubuntu || ${OS} == Debian ]];then
+        apt-get update
+        apt-get install -y python3 python3-pip
+    fi
+    if [[ ${OS} == CentOS ]];then
+        yum install -y python3 python3-pip
+        if [[ $? != 0 && ${CentOS_RHEL_version} == 7 ]];then
+            yum install -y epel-release
+            yum install -y python36 python36-pip
+            if [[ $? == 0 && ! -x /usr/bin/python3 && -x /usr/bin/python3.6 ]];then
+                ln -sf /usr/bin/python3.6 /usr/bin/python3
+            fi
+        fi
+    fi
+    if ! command -v python3 >/dev/null 2>&1;then
+        echo "python3 安装失败，请检查软件源后重试！"
+        exit 1
+    fi
+}
+
+NeedsPython3ShebangMigration(){
+    local target_dir="$1"
+    [[ -d ${target_dir} ]] || return 1
+
+    find "${target_dir}" -type f -name "*.py" -exec grep -lE \
+        '^(#!/usr/bin/python|#!/usr/bin/env python|# !/usr/bin/env python)$' {} + 2>/dev/null | grep -q .
+}
+
+ShellFileHasLegacyPythonCall(){
+    local target_file="$1"
+    [[ -f ${target_file} ]] || return 1
+
+    grep -qE '(^|[^[:alnum:]_])python2?([[:space:]]|-c|")' "${target_file}"
+}
+
+EnablePython3ForSSR(){
+    echo "开始检查 SSR 目录的 python3 兼容性..."
+
+    if [[ -d /usr/local/shadowsocksr ]];then
+        local ssr_needs_py3="no"
+        if NeedsPython3ShebangMigration /usr/local/shadowsocksr;then
+            ssr_needs_py3="yes"
+        fi
+        for ssr_script in /usr/local/shadowsocksr/run.sh /usr/local/shadowsocksr/logrun.sh /usr/local/shadowsocksr/stop.sh /usr/local/shadowsocksr/initmudbjson.sh
+        do
+            if [[ ! -f ${ssr_script} ]] || ShellFileHasLegacyPythonCall "${ssr_script}";then
+                ssr_needs_py3="yes"
+                break
+            fi
+        done
+
+        if [[ ${ssr_needs_py3} == "yes" ]];then
+            find /usr/local/shadowsocksr -type f -name "*.py" -exec sed -i \
+                -e '1s@^#!/usr/bin/python$@#!/usr/bin/env python3@' \
+                -e '1s@^#!/usr/bin/env python$@#!/usr/bin/env python3@' \
+                -e '1s@^# !/usr/bin/env python$@# !/usr/bin/env python3@' {} +
+
+            cat > /usr/local/shadowsocksr/run.sh <<'EOF'
+#!/bin/bash
+cd `dirname $0`
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: python3 not found"
+    exit 1
+fi
+
+eval $(ps -ef | grep "[0-9] python3 server\\.py m" | awk '{print "kill "$2}')
+ulimit -n 512000
+nohup python3 server.py m>> /dev/null 2>&1 &
+EOF
+
+            cat > /usr/local/shadowsocksr/logrun.sh <<'EOF'
+#!/bin/bash
+cd `dirname $0`
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: python3 not found"
+    exit 1
+fi
+
+eval $(ps -ef | grep "[0-9] python3 server\\.py m" | awk '{print "kill "$2}')
+ulimit -n 512000
+nohup python3 server.py m>> ssserver.log 2>&1 &
+EOF
+
+            cat > /usr/local/shadowsocksr/stop.sh <<'EOF'
+#!/bin/bash
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: python3 not found"
+    exit 1
+fi
+
+eval $(ps -ef | grep "[0-9] python3 server\\.py m" | awk '{print "kill "$2}')
+EOF
+
+            cat > /usr/local/shadowsocksr/initmudbjson.sh <<'EOF'
+#!/bin/bash
+
+bash initcfg.sh
+sed -i "s/API_INTERFACE = .\+\?\#/API_INTERFACE = \'mudbjson\' \#/g" userapiconfig.py
+ip_addr=`ifconfig -a|grep inet|grep -v inet6|grep -v "127.0.0."|grep -v -e "192\.168\..[0-9]\+\.[0-9]\+"|grep -v -e "10\.[0-9]\+\.[0-9]\+\.[0-9]\+"|awk '{print $2}'|tr -d "addr:"`
+ip_count=`echo $ip_addr|grep -e "^[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+$" -c`
+
+if [[ $ip_count == 1 ]]; then
+	ip_addr=`ip a|grep inet|grep -v inet6|grep -v "127.0.0."|grep -v -e "192\.168\..[0-9]\+\.[0-9]\+"|grep -v -e "10\.[0-9]\+\.[0-9]\+\.[0-9]\+"|awk '{print $2}'`
+	ip_addr=${ip_addr%/*}
+	ip_count=`echo $ip_addr|grep -e "^[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+$" -c`
+fi
+if [[ $ip_count == 1 ]]; then
+	echo "server IP is "${ip_addr}
+	sed -i "s/SERVER_PUB_ADDR = .\+/SERVER_PUB_ADDR = \'"${ip_addr}"\'/g" userapiconfig.py
+	user_count=`python3 mujson_mgr.py -l|grep -c -e "[0-9]"`
+	if [[ $user_count == 0 ]]; then
+		port=`python3 -c 'import random;print(random.randint(10000, 65536))'`
+		python3 mujson_mgr.py -a -p ${port}
+	fi
+else
+	echo "unable to detect server IP"
+fi
+EOF
+
+            chmod +x /usr/local/shadowsocksr/run.sh /usr/local/shadowsocksr/logrun.sh /usr/local/shadowsocksr/stop.sh /usr/local/shadowsocksr/initmudbjson.sh
+            echo "/usr/local/shadowsocksr 已切换为 python3"
+        else
+            echo "/usr/local/shadowsocksr 已是 python3，跳过"
+        fi
+    fi
+
+    if [[ -d /usr/local/SSR-Bash-Python ]];then
+        local bash_py3_needs_migration="no"
+        if NeedsPython3ShebangMigration /usr/local/SSR-Bash-Python;then
+            bash_py3_needs_migration="yes"
+        fi
+        for compat_file in \
+            /usr/local/SSR-Bash-Python/traffic.sh \
+            /usr/local/SSR-Bash-Python/repair_timelimit.sh \
+            /usr/local/SSR-Bash-Python/restore_nonstandard_timelimit.sh \
+            /usr/local/SSR-Bash-Python/user/easyadd.sh \
+            /usr/local/SSR-Bash-Python/traffic_control.sh \
+            /usr/local/SSR-Bash-Python/self.sh
+        do
+            if ShellFileHasLegacyPythonCall "${compat_file}";then
+                bash_py3_needs_migration="yes"
+                break
+            fi
+        done
+
+        if [[ ${bash_py3_needs_migration} == "yes" ]];then
+            find /usr/local/SSR-Bash-Python -type f -name "*.py" -exec sed -i \
+                -e '1s@^#!/usr/bin/python$@#!/usr/bin/env python3@' \
+                -e '1s@^#!/usr/bin/env python$@#!/usr/bin/env python3@' \
+                -e '1s@^#! /usr/bin/env python3$@#!/usr/bin/env python3@' {} +
+
+            for compat_file in \
+                /usr/local/SSR-Bash-Python/traffic.sh \
+                /usr/local/SSR-Bash-Python/repair_timelimit.sh \
+                /usr/local/SSR-Bash-Python/restore_nonstandard_timelimit.sh \
+                /usr/local/SSR-Bash-Python/user/easyadd.sh
+            do
+                if ShellFileHasLegacyPythonCall "${compat_file}";then
+                    sed -i \
+                        -e 's/command -v python >/command -v python3 >/g' \
+                        -e 's/command -v python2 >/command -v python3 >/g' \
+                        -e 's/PYTHON_CMD="python"/PYTHON_CMD="python3"/g' \
+                        -e 's/PYTHON_CMD="python2"/PYTHON_CMD="python3"/g' "${compat_file}"
+                fi
+            done
+
+            if ShellFileHasLegacyPythonCall /usr/local/SSR-Bash-Python/traffic.sh;then
+                sed -i \
+                    -e 's/python mujson_mgr.py/python3 mujson_mgr.py/g' \
+                    /usr/local/SSR-Bash-Python/traffic.sh
+            fi
+
+            if ShellFileHasLegacyPythonCall /usr/local/SSR-Bash-Python/traffic_control.sh;then
+                sed -i 's/python -c "/python3 -c "/g' /usr/local/SSR-Bash-Python/traffic_control.sh
+            fi
+
+            if ShellFileHasLegacyPythonCall /usr/local/SSR-Bash-Python/self.sh;then
+                sed -i \
+                    -e 's#python /usr/local/SSR-Bash-Python/speed.py#python3 /usr/local/SSR-Bash-Python/speed.py#g' \
+                    -e 's#ExecStart=/usr/bin/python /usr/local/shadowsocksr/server.py#ExecStart=/usr/bin/env python3 /usr/local/shadowsocksr/server.py#g' \
+                    -e 's#nohup python server.py#nohup python3 server.py#g' \
+                    -e 's#&& python server.py#&& python3 server.py#g' \
+                    -e 's#python server.py#python3 server.py#g' \
+                    /usr/local/SSR-Bash-Python/self.sh
+            fi
+
+            echo "/usr/local/SSR-Bash-Python 已切换为 python3"
+        else
+            echo "/usr/local/SSR-Bash-Python 已是 python3，跳过"
+        fi
+    fi
+}
+
+FixLegacyPythonStartup(){
+    echo "开始修复历史遗留启动项中的 python 调用..."
+
+    if ShellFileHasLegacyPythonCall /usr/local/SSR-Bash-Python/web_panel_start.sh;then
+        sed -i 's#python server.py#python3 server.py#g' /usr/local/SSR-Bash-Python/web_panel_start.sh
+        chmod +x /usr/local/SSR-Bash-Python/web_panel_start.sh
+    fi
+
+    if [[ -f /etc/systemd/system/ssr-web-panel.service ]] && grep -qE 'ExecStart=(/usr/bin/python|python) /usr/local/shadowsocksr/server\.py' /etc/systemd/system/ssr-web-panel.service;then
+        sed -i \
+            -e 's#ExecStart=/usr/bin/python /usr/local/shadowsocksr/server.py#ExecStart=/usr/bin/env python3 /usr/local/shadowsocksr/server.py#g' \
+            -e 's#ExecStart=python /usr/local/shadowsocksr/server.py#ExecStart=/usr/bin/env python3 /usr/local/shadowsocksr/server.py#g' \
+            /etc/systemd/system/ssr-web-panel.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+
+    if [[ -f /etc/systemd/system/ssr-bash-python.service ]] && grep -qE 'ExecStart=(/usr/bin/python|python) /usr/local/shadowsocksr/server\.py' /etc/systemd/system/ssr-bash-python.service;then
+        sed -i \
+            -e 's#ExecStart=/usr/bin/python /usr/local/shadowsocksr/server.py#ExecStart=/usr/bin/env python3 /usr/local/shadowsocksr/server.py#g' \
+            -e 's#ExecStart=python /usr/local/shadowsocksr/server.py#ExecStart=/usr/bin/env python3 /usr/local/shadowsocksr/server.py#g' \
+            /etc/systemd/system/ssr-bash-python.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+
+    if [[ -f /etc/rc.local ]] && grep -qE 'cd /usr/local/shadowsocksr && (nohup )?python server\.py' /etc/rc.local;then
+        sed -i \
+            -e 's#cd /usr/local/shadowsocksr && nohup python server.py#cd /usr/local/shadowsocksr && nohup python3 server.py#g' \
+            -e 's#cd /usr/local/shadowsocksr && python server.py#cd /usr/local/shadowsocksr && python3 server.py#g' \
+            /etc/rc.local
+    fi
+
+    if crontab -l >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -qE '@reboot cd /usr/local/shadowsocksr && (nohup )?python server\.py';then
+        crontab -l 2>/dev/null | sed \
+            -e 's#@reboot cd /usr/local/shadowsocksr && python server.py#@reboot cd /usr/local/shadowsocksr && python3 server.py#g' \
+            -e 's#@reboot cd /usr/local/shadowsocksr && nohup python server.py#@reboot cd /usr/local/shadowsocksr && nohup python3 server.py#g' \
+            | crontab - 2>/dev/null || true
+    fi
+}
+
 #Install Basic Tools
 if [ ! -e /usr/local/bin/ssr ];then
 if [[ $1 == "uninstall" ]];then
@@ -83,10 +321,10 @@ fi
 echo "开始部署"
 trap 'StopInstall 2>/dev/null && exit 0' 2
 sleep 2s
+InstallPython3
 if [[ ${OS} == Ubuntu ]];then
     apt-get update
-    apt-get -y install python screen
-    apt-get install python-pip -y
+    apt-get -y install screen
     apt-get install git -y
     #apt-get install language-pack-zh-hans -y
     apt-get -y install bc vnstat
@@ -94,8 +332,7 @@ if [[ ${OS} == Ubuntu ]];then
     #apt-get install net-tools -y
 fi
 if [[ ${OS} == CentOS ]];then
-    yum install python screen curl -y
-    yum install python-setuptools -y && easy_install pip -y
+    yum install screen curl -y
     yum install git -y
     yum install bc -y
     yum install vnstat -y
@@ -105,8 +342,7 @@ if [[ ${OS} == CentOS ]];then
 fi
 if [[ ${OS} == Debian ]];then
     apt-get update
-    apt-get -y install python screen
-    apt-get install python-pip -y
+    apt-get -y install screen
     apt-get install git -y
     #apt-get -y install net-tools
     apt-get -y install bc vnstat
@@ -276,6 +512,9 @@ else
     cd ..
     bashinstall="no"
 fi
+InstallPython3
+EnablePython3ForSSR
+FixLegacyPythonStartup
 cd /usr/local/shadowsocksr
 bash initcfg.sh
 if [[ ! -e /usr/bin/bc ]];then
