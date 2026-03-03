@@ -39,17 +39,17 @@ install_pkg() {
 
   case "$pm" in
     apt)
-      sudo apt-get update -y
-      sudo apt-get install -y "$pkg"
+      apt-get update -y
+      apt-get install -y "$pkg"
       ;;
     yum)
-      sudo yum install -y "$pkg"
+      yum install -y "$pkg"
       ;;
     dnf)
-      sudo dnf install -y "$pkg"
+      dnf install -y "$pkg"
       ;;
     apk)
-      sudo apk add --no-cache "$pkg"
+      apk add --no-cache "$pkg"
       ;;
   esac
 }
@@ -108,12 +108,12 @@ require_file() {
 }
 
 run_backup() {
-  sudo /bin/bash /usr/local/SSR-Bash-Python/user/backup.sh
+  /bin/bash /usr/local/SSR-Bash-Python/user/backup.sh
 }
 
 main() {
   if [[ "$(id -u)" -ne 0 ]]; then
-    echo "Warning: not running as root. You may need sudo for installs or file access."
+    echo "Warning: not running as root. You may need for installs or file access."
   fi
 
   ensure_rsync
