@@ -39,17 +39,17 @@ install_pkg() {
 
   case "$pm" in
     apt)
-      apt-get update -y
-      apt-get install -y "$pkg"
+      sudo apt-get update -y
+      sudo apt-get install -y "$pkg"
       ;;
     yum)
-      yum install -y "$pkg"
+      sudo yum install -y "$pkg"
       ;;
     dnf)
-      dnf install -y "$pkg"
+      sudo dnf install -y "$pkg"
       ;;
     apk)
-      apk add --no-cache "$pkg"
+      sudo apk add --no-cache "$pkg"
       ;;
   esac
 }
@@ -108,12 +108,12 @@ require_file() {
 }
 
 run_backup() {
-  /bin/bash /usr/local/SSR-Bash-Python/user/backup.sh
+  sudo /bin/bash /usr/local/SSR-Bash-Python/user/backup.sh
 }
 
 main() {
   if [[ "$(id -u)" -ne 0 ]]; then
-    echo "Warning: not running as root. You may need for installs or file access."
+    echo "Warning: not running as root. You may need sudo for installs or file access."
   fi
 
   ensure_rsync
@@ -155,7 +155,7 @@ main() {
         exit 1
       fi
       ssh "${remote_user}@${remote_ip}" "mkdir -p $REMOTE_CERT_DIR"
-      rsync -avz --delete -e ssh "${LOCAL_CERT_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_CERT_DIR}/"
+      rsync -avz -e ssh "${LOCAL_CERT_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_CERT_DIR}/"
       ;;
     4)
       require_file "$LOCAL_XUI"
