@@ -9,6 +9,8 @@ LOCAL_XUI="/etc/x-ui/x-ui.db"
 REMOTE_XUI="/etc/x-ui/x-ui.db"
 LOCAL_CERT_DIR="/root/cert"
 REMOTE_CERT_DIR="/root/cert"
+LOCAL_EXTRA_CERT_DIR="/usr/local/h-ui/my_acme_dir/certificates/acme.zerossl.com-v2-dv90"
+REMOTE_EXTRA_CERT_DIR="/usr/local/h-ui/my_acme_dir/certificates/acme.zerossl.com-v2-dv90"
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1
@@ -154,8 +156,14 @@ main() {
         echo "Local directory not found: $LOCAL_CERT_DIR" >&2
         exit 1
       fi
-      ssh "${remote_user}@${remote_ip}" "mkdir -p $REMOTE_CERT_DIR"
+      ssh "${remote_user}@${remote_ip}" "mkdir -p \"$REMOTE_CERT_DIR\""
       rsync -avz -e ssh "${LOCAL_CERT_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_CERT_DIR}/"
+      if [[ -d "$LOCAL_EXTRA_CERT_DIR" ]]; then
+        ssh "${remote_user}@${remote_ip}" "mkdir -p \"$REMOTE_EXTRA_CERT_DIR\""
+        rsync -avz -e ssh "${LOCAL_EXTRA_CERT_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_EXTRA_CERT_DIR}/"
+      else
+        echo "Optional directory not found, skip: $LOCAL_EXTRA_CERT_DIR"
+      fi
       ;;
     4)
       require_file "$LOCAL_XUI"
