@@ -9,8 +9,8 @@ LOCAL_XUI="/etc/x-ui/x-ui.db"
 REMOTE_XUI="/etc/x-ui/x-ui.db"
 LOCAL_CERT_DIR="/root/cert"
 REMOTE_CERT_DIR="/root/cert"
-LOCAL_EXTRA_CERT_DIR="/usr/local/h-ui/my_acme_dir/certificates/acme.zerossl.com-v2-dv90"
-REMOTE_EXTRA_CERT_DIR="/usr/local/h-ui/my_acme_dir/certificates/acme.zerossl.com-v2-dv90"
+LOCAL_EXTRA_CERT_DIR="/usr/local/h-ui/my_acme_dir/certificates"
+REMOTE_EXTRA_CERT_DIR="/usr/local/h-ui/my_acme_dir/certificates"
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1
