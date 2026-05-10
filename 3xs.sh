@@ -42,6 +42,53 @@ arch() {
 
 echo "Arch: $(arch)"
 
+xray_asset_arch() {
+    case "$(arch)" in
+        amd64) echo '64' ;;
+        386) echo '32' ;;
+        arm64) echo 'arm64-v8a' ;;
+        armv7) echo 'arm32-v7a' ;;
+        armv6) echo 'arm32-v6' ;;
+        armv5) echo 'arm32-v5' ;;
+        s390x) echo 's390x' ;;
+        *) echo '' ;;
+    esac
+}
+
+install_default_xray() {
+    local xray_version="${XRAY_VERSION:-v26.4.25}"
+    local asset_arch="$(xray_asset_arch)"
+    local target_arch="$(arch)"
+    local target_name="xray-linux-${target_arch}"
+
+    if [[ -z "${asset_arch}" ]]; then
+        echo -e "${yellow}Skipping Xray-core replacement for unsupported arch: ${target_arch}${plain}"
+        return 0
+    fi
+
+    if [[ "${target_arch}" == "armv5" || "${target_arch}" == "armv6" || "${target_arch}" == "armv7" ]]; then
+        target_name="xray-linux-arm"
+    fi
+
+    echo -e "${green}Installing default Xray-core ${xray_version}...${plain}"
+    mkdir -p bin
+    curl -4fL -o /tmp/xray-core.zip "https://github.com/XTLS/Xray-core/releases/download/${xray_version}/Xray-linux-${asset_arch}.zip"
+    if [[ $? -ne 0 ]]; then
+        echo -e "${red}Failed to download Xray-core ${xray_version}${plain}"
+        exit 1
+    fi
+    rm -rf /tmp/xray-core
+    mkdir -p /tmp/xray-core
+    unzip -o /tmp/xray-core.zip -d /tmp/xray-core >/dev/null
+    if [[ $? -ne 0 || ! -f /tmp/xray-core/xray ]]; then
+        echo -e "${red}Failed to extract Xray-core ${xray_version}${plain}"
+        exit 1
+    fi
+    mv -f /tmp/xray-core/xray "bin/${target_name}"
+    chmod +x "bin/${target_name}"
+    rm -rf /tmp/xray-core /tmp/xray-core.zip
+}
+
 # Simple helpers
 is_ipv4() {
     [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && return 0 || return 1
@@ -76,29 +123,29 @@ is_port_in_use() {
 install_base() {
     case "${release}" in
         ubuntu | debian | armbian)
-            apt-get update && apt-get install -y -q cron curl tar tzdata socat ca-certificates openssl
+            apt-get update && apt-get install -y -q cron curl tar unzip tzdata socat ca-certificates openssl
             ;;
         fedora | amzn | virtuozzo | rhel | almalinux | rocky | ol)
-            dnf -y update && dnf install -y -q cronie curl tar tzdata socat ca-certificates openssl
+            dnf -y update && dnf install -y -q cronie curl tar unzip tzdata socat ca-certificates openssl
             ;;
         centos)
             if [[ "${VERSION_ID}" =~ ^7 ]]; then
-                yum -y update && yum install -y cronie curl tar tzdata socat ca-certificates openssl
+                yum -y update && yum install -y cronie curl tar unzip tzdata socat ca-certificates openssl
             else
-                dnf -y update && dnf install -y -q cronie curl tar tzdata socat ca-certificates openssl
+                dnf -y update && dnf install -y -q cronie curl tar unzip tzdata socat ca-certificates openssl
             fi
             ;;
         arch | manjaro | parch)
-            pacman -Syu && pacman -Syu --noconfirm cronie curl tar tzdata socat ca-certificates openssl
+            pacman -Syu && pacman -Syu --noconfirm cronie curl tar unzip tzdata socat ca-certificates openssl
             ;;
         opensuse-tumbleweed | opensuse-leap)
-            zypper refresh && zypper -q install -y cron curl tar timezone socat ca-certificates openssl
+            zypper refresh && zypper -q install -y cron curl tar unzip timezone socat ca-certificates openssl
             ;;
         alpine)
-            apk update && apk add dcron curl tar tzdata socat ca-certificates openssl
+            apk update && apk add dcron curl tar unzip tzdata socat ca-certificates openssl
             ;;
         *)
-            apt-get update && apt-get install -y -q cron curl tar tzdata socat ca-certificates openssl
+            apt-get update && apt-get install -y -q cron curl tar unzip tzdata socat ca-certificates openssl
             ;;
     esac
 }
@@ -861,7 +908,12 @@ install_x-ui() {
         mv bin/xray-linux-$(arch) bin/xray-linux-arm
         chmod +x bin/xray-linux-arm
     fi
-    chmod +x x-ui bin/xray-linux-$(arch)
+    install_default_xray
+    if [[ $(arch) == "armv5" || $(arch) == "armv6" || $(arch) == "armv7" ]]; then
+        chmod +x x-ui bin/xray-linux-arm
+    else
+        chmod +x x-ui bin/xray-linux-$(arch)
+    fi
 
     # Update x-ui cli and se set permission
     mv -f /usr/bin/x-ui-temp /usr/bin/x-ui
