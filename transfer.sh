@@ -9,8 +9,8 @@ LOCAL_XUI="/etc/x-ui/x-ui.db"
 REMOTE_XUI="/etc/x-ui/x-ui.db"
 LOCAL_CERT_DIR="/root/cert"
 REMOTE_CERT_DIR="/root/cert"
-LOCAL_EXTRA_CERT_DIR="/usr/local/h-ui/my_acme_dir/certificates"
-REMOTE_EXTRA_CERT_DIR="/usr/local/h-ui/my_acme_dir/certificates"
+LOCAL_EXTRA_CERT_DIR="/usr/local/h-ui/my_acme_dir/certificates/acme.zerossl.com-v2-dv90"
+REMOTE_EXTRA_CERT_DIR="/usr/local/h-ui/my_acme_dir/certificates/acme.zerossl.com-v2-dv90"
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1
@@ -35,7 +35,7 @@ install_pkg() {
   local pm
   pm="$(detect_pm)"
   if [[ -z "$pm" ]]; then
-    echo "No supported package manager found; please install $pkg manually." >&2
+    echo "未找到支持的包管理器；请手动安装 $pkg。" >&2
     return 1
   fi
 
@@ -58,18 +58,18 @@ install_pkg() {
 
 ensure_rsync() {
   if ! need_cmd rsync; then
-    echo "rsync not found; installing..."
+    echo "未找到 rsync；正在安装..."
     install_pkg rsync
   fi
 }
 
 ensure_ssh_key() {
   if [[ ! -f "$HOME/.ssh/id_rsa" || ! -f "$HOME/.ssh/id_rsa.pub" ]]; then
-    echo "SSH key not found; creating one..."
+    echo "未找到 SSH 密钥；正在创建..."
     mkdir -p "$HOME/.ssh"
     ssh-keygen -t rsa -b 2048 -N "" -f "$HOME/.ssh/id_rsa"
   else
-    echo "SSH key exists; skipping."
+    echo "SSH 密钥已存在；跳过。"
   fi
 }
 
@@ -85,15 +85,15 @@ setup_key_auth() {
   local host="$2"
 
   if try_key_auth "$user" "$host"; then
-    echo "Key auth already works; skipping password."
+    echo "密钥认证已生效；跳过密码输入。"
     return 0
   fi
 
   if need_cmd ssh-copy-id; then
-    echo "Password will be requested to install key..."
+    echo "将要求输入密码以安装密钥..."
     ssh-copy-id -o StrictHostKeyChecking=accept-new "${user}@${host}"
   else
-    echo "Password will be requested to install key..."
+    echo "将要求输入密码以安装密钥..."
     ssh -o StrictHostKeyChecking=accept-new "${user}@${host}" \
       "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
     ssh -o StrictHostKeyChecking=accept-new "${user}@${host}" \
@@ -104,7 +104,7 @@ setup_key_auth() {
 require_file() {
   local path="$1"
   if [[ ! -f "$path" ]]; then
-    echo "Local file not found: $path" >&2
+    echo "本地文件未找到: $path" >&2
     exit 1
   fi
 }
@@ -115,15 +115,15 @@ run_backup() {
 
 main() {
   if [[ "$(id -u)" -ne 0 ]]; then
-    echo "Warning: not running as root. You may need sudo for installs or file access."
+    echo "警告: 当前未以 root 身份运行。可能需要使用 sudo 进行安装或文件访问。"
   fi
 
   ensure_rsync
   ensure_ssh_key
 
-  read -r -p "Remote IP: " remote_ip
+  read -r -p "远程 IP: " remote_ip
   if [[ -z "$remote_ip" ]]; then
-    echo "Remote IP is required." >&2
+    echo "远程 IP 是必需的。" >&2
     exit 1
   fi
 
@@ -131,12 +131,12 @@ main() {
 
   setup_key_auth "$remote_user" "$remote_ip"
 
-  echo "Select transfer:"
-  echo "1) ssr package"
-  echo "2) hui package"
-  echo "3) cert directory"
-  echo "4) xui database"
-  read -r -p "Enter 1, 2, 3, or 4: " choice
+  echo "请选择传输选项:"
+  echo "1) ssr 包"
+  echo "2) hui 包"
+  echo "3) 证书目录"
+  echo "4) xui 数据库"
+  read -r -p "请输入 1, 2, 3 或 4: " choice
 
   case "$choice" in
     1)
@@ -153,7 +153,7 @@ main() {
       ;;
     3)
       if [[ ! -d "$LOCAL_CERT_DIR" ]]; then
-        echo "Local directory not found: $LOCAL_CERT_DIR" >&2
+        echo "本地目录未找到: $LOCAL_CERT_DIR" >&2
         exit 1
       fi
       ssh "${remote_user}@${remote_ip}" "mkdir -p \"$REMOTE_CERT_DIR\""
@@ -162,7 +162,7 @@ main() {
         ssh "${remote_user}@${remote_ip}" "mkdir -p \"$REMOTE_EXTRA_CERT_DIR\""
         rsync -avz -e ssh "${LOCAL_EXTRA_CERT_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_EXTRA_CERT_DIR}/"
       else
-        echo "Optional directory not found, skip: $LOCAL_EXTRA_CERT_DIR"
+        echo "可选目录未找到，跳过: $LOCAL_EXTRA_CERT_DIR"
       fi
       ;;
     4)
@@ -171,12 +171,12 @@ main() {
       rsync -avz -e ssh "$LOCAL_XUI" "${remote_user}@${remote_ip}:$REMOTE_XUI"
       ;;
     *)
-      echo "Invalid choice." >&2
+      echo "无效的选择。" >&2
       exit 1
       ;;
   esac
 
-  echo "Done."
+  echo "完成。"
 }
 
 main "$@"
