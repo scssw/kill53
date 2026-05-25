@@ -12,6 +12,7 @@ LOG_PATH="/var/log/${APP_NAME}.log"
 CRON_MARKER="# ${APP_NAME}_daily_job"
 DEFAULT_SSR_FILE="/usr/local/shadowsocksr/mudb.json"
 ROOT_SSH_DIR="/root/.ssh"
+SELF_DOWNLOAD_URL="https://raw.githubusercontent.com/scssw/kill53/refs/heads/main/ssr_cf_switch.sh"
 
 need_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -177,13 +178,52 @@ valid_ipv4() {
   done
 }
 
+resolve_script_path() {
+  local source_path="${BASH_SOURCE[0]:-$0}"
+  local resolved_path
+
+  if [ -f "$source_path" ]; then
+    readlink -f "$source_path"
+    return 0
+  fi
+
+  if [[ "$source_path" != /* ]] && [ -f "$(pwd -P)/${source_path}" ]; then
+    readlink -f "$(pwd -P)/${source_path}"
+    return 0
+  fi
+
+  resolved_path="$(readlink -f "$source_path" 2>/dev/null || true)"
+  if [ -n "$resolved_path" ] && [ -f "$resolved_path" ]; then
+    printf '%s\n' "$resolved_path"
+    return 0
+  fi
+
+  return 1
+}
+
 install_self() {
   local current_path
 
-  current_path="$(readlink -f "$0")"
-  if [ "$current_path" != "$INSTALL_PATH" ]; then
-    cp "$current_path" "$INSTALL_PATH"
+  if current_path="$(resolve_script_path)"; then
+    if [ "$current_path" != "$INSTALL_PATH" ]; then
+      cp "$current_path" "$INSTALL_PATH"
+      chmod 700 "$INSTALL_PATH"
+    fi
+  else
+    require_cmd curl
+    echo "当前脚本来自管道或进程替换，正在从 GitHub 下载脚本安装到 ${INSTALL_PATH}..."
+    curl -fsSL "$SELF_DOWNLOAD_URL" -o "$INSTALL_PATH"
     chmod 700 "$INSTALL_PATH"
+  fi
+
+  if [ ! -s "$INSTALL_PATH" ]; then
+    echo "脚本安装失败：${INSTALL_PATH} 为空或不存在。" >&2
+    exit 1
+  fi
+
+  if ! bash -n "$INSTALL_PATH"; then
+    echo "脚本安装失败：下载或复制后的脚本语法检查未通过。" >&2
+    exit 1
   fi
 }
 
