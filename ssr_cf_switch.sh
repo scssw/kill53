@@ -11,6 +11,7 @@ CONFIG_PATH="/etc/${APP_NAME}.conf"
 LOG_PATH="/var/log/${APP_NAME}.log"
 CRON_MARKER="# ${APP_NAME}_daily_job"
 DEFAULT_SSR_FILE="/usr/local/shadowsocksr/mudb.json"
+DEFAULT_TIMELIMIT_FILE="/usr/local/SSR-Bash-Python/timelimit.db"
 ROOT_SSH_DIR="/root/.ssh"
 SELF_DOWNLOAD_URL="https://raw.githubusercontent.com/scssw/kill53/refs/heads/main/ssr_cf_switch.sh"
 
@@ -239,6 +240,7 @@ write_config() {
     printf 'CF_TOKEN=%q\n' "$CF_TOKEN"
     printf 'TARGET_IP=%q\n' "$TARGET_IP"
     printf 'SSR_FILE=%q\n' "$SSR_FILE"
+    printf 'TIMELIMIT_FILE=%q\n' "$TIMELIMIT_FILE"
     printf 'TRANSFER_ENABLED=%q\n' "$transfer_enabled"
   } > "$CONFIG_PATH"
   chmod 600 "$CONFIG_PATH"
@@ -313,7 +315,21 @@ load_config() {
   CF_AUTH_TYPE="${CF_AUTH_TYPE:-token}"
   CF_EMAIL="${CF_EMAIL:-}"
   SSR_FILE="${SSR_FILE:-$DEFAULT_SSR_FILE}"
+  TIMELIMIT_FILE="${TIMELIMIT_FILE:-$DEFAULT_TIMELIMIT_FILE}"
   TRANSFER_ENABLED="${TRANSFER_ENABLED:-1}"
+}
+
+sync_file_to_target() {
+  local source_file="$1"
+  local label="$2"
+
+  if [ ! -f "$source_file" ]; then
+    echo "${label} 文件不存在：$source_file" >&2
+    return 1
+  fi
+
+  rsync -avz "$source_file" "root@${TARGET_IP}:${source_file}"
+  echo "${label} 已同步到：root@${TARGET_IP}:${source_file}"
 }
 
 run_job() {
@@ -327,12 +343,8 @@ run_job() {
   update_cloudflare_record "$DOMAIN" "$TARGET_IP"
 
   if [ "${TRANSFER_ENABLED}" = "1" ]; then
-    if [ ! -f "$SSR_FILE" ]; then
-      echo "SSR 数据文件不存在：$SSR_FILE" >&2
-      return 1
-    fi
-    rsync -avz "$SSR_FILE" "root@${TARGET_IP}:${SSR_FILE}"
-    echo "SSR 数据已同步到：root@${TARGET_IP}:${SSR_FILE}"
+    sync_file_to_target "$SSR_FILE" "SSR 用户数据"
+    sync_file_to_target "$TIMELIMIT_FILE" "SSR 到期时间数据"
   else
     echo "SSR 数据同步已关闭，仅执行 DNS 切换。"
   fi
@@ -396,6 +408,7 @@ setup_switch() {
   fi
 
   SSR_FILE="$DEFAULT_SSR_FILE"
+  TIMELIMIT_FILE="$DEFAULT_TIMELIMIT_FILE"
 
   echo "正在验证 Cloudflare 认证信息和域名..."
   zone_id="$(find_zone_id "$DOMAIN")"
@@ -410,6 +423,7 @@ setup_switch() {
   echo "每天 ${switch_time} 会执行："
   echo "1. 将 ${DOMAIN} 的 A 记录切换到 ${TARGET_IP}"
   echo "2. 执行 rsync -avz ${SSR_FILE} root@${TARGET_IP}:${SSR_FILE}"
+  echo "3. 执行 rsync -avz ${TIMELIMIT_FILE} root@${TARGET_IP}:${TIMELIMIT_FILE}"
   echo
   echo "配置文件：$CONFIG_PATH"
   echo "执行脚本：$INSTALL_PATH"
@@ -440,6 +454,15 @@ change_time() {
   echo "当前任务：${INSTALL_PATH} --run"
 }
 
+upgrade_script_only() {
+  need_root
+  install_self
+
+  echo "脚本已升级，原有配置和定时时间保持不变。"
+  echo "执行脚本：$INSTALL_PATH"
+  echo "配置文件：$CONFIG_PATH"
+}
+
 disable_transfer() {
   need_root
   load_config
@@ -462,14 +485,16 @@ show_menu() {
   echo "2、取消转移数据设置"
   echo "3、取消所有所有设置"
   echo "4、修改定时时间"
+  echo "5、升级脚本设置不变"
   echo
-  read -r -p "请输入选项 [1-4]：" choice
+  read -r -p "请输入选项 [1-5]：" choice
 
   case "$choice" in
     1) setup_switch ;;
     2) disable_transfer ;;
     3) cancel_all ;;
     4) change_time ;;
+    5) upgrade_script_only ;;
     *) echo "无效选项。" && exit 1 ;;
   esac
 }
