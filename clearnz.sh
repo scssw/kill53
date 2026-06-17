@@ -9,7 +9,7 @@ usage() {
   cat <<'USAGE'
 Usage:
   bash clean_nezha_rogue_agents.sh          # dry-run, only show actions
-  bash clean_nezha_rogue_agents.sh --apply  # stop, disable, and delete rogue random-config services
+  bash clean_nezha_rogue_agents.sh --apply  # stop, disable, kill, and delete rogue random-config agents
 
 This script preserves:
   /opt/nezha/agent/config.yml
@@ -74,6 +74,27 @@ extract_random_configs_from_unit() {
   grep -Eo -- "${AGENT_DIR}/config-[A-Za-z0-9_-]+\\.ya?ml" "$unit_file" | sort -u
 }
 
+stop_rogue_unit() {
+  unit_name="$1"
+  log "Stop rogue service: $unit_name"
+  run systemctl stop "$unit_name" || true
+  run systemctl disable "$unit_name" || true
+  run systemctl reset-failed "$unit_name" || true
+}
+
+kill_rogue_processes() {
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    found=1
+    log "Kill rogue process using random config: PID $pid"
+    run kill "$pid" || true
+  done < <(ps -eo pid=,args= | awk -v dir="$AGENT_DIR" '
+    $0 ~ dir "/nezha-agent" && $0 ~ dir "/config-[A-Za-z0-9_-]+\\.ya?ml" {
+      print $1
+    }
+  ')
+}
+
 main() {
   parse_args "$@"
   needs_root
@@ -92,6 +113,14 @@ main() {
   config_delete_list="$(mktemp)"
   trap 'rm -f "$config_delete_list"' EXIT
 
+  while IFS= read -r unit_name; do
+    [ -n "$unit_name" ] || continue
+    found=1
+    stop_rogue_unit "$unit_name"
+  done < <(systemctl list-units --type=service --all --plain --no-legend 'nezha-agent*.service' 2>/dev/null \
+    | awk '{print $1}' \
+    | grep -E '^nezha-agent-.+\.service$' || true)
+
   for unit_file in "${SYSTEMD_DIR}"/nezha-agent*.service; do
     [ -e "$unit_file" ] || continue
     [ "$unit_file" = "${SYSTEMD_DIR}/nezha-agent.service" ] && continue
@@ -102,12 +131,13 @@ main() {
       log "Rogue service: $unit_name"
       extract_random_configs_from_unit "$unit_file" | tee -a "$config_delete_list" | sed 's/^/  config: /'
 
-      run systemctl stop "$unit_name" || true
-      run systemctl disable "$unit_name" || true
+      stop_rogue_unit "$unit_name"
       run rm -f "$unit_file"
       log ""
     fi
   done
+
+  kill_rogue_processes
 
   for cfg in "${AGENT_DIR}"/config-*.yml "${AGENT_DIR}"/config-*.yaml; do
     [ -e "$cfg" ] || continue
