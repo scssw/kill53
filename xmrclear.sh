@@ -43,6 +43,23 @@ mkdir -p /opt/systemlog/SystemLoger
 chmod 000 /opt/systemlog/SystemLoger
 chattr +i /opt/systemlog/SystemLoger 2>/dev/null || true
 
+echo "  - systemlog.service 状态："
+systemctl is-enabled systemlog.service 2>/dev/null || true
+systemctl is-active systemlog.service 2>/dev/null || true
+if pgrep -f '^/opt/systemlog/SystemLoger$' >/dev/null 2>&1; then
+  echo "  - [WARN] SystemLoger 进程仍在运行"
+  ps aux | grep -F '/opt/systemlog/SystemLoger' | grep -v grep || true
+else
+  echo "  - [OK] SystemLoger 进程已清除"
+fi
+if [ -d /opt/systemlog/SystemLoger ] && [ ! -x /opt/systemlog/SystemLoger ]; then
+  echo "  - [OK] /opt/systemlog/SystemLoger 已替换为不可执行占位目录"
+else
+  echo "  - [WARN] /opt/systemlog/SystemLoger 占位异常"
+  ls -ld /opt/systemlog/SystemLoger 2>/dev/null || true
+fi
+lsattr -d /opt/systemlog/SystemLoger 2>/dev/null || true
+
 echo "[4/7] 停用 qemu-guest-agent..."
 systemctl stop qemu-guest-agent 2>/dev/null || true
 systemctl disable qemu-guest-agent 2>/dev/null || true
