@@ -1,0 +1,47 @@
+cat > /root/fix_cpu_xmrig_qemuga.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "[1/6] 清理 XMRig 矿工..."
+systemctl stop xmrig 2>/dev/null || true
+systemctl disable xmrig 2>/dev/null || true
+pkill -9 xmrig 2>/dev/null || true
+
+rm -f /etc/systemd/system/xmrig.service
+rm -f /etc/systemd/system/multi-user.target.wants/xmrig.service
+rm -f /usr/lib/systemd/system/xmrig.service
+rm -f /lib/systemd/system/xmrig.service
+rm -f /usr/local/bin/xmrig
+rm -rf /tmp/xmrig-*
+rm -f /tmp/xmrig.tar.gz /tmp/xmrig
+
+echo "[2/6] 清理 cron 里的矿工痕迹..."
+for c in /var/spool/cron/crontabs/root /var/spool/cron/root /etc/crontab; do
+  [ -f "$c" ] && sed -i.bak '/xmrig\|supportxmr\|monero\|minerd\|kinsing\|kdevtmpfsi/d' "$c"
+done
+
+find /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly -type f 2>/dev/null \
+  -exec sed -i.bak '/xmrig\|supportxmr\|monero\|minerd\|kinsing\|kdevtmpfsi/d' {} \; || true
+
+echo "[3/6] 停用 qemu-guest-agent..."
+systemctl stop qemu-guest-agent 2>/dev/null || true
+systemctl disable qemu-guest-agent 2>/dev/null || true
+systemctl mask qemu-guest-agent 2>/dev/null || true
+pkill -9 qemu-ga 2>/dev/null || true
+
+echo "[4/6] 清理 systemd 状态..."
+systemctl daemon-reload
+systemctl reset-failed 2>/dev/null || true
+
+echo "[5/6] 当前可疑进程："
+ps aux | egrep 'xmrig|supportxmr|monero|minerd|kinsing|kdevtmpfsi|qemu-ga' | grep -v grep || echo "未发现可疑进程"
+
+echo "[6/6] 当前 CPU 前10："
+ps -eo pid,ppid,user,stat,pcpu,pmem,comm,args --sort=-pcpu | head -11
+
+echo
+echo "完成。建议再执行：top"
+EOF
+
+chmod +x /root/fix_cpu_xmrig_qemuga.sh
+bash /root/fix_cpu_xmrig_qemuga.sh
