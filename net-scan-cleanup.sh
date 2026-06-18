@@ -12,6 +12,7 @@ set -euo pipefail
 
 SCAN_PORTS="${SCAN_PORTS:-23 2323 2333}"
 BLOCK_SSH_ABUSE="${BLOCK_SSH_ABUSE:-1}"
+SCAN_KILL_PROCS="${SCAN_KILL_PROCS:-1}"
 PERSIST="${PERSIST:-1}"
 TOP_N="${TOP_N:-30}"
 
@@ -94,6 +95,9 @@ audit_processes() {
     | grep ESTAB \
     | grep -o 'pid=[0-9]*' \
     | sort | uniq -c | sort -nr | head -n "$TOP_N" || true
+
+  show_header "processes connected to watched scan ports: $SCAN_PORTS"
+  scan_socket_lines | head -n 200 || true
 }
 
 audit_ssh() {
@@ -136,12 +140,40 @@ block_scan_ports() {
   iptables -S FORWARD | egrep "dport ($(port_regex))" || true
 }
 
+conntrack_scan_tuples() {
+  local re
+  re="$(port_regex)"
+  conntrack_scan_lines \
+    | awk -v re="^($re)$" '
+        {
+          src = dst = sport = dport = ""
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /^src=/ && src == "") src = substr($i, 5)
+            else if ($i ~ /^dst=/ && dst == "") dst = substr($i, 5)
+            else if ($i ~ /^sport=/ && sport == "") sport = substr($i, 7)
+            else if ($i ~ /^dport=/ && dport == "") dport = substr($i, 7)
+          }
+          if (src != "" && dst != "" && sport != "" && dport ~ re) {
+            print src, dst, sport, dport
+          }
+        }'
+}
+
 delete_conntrack_scan_ports() {
   show_header "delete existing conntrack state for scan ports"
-  local proto port before after
+  local proto port before after src dst sport dport tuple_tmp
   before="$(conntrack_scan_lines | wc -l || true)"
   echo "before: $before"
   if have conntrack; then
+    tuple_tmp="/tmp/net-scan-cleanup.conntrack-tuples.$$"
+    conntrack_scan_tuples | sort -u >"$tuple_tmp" || true
+    while read -r src dst sport dport; do
+      [ -n "${src:-}" ] || continue
+      conntrack -D -p tcp --orig-src "$src" --orig-dst "$dst" \
+        --sport "$sport" --dport "$dport" 2>/dev/null || true
+    done <"$tuple_tmp"
+    rm -f "$tuple_tmp"
+
     for proto in tcp udp; do
       for port in $SCAN_PORTS; do
         conntrack -D -p "$proto" --dport "$port" 2>/dev/null || true
@@ -151,6 +183,59 @@ delete_conntrack_scan_ports() {
   fi
   after="$(conntrack_scan_lines | wc -l || true)"
   echo "after: $after"
+}
+
+scan_socket_lines() {
+  local re
+  re="$(port_regex)"
+  if have ss; then
+    ss -H -tanp 2>/dev/null \
+      | awk -v re=":($re)$" '$1 ~ /^(ESTAB|SYN-SENT|SYN-RECV|FIN-WAIT-1|FIN-WAIT-2|CLOSE-WAIT|LAST-ACK)$/ && $5 ~ re {print}' || true
+  fi
+}
+
+kill_scan_processes() {
+  [ "$SCAN_KILL_PROCS" = "1" ] || return 0
+  have ss || return 0
+
+  show_header "terminate processes still connected to scan ports"
+  local tmp pid
+  tmp="/tmp/net-scan-cleanup.scan-pids.$$"
+  scan_socket_lines | tee /tmp/net-scan-cleanup.scan-sockets.$$ \
+    | grep -o 'pid=[0-9]*' \
+    | cut -d= -f2 \
+    | sort -u >"$tmp" || true
+
+  if [ ! -s "$tmp" ]; then
+    echo "no process-owned outbound scan sockets found"
+    rm -f "$tmp" /tmp/net-scan-cleanup.scan-sockets.$$
+    return 0
+  fi
+
+  while read -r pid; do
+    [ -n "${pid:-}" ] || continue
+    case "$pid" in
+      1|$$) continue ;;
+    esac
+    if kill -0 "$pid" 2>/dev/null; then
+      ps -p "$pid" -o pid,ppid,user,stat,%cpu,%mem,rss,etime,lstart,cmd --no-headers || true
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done <"$tmp"
+
+  sleep 2
+  while read -r pid; do
+    [ -n "${pid:-}" ] || continue
+    case "$pid" in
+      1|$$) continue ;;
+    esac
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "force killing pid=$pid"
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  done <"$tmp"
+
+  rm -f "$tmp" /tmp/net-scan-cleanup.scan-sockets.$$
 }
 
 block_recent_ssh_abusers() {
@@ -209,6 +294,7 @@ audit_all() {
 clean_all() {
   audit_scan_ports
   block_scan_ports
+  kill_scan_processes
   delete_conntrack_scan_ports
   block_recent_ssh_abusers
   persist_iptables
