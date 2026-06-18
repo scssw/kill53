@@ -27,6 +27,29 @@ have() {
   command -v "$1" >/dev/null 2>&1
 }
 
+ensure_conntrack() {
+  if have conntrack; then
+    return 0
+  fi
+
+  echo "未找到 conntrack，开始自动安装：apt install conntrack -y"
+  if have apt-get; then
+    apt-get update
+    apt-get install -y conntrack
+  elif have apt; then
+    apt update
+    apt install -y conntrack
+  else
+    echo "错误：未找到 conntrack，也未找到 apt/apt-get，无法自动安装" >&2
+    exit 1
+  fi
+
+  if ! have conntrack; then
+    echo "错误：conntrack 安装后仍不可用，请手动检查软件源或系统包管理器" >&2
+    exit 1
+  fi
+}
+
 port_regex() {
   local out="" p
   for p in $SCAN_PORTS; do
@@ -314,9 +337,9 @@ watch_scan() {
 main() {
   need_root
   case "${1:-audit}" in
-    audit) audit_all ;;
-    clean) clean_all ;;
-    watch) watch_scan ;;
+    audit) ensure_conntrack; audit_all ;;
+    clean) ensure_conntrack; clean_all ;;
+    watch) ensure_conntrack; watch_scan ;;
     ports) echo "$SCAN_PORTS" ;;
     *)
       echo "用法：$0 {audit|clean|watch|ports}" >&2
