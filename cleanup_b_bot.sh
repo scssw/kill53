@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# One-shot cleanup and audit for /tmp/b style Linux bot fallout.
+# One-shot cleanup and audit for /tmp/b and /tmp/probe-agent style fallout.
 # Safe defaults:
 # - keeps /opt/systemlog/SystemLoger placeholder directory if it already exists
 # - backs up files before editing cron/systemd
 # - does not touch Nezha, x-ui, h-ui, Docker, or SSH authorized_keys
 
 IOC_HASH="30ca33a71b715f77191e4009124e684d76b054151faa4ffa8965fb84f31fee68"
+PROBE_AGENT_HASH="21c34c0f4d54d2bfba4bf2501ab30e5329e126b04007e231e57e57dc6d11baa4"
 SAMPLE_DIR="/root/malware-samples"
 LOG="/root/b-bot-cleanup-$(date +%Y%m%d-%H%M%S).log"
 
@@ -67,6 +68,8 @@ save_sample() {
   sum="$(sha256sum "$dst" | awk '{print $1}')"
   if [ "$sum" = "$IOC_HASH" ]; then
     bad "保存已知 /tmp/b 样本：$dst"
+  elif [ "$sum" = "$PROBE_AGENT_HASH" ]; then
+    bad "保存可疑 probe-agent 样本：$dst"
   else
     warn "保存可疑样本：$dst sha256=$sum"
   fi
@@ -74,7 +77,7 @@ save_sample() {
 
 clean_processes() {
   section "进程清理"
-  local pattern='xmrig|supportxmr|monero|minerd|kinsing|kdevtmpfsi|/tmp/b|/tmp/\.a|/tmp/attack'
+  local pattern='xmrig|supportxmr|monero|minerd|kinsing|kdevtmpfsi|/tmp/b|/tmp/\.a|/tmp/attack|/tmp/probe-agent|probe-agent'
 
   if pgrep -af "$pattern" >/tmp/bbot-pids.$$ 2>/dev/null; then
     bad "发现可疑进程："
@@ -94,6 +97,7 @@ clean_tmp_payloads() {
     /tmp/b \
     /tmp/.a \
     /tmp/attack \
+    /tmp/probe-agent \
     /tmp/xmrig \
     /tmp/xmrig.tar.gz \
     /tmp/SystemLog.log \
@@ -148,7 +152,7 @@ clean_systemd() {
 
 clean_cron_iocs() {
   section "Cron IOC 清理"
-  local expr='xmrig|supportxmr|monero|minerd|kinsing|kdevtmpfsi|103\.106\.228\.23|jysiys\.xyz|/tmp/\.a|/tmp/b'
+  local expr='xmrig|supportxmr|monero|minerd|kinsing|kdevtmpfsi|103\.106\.228\.23|jysiys\.xyz|68\.183\.181\.185|50001|probe-agent|probe3|/tmp/\.a|/tmp/b'
   local files=()
 
   while IFS= read -r f; do
@@ -177,7 +181,7 @@ clean_cron_iocs() {
 audit_iocs() {
   section "IOC 复查"
 
-  local expr='103\.106\.228\.23|jysiys\.xyz|/tmp/\.a|/tmp/b|xmrig|supportxmr|monero|minerd|kinsing|kdevtmpfsi'
+  local expr='103\.106\.228\.23|jysiys\.xyz|68\.183\.181\.185|50001|probe-agent|probe3|main\.execCmd|/tmp/\.a|/tmp/b|xmrig|supportxmr|monero|minerd|kinsing|kdevtmpfsi'
   local exclude='(/root/\.bash_history|/root/fix_cpu_xmrig_qemuga\.sh|/root/b-bot-cleanup-|/root/malware-samples|/usr/local/x-ui/bin/geosite)'
 
   if command -v rg >/dev/null 2>&1; then
@@ -206,7 +210,7 @@ audit_tmp_exec() {
   if [ "$found" -eq 0 ]; then
     ok "未发现临时目录中的可执行文件"
   else
-    warn "请人工确认上面这些临时目录可执行文件。你当前提到的 /tmp/probe-agent 如果是自用探针，可保留。"
+    warn "请人工确认上面这些临时目录可执行文件。正常服务不应长期从 /tmp 运行。"
   fi
 }
 
