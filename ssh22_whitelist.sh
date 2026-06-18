@@ -6,6 +6,8 @@ PORT="22"
 WHITELIST_FILE="/etc/ssh22_whitelist.list"
 APPLY_SCRIPT="/usr/local/sbin/ssh22-whitelist-apply"
 RESTORE_HOOK="/etc/network/if-pre-up.d/ssh22-whitelist"
+IPTABLES_BIN=""
+IPTABLES_SAVE_BIN=""
 
 need_root() {
     if [[ "${EUID}" -ne 0 ]]; then
@@ -19,6 +21,59 @@ need_cmd() {
         echo "缺少命令：$1"
         exit 1
     fi
+}
+
+cmd_path() {
+    command -v "$1" 2>/dev/null || true
+}
+
+chain_exists_with() {
+    local bin="$1"
+    [[ -n "$bin" ]] && "$bin" -nL "$CHAIN" >/dev/null 2>&1
+}
+
+has_append_rules_with_save() {
+    local bin="$1"
+    [[ -n "$bin" ]] || return 1
+    "$bin" 2>/dev/null | awk '$1 == "-A" { found = 1; exit } END { exit !found }'
+}
+
+select_iptables_backend() {
+    local default_iptables default_save legacy_iptables legacy_save nft_iptables nft_save
+
+    default_iptables="$(cmd_path iptables)"
+    default_save="$(cmd_path iptables-save)"
+    legacy_iptables="$(cmd_path iptables-legacy)"
+    legacy_save="$(cmd_path iptables-legacy-save)"
+    nft_iptables="$(cmd_path iptables-nft)"
+    nft_save="$(cmd_path iptables-nft-save)"
+
+    if chain_exists_with "$legacy_iptables"; then
+        IPTABLES_BIN="$legacy_iptables"
+        IPTABLES_SAVE_BIN="${legacy_save:-$default_save}"
+    elif chain_exists_with "$nft_iptables"; then
+        IPTABLES_BIN="$nft_iptables"
+        IPTABLES_SAVE_BIN="${nft_save:-$default_save}"
+    elif has_append_rules_with_save "$legacy_save"; then
+        IPTABLES_BIN="${legacy_iptables:-$default_iptables}"
+        IPTABLES_SAVE_BIN="${legacy_save:-$default_save}"
+    else
+        IPTABLES_BIN="$default_iptables"
+        IPTABLES_SAVE_BIN="$default_save"
+    fi
+
+    if [[ -z "$IPTABLES_BIN" || -z "$IPTABLES_SAVE_BIN" ]]; then
+        echo "缺少命令：iptables 或 iptables-save"
+        exit 1
+    fi
+}
+
+iptables_cmd() {
+    "$IPTABLES_BIN" "$@"
+}
+
+iptables_save_cmd() {
+    "$IPTABLES_SAVE_BIN" "$@"
 }
 
 validate_ip_or_cidr() {
@@ -45,20 +100,20 @@ validate_ip_or_cidr() {
 }
 
 ensure_chain() {
-    if ! iptables -nL "$CHAIN" >/dev/null 2>&1; then
-        iptables -N "$CHAIN"
+    if ! iptables_cmd -nL "$CHAIN" >/dev/null 2>&1; then
+        iptables_cmd -N "$CHAIN"
     fi
 
-    if ! iptables -C "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1; then
-        iptables -I "$CHAIN" 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    if ! iptables_cmd -C "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1; then
+        iptables_cmd -I "$CHAIN" 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     fi
 
-    if ! iptables -C "$CHAIN" -j DROP >/dev/null 2>&1; then
-        iptables -A "$CHAIN" -j DROP
+    if ! iptables_cmd -C "$CHAIN" -j DROP >/dev/null 2>&1; then
+        iptables_cmd -A "$CHAIN" -j DROP
     fi
 
-    if ! iptables -C INPUT -p tcp --dport "$PORT" -j "$CHAIN" >/dev/null 2>&1; then
-        iptables -I INPUT 1 -p tcp --dport "$PORT" -j "$CHAIN"
+    if ! iptables_cmd -C INPUT -p tcp --dport "$PORT" -j "$CHAIN" >/dev/null 2>&1; then
+        iptables_cmd -I INPUT 1 -p tcp --dport "$PORT" -j "$CHAIN"
     fi
 }
 
@@ -66,36 +121,37 @@ install_restore_files() {
     mkdir -p "$(dirname "$RESTORE_HOOK")"
     mkdir -p "$(dirname "$APPLY_SCRIPT")"
 
-    cat > "$APPLY_SCRIPT" <<'EOF'
+    cat > "$APPLY_SCRIPT" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
 CHAIN="SSH22_WHITELIST"
 PORT="22"
 WHITELIST_FILE="/etc/ssh22_whitelist.list"
+IPTABLES_BIN="$IPTABLES_BIN"
 
-if [[ ! -f "$WHITELIST_FILE" ]]; then
+if [[ ! -x "\$IPTABLES_BIN" || ! -f "\$WHITELIST_FILE" ]]; then
     exit 0
 fi
 
-if ! iptables -nL "$CHAIN" >/dev/null 2>&1; then
-    iptables -N "$CHAIN"
+if ! "\$IPTABLES_BIN" -nL "\$CHAIN" >/dev/null 2>&1; then
+    "\$IPTABLES_BIN" -N "\$CHAIN"
 fi
 
-iptables -F "$CHAIN"
-iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+"\$IPTABLES_BIN" -F "\$CHAIN"
+"\$IPTABLES_BIN" -A "\$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
 while IFS= read -r item; do
-    [[ -z "$item" || "$item" == \#* ]] && continue
-    iptables -A "$CHAIN" -s "$item" -j ACCEPT
-done < "$WHITELIST_FILE"
+    [[ -z "\$item" || "\$item" == \#* ]] && continue
+    "\$IPTABLES_BIN" -A "\$CHAIN" -s "\$item" -j ACCEPT
+done < "\$WHITELIST_FILE"
 
-iptables -A "$CHAIN" -j DROP
+"\$IPTABLES_BIN" -A "\$CHAIN" -j DROP
 
-while iptables -C INPUT -p tcp --dport "$PORT" -j "$CHAIN" >/dev/null 2>&1; do
-    iptables -D INPUT -p tcp --dport "$PORT" -j "$CHAIN"
+while "\$IPTABLES_BIN" -C INPUT -p tcp --dport "\$PORT" -j "\$CHAIN" >/dev/null 2>&1; do
+    "\$IPTABLES_BIN" -D INPUT -p tcp --dport "\$PORT" -j "\$CHAIN"
 done
-iptables -I INPUT 1 -p tcp --dport "$PORT" -j "$CHAIN"
+"\$IPTABLES_BIN" -I INPUT 1 -p tcp --dport "\$PORT" -j "\$CHAIN"
 EOF
     chmod +x "$APPLY_SCRIPT"
 
@@ -108,7 +164,7 @@ EOF
 }
 
 print_whitelist_sources() {
-    iptables-save | awk -v chain="$CHAIN" '
+    iptables_save_cmd | awk -v chain="$CHAIN" '
         $1 == "-A" && $2 == chain && $0 ~ /(^| )-j ACCEPT( |$)/ {
             source = ""
             for (i = 1; i <= NF; i++) {
@@ -127,7 +183,7 @@ print_whitelist_sources() {
 persist_whitelist() {
     install_restore_files
 
-    if iptables -nL "$CHAIN" >/dev/null 2>&1; then
+    if iptables_cmd -nL "$CHAIN" >/dev/null 2>&1; then
         print_whitelist_sources > "$WHITELIST_FILE"
     else
         : > "$WHITELIST_FILE"
@@ -135,6 +191,7 @@ persist_whitelist() {
 
     echo "已持久化白名单到：$WHITELIST_FILE"
     echo "已安装独立开机恢复钩子：$RESTORE_HOOK"
+    echo "当前使用 iptables 后端：$IPTABLES_BIN"
     echo "不会修改或覆盖 /etc/iptables.up.rules"
 }
 
@@ -159,18 +216,18 @@ read_batch_items() {
 insert_allow_rule() {
     local item="$1"
 
-    if iptables -C "$CHAIN" -s "$item" -j ACCEPT >/dev/null 2>&1; then
+    if iptables_cmd -C "$CHAIN" -s "$item" -j ACCEPT >/dev/null 2>&1; then
         echo "已存在：$item"
         return
     fi
 
     local drop_line
-    drop_line="$(iptables -nL "$CHAIN" --line-numbers | awk '$2 == "DROP" {print $1; exit}')"
+    drop_line="$(iptables_cmd -nL "$CHAIN" --line-numbers | awk '$2 == "DROP" {print $1; exit}')"
     if [[ -n "$drop_line" ]]; then
-        iptables -I "$CHAIN" "$drop_line" -s "$item" -j ACCEPT
+        iptables_cmd -I "$CHAIN" "$drop_line" -s "$item" -j ACCEPT
     else
-        iptables -A "$CHAIN" -s "$item" -j ACCEPT
-        iptables -A "$CHAIN" -j DROP
+        iptables_cmd -A "$CHAIN" -s "$item" -j ACCEPT
+        iptables_cmd -A "$CHAIN" -j DROP
     fi
 
     echo "已添加：$item"
@@ -214,7 +271,7 @@ add_whitelist() {
 }
 
 list_whitelist() {
-    if ! iptables -nL "$CHAIN" >/dev/null 2>&1; then
+    if ! iptables_cmd -nL "$CHAIN" >/dev/null 2>&1; then
         echo "当前没有启用 22 端口白名单。"
         return
     fi
@@ -234,8 +291,8 @@ delete_one_source() {
     local item="$1"
     local deleted=0
 
-    while iptables -C "$CHAIN" -s "$item" -j ACCEPT >/dev/null 2>&1; do
-        iptables -D "$CHAIN" -s "$item" -j ACCEPT
+    while iptables_cmd -C "$CHAIN" -s "$item" -j ACCEPT >/dev/null 2>&1; do
+        iptables_cmd -D "$CHAIN" -s "$item" -j ACCEPT
         deleted=1
     done
 
@@ -247,7 +304,7 @@ delete_one_source() {
 }
 
 delete_whitelist() {
-    if ! iptables -nL "$CHAIN" >/dev/null 2>&1; then
+    if ! iptables_cmd -nL "$CHAIN" >/dev/null 2>&1; then
         echo "当前没有启用 22 端口白名单。"
         return
     fi
@@ -271,13 +328,13 @@ delete_whitelist() {
 }
 
 restore_open() {
-    while iptables -C INPUT -p tcp --dport "$PORT" -j "$CHAIN" >/dev/null 2>&1; do
-        iptables -D INPUT -p tcp --dport "$PORT" -j "$CHAIN"
+    while iptables_cmd -C INPUT -p tcp --dport "$PORT" -j "$CHAIN" >/dev/null 2>&1; do
+        iptables_cmd -D INPUT -p tcp --dport "$PORT" -j "$CHAIN"
     done
 
-    if iptables -nL "$CHAIN" >/dev/null 2>&1; then
-        iptables -F "$CHAIN"
-        iptables -X "$CHAIN"
+    if iptables_cmd -nL "$CHAIN" >/dev/null 2>&1; then
+        iptables_cmd -F "$CHAIN"
+        iptables_cmd -X "$CHAIN"
     fi
 
     rm -f "$WHITELIST_FILE" "$RESTORE_HOOK" "$APPLY_SCRIPT"
@@ -300,8 +357,7 @@ show_menu() {
 
 main() {
     need_root
-    need_cmd iptables
-    need_cmd iptables-save
+    select_iptables_backend
 
     local choice
     while true; do
