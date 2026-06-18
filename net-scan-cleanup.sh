@@ -34,10 +34,10 @@ ensure_conntrack() {
 
   echo "未找到 conntrack，开始自动安装：apt install conntrack -y"
   if have apt-get; then
-    apt-get update
+    apt-get update || echo "警告：apt-get update 失败，将继续尝试直接安装 conntrack"
     apt-get install -y conntrack
   elif have apt; then
-    apt update
+    apt update || echo "警告：apt update 失败，将继续尝试直接安装 conntrack"
     apt install -y conntrack
   else
     echo "错误：未找到 conntrack，也未找到 apt/apt-get，无法自动安装" >&2
