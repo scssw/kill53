@@ -6,6 +6,7 @@ PORT="22"
 WHITELIST_FILE="/etc/ssh22_whitelist.list"
 APPLY_SCRIPT="/usr/local/sbin/ssh22-whitelist-apply"
 RESTORE_HOOK="/etc/network/if-pre-up.d/ssh22-whitelist"
+SSR_SERVER_SCRIPT="/usr/local/SSR-Bash-Python/server.sh"
 IPTABLES_BIN=""
 IPTABLES_SAVE_BIN=""
 
@@ -161,6 +162,32 @@ EOF
 exit 0
 EOF
     chmod +x "$RESTORE_HOOK"
+
+    install_ssr_restore_hook
+}
+
+install_ssr_restore_hook() {
+    [[ -f "$SSR_SERVER_SCRIPT" && -w "$SSR_SERVER_SCRIPT" ]] || return 0
+    grep -q "$APPLY_SCRIPT" "$SSR_SERVER_SCRIPT" && return 0
+
+    cp -a "$SSR_SERVER_SCRIPT" "${SSR_SERVER_SCRIPT}.bak.$(date +%Y%m%d%H%M%S)"
+    local tmp_file
+    tmp_file="$(mktemp)"
+    awk -v hook="[ -x \"$APPLY_SCRIPT\" ] && \"$APPLY_SCRIPT\"" '
+        /^\[\[ \$serverc == 1 \]\]/ || /if \[\[ \$serverc == 1 \]\];then/ { direct = 1 }
+        /^\[\[ \$serverc == 3 \]\]/ || /if \[\[ \$serverc == 3 \]\];then/ { direct = 1 }
+        /if \[\[ \$serverc == 9 \]\];then/ { startup = 1; direct = 0 }
+        /if \[\[ \$serverc == 10 \]\];then/ { startup = 0; direct = 0 }
+        /if \[\[ \$serverc == [0-9]+ \]\];then/ && $0 !~ /serverc == (1|3|9|10)/ { direct = 0 }
+        {
+            print
+            if ($0 ~ /^[[:space:]]*iptables-restore < \/etc\/iptables\.up\.rules[[:space:]]*$/ && (direct || startup)) {
+                print hook
+            }
+        }
+    ' "$SSR_SERVER_SCRIPT" > "$tmp_file"
+    cp "$tmp_file" "$SSR_SERVER_SCRIPT"
+    rm -f "$tmp_file"
 }
 
 print_whitelist_sources() {
