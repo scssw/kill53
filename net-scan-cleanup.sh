@@ -8,9 +8,9 @@ set -euo pipefail
 #   bash net-scan-cleanup.sh watch
 #
 # 覆盖默认监控端口：
-#   SCAN_PORTS="23 2323 2333 5555 7547" bash net-scan-cleanup.sh clean
+#   SCAN_PORTS="445 3389 22 3306 8080 23 5900 1433 2323 2333" bash net-scan-cleanup.sh clean
 
-SCAN_PORTS="${SCAN_PORTS:-23 2323 2333}"
+SCAN_PORTS="${SCAN_PORTS:-445 3389 22 3306 8080 23 5900 1433 2323 2333}"
 BLOCK_SSH_ABUSE="${BLOCK_SSH_ABUSE:-1}"
 SCAN_KILL_PROCS="${SCAN_KILL_PROCS:-1}"
 PERSIST="${PERSIST:-1}"
