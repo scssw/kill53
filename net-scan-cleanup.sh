@@ -6,11 +6,13 @@ set -euo pipefail
 #   bash net-scan-cleanup.sh audit
 #   bash net-scan-cleanup.sh clean
 #   bash net-scan-cleanup.sh watch
+#   bash net-scan-cleanup.sh restore-ssh
 #
 # 覆盖默认监控端口：
-#   SCAN_PORTS="445 3389 22 3306 8080 23 5900 1433 2323 2333" bash net-scan-cleanup.sh clean
+#   SCAN_PORTS="445 3389 3306 8080 23 5900 1433 2323 2333" bash net-scan-cleanup.sh clean
 
-SCAN_PORTS="${SCAN_PORTS:-445 3389 22 3306 8080 23 5900 1433 2323 2333}"
+SCAN_PORTS="${SCAN_PORTS:-445 3389 3306 8080 23 5900 1433 2323 2333}"
+SSH_PORT="${SSH_PORT:-22}"
 BLOCK_SSH_ABUSE="${BLOCK_SSH_ABUSE:-1}"
 SCAN_KILL_PROCS="${SCAN_KILL_PROCS:-1}"
 PERSIST="${PERSIST:-1}"
@@ -25,6 +27,19 @@ need_root() {
 
 have() {
   command -v "$1" >/dev/null 2>&1
+}
+
+iptables_bins() {
+  local name path seen=""
+  for name in iptables iptables-legacy iptables-nft; do
+    path="$(command -v "$name" 2>/dev/null || true)"
+    [ -n "$path" ] || continue
+    case " $seen " in
+      *" $path "*) continue ;;
+    esac
+    seen="$seen $path"
+    printf '%s\n' "$path"
+  done
 }
 
 ensure_conntrack() {
@@ -52,10 +67,18 @@ ensure_conntrack() {
 
 port_regex() {
   local out="" p
-  for p in $SCAN_PORTS; do
+  for p in $(effective_scan_ports); do
     if [ -z "$out" ]; then out="$p"; else out="$out|$p"; fi
   done
   printf '%s' "$out"
+}
+
+effective_scan_ports() {
+  local p
+  for p in $SCAN_PORTS; do
+    [ "$p" = "$SSH_PORT" ] && continue
+    printf '%s\n' "$p"
+  done
 }
 
 show_header() {
@@ -66,6 +89,7 @@ show_header() {
 conntrack_scan_lines() {
   local re
   re="$(port_regex)"
+  [ -n "$re" ] || return 0
   if have conntrack; then
     conntrack -L 2>/dev/null | egrep "dport=($re)( |$)" || true
   else
@@ -154,13 +178,70 @@ block_scan_ports() {
   local chain proto port
   for chain in OUTPUT FORWARD; do
     for proto in tcp udp; do
-      for port in $SCAN_PORTS; do
+      for port in $(effective_scan_ports); do
         add_drop_rule "$chain" "$proto" "$port"
       done
     done
   done
-  iptables -S OUTPUT | egrep "dport ($(port_regex))" || true
-  iptables -S FORWARD | egrep "dport ($(port_regex))" || true
+  if [ -n "$(port_regex)" ]; then
+    iptables -S OUTPUT | egrep "dport ($(port_regex))" || true
+    iptables -S FORWARD | egrep "dport ($(port_regex))" || true
+  fi
+}
+
+delete_rule_if_exists() {
+  local bin="$1" chain="$2" proto="$3" direction="$4" port="$5" target="$6"
+  while "$bin" -C "$chain" -p "$proto" "$direction" "$port" -j "$target" 2>/dev/null; do
+    "$bin" -D "$chain" -p "$proto" "$direction" "$port" -j "$target"
+  done
+}
+
+restore_ssh_22_access() {
+  show_header "检查并恢复 SSH 22 端口访问"
+  local bin chain proto direction target changed=0
+
+  for bin in $(iptables_bins); do
+    for chain in INPUT OUTPUT FORWARD; do
+      for proto in tcp udp; do
+        for direction in --dport --sport; do
+          for target in REJECT DROP; do
+            if "$bin" -C "$chain" -p "$proto" "$direction" "$SSH_PORT" -j "$target" 2>/dev/null; then
+              changed=1
+              delete_rule_if_exists "$bin" "$chain" "$proto" "$direction" "$SSH_PORT" "$target"
+            fi
+          done
+        done
+      done
+    done
+
+    if "$bin" -nL SSH22_WHITELIST >/dev/null 2>&1; then
+      while "$bin" -C INPUT -p tcp --dport "$SSH_PORT" -j SSH22_WHITELIST 2>/dev/null; do
+        changed=1
+        "$bin" -D INPUT -p tcp --dport "$SSH_PORT" -j SSH22_WHITELIST
+      done
+    fi
+
+  done
+
+  for bin in $(iptables_bins); do
+    for chain in INPUT OUTPUT FORWARD; do
+      while read -r rule; do
+        case "$rule" in
+          *"--dport $SSH_PORT"*"-j DROP"*|*"--dport $SSH_PORT"*"-j REJECT"*|*"--dport $SSH_PORT"*"-j SSH22_WHITELIST"*)
+            echo "警告：$bin $chain 仍有 22 限制规则，请手动检查：$rule"
+            ;;
+        esac
+      done <<EOF
+$("$bin" -S "$chain" 2>/dev/null || true)
+EOF
+    done
+  done
+
+  if [ "$changed" = "1" ]; then
+    echo "已移除 22 端口相关 DROP/REJECT/白名单跳转规则。"
+  else
+    echo "未发现 22 端口被本机 iptables 明确禁用。"
+  fi
 }
 
 conntrack_scan_tuples() {
@@ -198,7 +279,7 @@ delete_conntrack_scan_ports() {
     rm -f "$tuple_tmp"
 
     for proto in tcp udp; do
-      for port in $SCAN_PORTS; do
+      for port in $(effective_scan_ports); do
         conntrack -D -p "$proto" --dport "$port" 2>/dev/null || true
         conntrack -D -p "$proto" --sport "$port" 2>/dev/null || true
       done
@@ -211,6 +292,7 @@ delete_conntrack_scan_ports() {
 scan_socket_lines() {
   local re
   re="$(port_regex)"
+  [ -n "$re" ] || return 0
   if have ss; then
     ss -H -tanp 2>/dev/null \
       | awk -v re=":($re)$" '$1 ~ /^(ESTAB|SYN-SENT|SYN-RECV|FIN-WAIT-1|FIN-WAIT-2|CLOSE-WAIT|LAST-ACK)$/ && $5 ~ re {print}' || true
@@ -316,10 +398,12 @@ audit_all() {
 
 clean_all() {
   audit_scan_ports
+  restore_ssh_22_access
   block_scan_ports
   kill_scan_processes
   delete_conntrack_scan_ports
   block_recent_ssh_abusers
+  restore_ssh_22_access
   persist_iptables
   audit_scan_ports
 }
@@ -340,9 +424,10 @@ main() {
     audit) ensure_conntrack; audit_all ;;
     clean) ensure_conntrack; clean_all ;;
     watch) ensure_conntrack; watch_scan ;;
-    ports) echo "$SCAN_PORTS" ;;
+    restore-ssh|restore22) restore_ssh_22_access; persist_iptables ;;
+    ports) effective_scan_ports | xargs echo ;;
     *)
-      echo "用法：$0 {audit|clean|watch|ports}" >&2
+      echo "用法：$0 {audit|clean|watch|restore-ssh|ports}" >&2
       echo "示例：SCAN_PORTS='23 2323 2333 5555 7547' $0 clean" >&2
       exit 2
       ;;
