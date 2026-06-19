@@ -105,16 +105,68 @@ ensure_chain() {
         iptables_cmd -N "$CHAIN"
     fi
 
-    if ! iptables_cmd -C "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1; then
-        iptables_cmd -I "$CHAIN" 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    while iptables_cmd -C "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1; do
+        iptables_cmd -D "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    done
+    iptables_cmd -I "$CHAIN" 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    while iptables_cmd -C "$CHAIN" -j DROP >/dev/null 2>&1; do
+        iptables_cmd -D "$CHAIN" -j DROP
+    done
+    iptables_cmd -A "$CHAIN" -j DROP
+
+    while iptables_cmd -C INPUT -p tcp --dport "$PORT" -j "$CHAIN" >/dev/null 2>&1; do
+        iptables_cmd -D INPUT -p tcp --dport "$PORT" -j "$CHAIN"
+    done
+    iptables_cmd -I INPUT 1 -p tcp --dport "$PORT" -j "$CHAIN"
+}
+
+whitelist_file_has_entries() {
+    [[ -f "$WHITELIST_FILE" ]] || return 1
+    awk '
+        /^[[:space:]]*($|#)/ { next }
+        { found = 1; exit }
+        END { exit !found }
+    ' "$WHITELIST_FILE"
+}
+
+restore_chain_from_whitelist_file() {
+    local item
+
+    if ! iptables_cmd -nL "$CHAIN" >/dev/null 2>&1; then
+        iptables_cmd -N "$CHAIN"
     fi
 
-    if ! iptables_cmd -C "$CHAIN" -j DROP >/dev/null 2>&1; then
-        iptables_cmd -A "$CHAIN" -j DROP
-    fi
+    iptables_cmd -F "$CHAIN"
+    iptables_cmd -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-    if ! iptables_cmd -C INPUT -p tcp --dport "$PORT" -j "$CHAIN" >/dev/null 2>&1; then
-        iptables_cmd -I INPUT 1 -p tcp --dport "$PORT" -j "$CHAIN"
+    while IFS= read -r item; do
+        item="${item%%#*}"
+        item="${item//[[:space:]]/}"
+        [[ -z "$item" ]] && continue
+        if validate_ip_or_cidr "$item"; then
+            iptables_cmd -A "$CHAIN" -s "$item" -j ACCEPT
+        else
+            echo "跳过白名单文件中的无效项：$item"
+        fi
+    done < "$WHITELIST_FILE"
+
+    iptables_cmd -A "$CHAIN" -j DROP
+    while iptables_cmd -C INPUT -p tcp --dport "$PORT" -j "$CHAIN" >/dev/null 2>&1; do
+        iptables_cmd -D INPUT -p tcp --dport "$PORT" -j "$CHAIN"
+    done
+    iptables_cmd -I INPUT 1 -p tcp --dport "$PORT" -j "$CHAIN"
+}
+
+repair_existing_whitelist() {
+    if iptables_cmd -nL "$CHAIN" >/dev/null 2>&1; then
+        ensure_chain
+        install_restore_files
+        echo "已修复现有白名单规则：22 端口跳转已放到 INPUT 链最前。"
+    elif whitelist_file_has_entries; then
+        restore_chain_from_whitelist_file
+        install_restore_files
+        echo "已根据 $WHITELIST_FILE 恢复 22 端口白名单规则。"
     fi
 }
 
@@ -385,6 +437,7 @@ show_menu() {
 main() {
     need_root
     select_iptables_backend
+    repair_existing_whitelist
 
     local choice
     while true; do
