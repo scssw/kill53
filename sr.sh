@@ -1,5 +1,22 @@
 #!/bin/bash
 #Set PATH
+ForceIPv4WhenNoIPv6(){
+    if command -v ip >/dev/null 2>&1 && ! ip -6 route show default 2>/dev/null | grep -q .;then
+        echo "未检测到 IPv6 默认路由，安装下载将优先使用 IPv4"
+        export GIT_SSL_NO_VERIFY=true
+        if [ -f /etc/gai.conf ] && ! grep -q '^precedence ::ffff:0:0/96  100' /etc/gai.conf;then
+            cp -a /etc/gai.conf "/etc/gai.conf.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+            sed -i 's/^#precedence ::ffff:0:0\/96  100/precedence ::ffff:0:0\/96  100/' /etc/gai.conf
+            grep -q '^precedence ::ffff:0:0/96  100' /etc/gai.conf || echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf
+        fi
+        if [ -d /etc/apt/apt.conf.d ];then
+            echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
+        fi
+    fi
+}
+
+ForceIPv4WhenNoIPv6
+
 unset check
 for i in `echo $PATH | sed 's/:/\n/g'`
 do
@@ -257,7 +274,7 @@ else
         echo "使用源码编译安装libsodium..."
         cd $workdir
         export LIBSODIUM_VER=1.0.16
-        wget -q https://github.com/jedisct1/libsodium/releases/download/${LIBSODIUM_VER}/libsodium-$LIBSODIUM_VER.tar.gz
+        wget -4 -q https://github.com/jedisct1/libsodium/releases/download/${LIBSODIUM_VER}/libsodium-$LIBSODIUM_VER.tar.gz
         tar xf libsodium-$LIBSODIUM_VER.tar.gz
         pushd libsodium-$LIBSODIUM_VER
         ./configure --prefix=/usr
@@ -438,10 +455,10 @@ fi
 fi
 #Install SSR-Bash Background
 if [[ $1 == "develop" ]];then
-    wget -q -N --no-check-certificate -O /usr/local/bin/ssr https://raw.githubusercontent.com/scssw/SSR-Bash-Python/master/ssr
+    wget -4 -q -N --no-check-certificate -O /usr/local/bin/ssr https://raw.githubusercontent.com/scssw/SSR-Bash-Python/master/ssr
     chmod +x /usr/local/bin/ssr
 else
-    wget -q -N --no-check-certificate -O /usr/local/bin/ssr https://raw.githubusercontent.com/scssw/SSR-Bash-Python/master/ssr
+    wget -4 -q -N --no-check-certificate -O /usr/local/bin/ssr https://raw.githubusercontent.com/scssw/SSR-Bash-Python/master/ssr
     chmod +x /usr/local/bin/ssr
 fi
 PatchSSRCommandLegacyIptables
@@ -450,11 +467,11 @@ PatchSSRCommandLegacyIptables
 nowip=$(grep -E -o "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)" /usr/local/shadowsocksr/userapiconfig.py)
 sed -i "s/sspanelv2/mudbjson/g" /usr/local/shadowsocksr/userapiconfig.py
 sed -i "s/UPDATE_TIME = 60/UPDATE_TIME = 10/g" /usr/local/shadowsocksr/userapiconfig.py
-sed -i "s/SERVER_PUB_ADDR = '${nowip}'/SERVER_PUB_ADDR = '$(wget -qO- -t1 -T2 ipinfo.io/ip)'/" /usr/local/shadowsocksr/userapiconfig.py
+sed -i "s/SERVER_PUB_ADDR = '${nowip}'/SERVER_PUB_ADDR = '$(wget -4 -qO- -t1 -T2 ipinfo.io/ip)'/" /usr/local/shadowsocksr/userapiconfig.py
 
 # 添加域名检测逻辑
 if [ ! -f /usr/local/shadowsocksr/myip.txt ] || ! grep -qE '^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,6}$' /usr/local/shadowsocksr/myip.txt; then
-    ipname=$(wget -qO- -t1 -T2 ipinfo.io/ip)
+    ipname=$(wget -4 -qO- -t1 -T2 ipinfo.io/ip)
     echo "$ipname" > /usr/local/shadowsocksr/myip.txt
 fi
 
