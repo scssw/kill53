@@ -13,10 +13,14 @@ set -euo pipefail
 
 SCAN_PORTS="${SCAN_PORTS:-445 3389 3306 8080 23 5900 1433 2323 2333}"
 SSH_PORT="${SSH_PORT:-22}"
-BLOCK_SSH_ABUSE="${BLOCK_SSH_ABUSE:-1}"
+BLOCK_SSH_ABUSE="${BLOCK_SSH_ABUSE:-0}"
 SCAN_KILL_PROCS="${SCAN_KILL_PROCS:-1}"
 PERSIST="${PERSIST:-1}"
 TOP_N="${TOP_N:-30}"
+SCAN_CHAIN="${SCAN_CHAIN:-NET_SCAN_CLEANUP}"
+APPLY_SCRIPT="${APPLY_SCRIPT:-/usr/local/sbin/net-scan-cleanup-apply}"
+RESTORE_HOOK="${RESTORE_HOOK:-/etc/network/if-pre-up.d/net-scan-cleanup}"
+SSR_SERVER_SCRIPT="${SSR_SERVER_SCRIPT:-/usr/local/SSR-Bash-Python/server.sh}"
 
 need_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -169,13 +173,47 @@ audit_ssh() {
 
 add_drop_rule() {
   local chain="$1" proto="$2" port="$3"
-  iptables -C "$chain" -p "$proto" --dport "$port" -j REJECT 2>/dev/null \
-    || iptables -I "$chain" 1 -p "$proto" --dport "$port" -j REJECT
+  iptables -C "$SCAN_CHAIN" -p "$proto" --dport "$port" -j REJECT 2>/dev/null \
+    || iptables -A "$SCAN_CHAIN" -p "$proto" --dport "$port" -j REJECT
+  iptables -C "$chain" -j "$SCAN_CHAIN" 2>/dev/null \
+    || iptables -I "$chain" 1 -j "$SCAN_CHAIN"
+}
+
+delete_direct_port_rules() {
+  local bin="$1" chain="$2" proto="$3" port="$4" target="$5"
+  while "$bin" -C "$chain" -p "$proto" --dport "$port" -j "$target" 2>/dev/null; do
+    "$bin" -D "$chain" -p "$proto" --dport "$port" -j "$target"
+  done
+}
+
+cleanup_old_direct_scan_port_rules() {
+  local bin chain proto port target
+  for bin in $(iptables_bins); do
+    for chain in OUTPUT FORWARD; do
+      for proto in tcp udp; do
+        for port in $(effective_scan_ports); do
+          for target in REJECT DROP; do
+            delete_direct_port_rules "$bin" "$chain" "$proto" "$port" "$target"
+          done
+        done
+      done
+    done
+  done
+}
+
+ensure_scan_chain() {
+  if ! iptables -nL "$SCAN_CHAIN" >/dev/null 2>&1; then
+    iptables -N "$SCAN_CHAIN"
+  fi
+
+  iptables -F "$SCAN_CHAIN"
 }
 
 block_scan_ports() {
   show_header "阻断出站/转发扫描端口"
   local chain proto port
+  cleanup_old_direct_scan_port_rules
+  ensure_scan_chain
   for chain in OUTPUT FORWARD; do
     for proto in tcp udp; do
       for port in $(effective_scan_ports); do
@@ -184,8 +222,9 @@ block_scan_ports() {
     done
   done
   if [ -n "$(port_regex)" ]; then
-    iptables -S OUTPUT | egrep "dport ($(port_regex))" || true
-    iptables -S FORWARD | egrep "dport ($(port_regex))" || true
+    iptables -S "$SCAN_CHAIN" | egrep "dport ($(port_regex))" || true
+    iptables -S OUTPUT | grep -- "-j $SCAN_CHAIN" || true
+    iptables -S FORWARD | grep -- "-j $SCAN_CHAIN" || true
   fi
 }
 
@@ -214,20 +253,13 @@ restore_ssh_22_access() {
       done
     done
 
-    if "$bin" -nL SSH22_WHITELIST >/dev/null 2>&1; then
-      while "$bin" -C INPUT -p tcp --dport "$SSH_PORT" -j SSH22_WHITELIST 2>/dev/null; do
-        changed=1
-        "$bin" -D INPUT -p tcp --dport "$SSH_PORT" -j SSH22_WHITELIST
-      done
-    fi
-
   done
 
   for bin in $(iptables_bins); do
     for chain in INPUT OUTPUT FORWARD; do
       while read -r rule; do
         case "$rule" in
-          *"--dport $SSH_PORT"*"-j DROP"*|*"--dport $SSH_PORT"*"-j REJECT"*|*"--dport $SSH_PORT"*"-j SSH22_WHITELIST"*)
+          *"--dport $SSH_PORT"*"-j DROP"*|*"--dport $SSH_PORT"*"-j REJECT"*)
             echo "警告：$bin $chain 仍有 22 限制规则，请手动检查：$rule"
             ;;
         esac
@@ -238,9 +270,9 @@ EOF
   done
 
   if [ "$changed" = "1" ]; then
-    echo "已移除 22 端口相关 DROP/REJECT/白名单跳转规则。"
+    echo "已移除 22 端口相关 DROP/REJECT 规则，保留 SSH22_WHITELIST 白名单跳转。"
   else
-    echo "未发现 22 端口被本机 iptables 明确禁用。"
+    echo "未发现 22 端口被本机 iptables 直接 DROP/REJECT。"
   fi
 }
 
@@ -347,24 +379,141 @@ block_recent_ssh_abusers() {
   [ "$BLOCK_SSH_ABUSE" = "1" ] || return 0
   have journalctl || return 0
 
-  show_header "阻断最近 SSH 暴力破解来源"
-  local tmp ip count
-  tmp="/tmp/net-scan-cleanup.ssh-abuse.$$"
-  journalctl -u ssh -u sshd --since "24 hours ago" --no-pager 2>/dev/null \
-    | awk '/Failed password|Invalid user/ {
-        for (i=1;i<=NF;i++) if ($i=="from") print $(i+1)
-      }' \
-    | sort | uniq -c | sort -nr | awk '$1 >= 5 {print $1, $2}' | head -n 50 >"$tmp" || true
+  show_header "跳过 SSH 来源 IP 自动阻断"
+  echo "BLOCK_SSH_ABUSE 默认关闭，避免添加 INPUT -s x.x.x.x -j DROP 这类单 IP 阻断规则。"
+  return 0
+}
 
-  while read -r count ip; do
-    [ -n "${ip:-}" ] || continue
-    case "$ip" in
-      127.*|10.*|192.168.*|172.16.*|172.17.*|172.18.*|172.19.*|172.2[0-9].*|172.3[0-1].*) continue ;;
-    esac
-    iptables -C INPUT -s "$ip" -j DROP 2>/dev/null || iptables -I INPUT 1 -s "$ip" -j DROP
-    echo "已阻断 $ip 失败次数=$count"
-  done <"$tmp"
-  rm -f "$tmp"
+clear_old_input_ip_blocks() {
+  show_header "清理历史 INPUT 单 IP 阻断规则"
+  local bin source changed=0
+  for bin in $(iptables_bins); do
+    while read -r source; do
+      [ -n "${source:-}" ] || continue
+      while "$bin" -C INPUT -s "$source" -j DROP 2>/dev/null; do
+        "$bin" -D INPUT -s "$source" -j DROP
+        changed=1
+        echo "已删除：$bin -D INPUT -s $source -j DROP"
+      done
+    done <<EOF
+$("$bin" -S INPUT 2>/dev/null | awk '
+  $1 == "-A" && $2 == "INPUT" {
+    source = ""
+    target = ""
+    other = 0
+    for (i = 3; i <= NF; i++) {
+      if ($i == "-s" && (i + 1) <= NF) {
+        source = $(i + 1)
+        i++
+      } else if ($i == "-j" && (i + 1) <= NF) {
+        target = $(i + 1)
+        i++
+      } else {
+        other = 1
+      }
+    }
+    if (source != "" && target == "DROP" && other == 0) {
+      print source
+    }
+  }
+')
+EOF
+  done
+
+  if [ "$changed" = "0" ]; then
+    echo "未发现历史 INPUT 单 IP DROP 规则。"
+  fi
+}
+
+install_scan_restore_files() {
+  [ "$PERSIST" = "1" ] || return 0
+
+  show_header "安装扫描端口常驻恢复钩子"
+  mkdir -p "$(dirname "$APPLY_SCRIPT")" "$(dirname "$RESTORE_HOOK")"
+
+  cat >"$APPLY_SCRIPT" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCAN_PORTS="$SCAN_PORTS"
+SSH_PORT="$SSH_PORT"
+SCAN_CHAIN="$SCAN_CHAIN"
+IPTABLES_BIN="\${IPTABLES_BIN:-$(command -v iptables 2>/dev/null || echo iptables)}"
+
+effective_scan_ports() {
+  local p
+  for p in \$SCAN_PORTS; do
+    [ "\$p" = "\$SSH_PORT" ] && continue
+    printf '%s\n' "\$p"
+  done
+}
+
+delete_direct_port_rules() {
+  local chain="\$1" proto="\$2" port="\$3" target="\$4"
+  while "\$IPTABLES_BIN" -C "\$chain" -p "\$proto" --dport "\$port" -j "\$target" 2>/dev/null; do
+    "\$IPTABLES_BIN" -D "\$chain" -p "\$proto" --dport "\$port" -j "\$target"
+  done
+}
+
+if ! "\$IPTABLES_BIN" -nL "\$SCAN_CHAIN" >/dev/null 2>&1; then
+  "\$IPTABLES_BIN" -N "\$SCAN_CHAIN"
+fi
+
+"\$IPTABLES_BIN" -F "\$SCAN_CHAIN"
+
+for proto in tcp udp; do
+  for port in \$(effective_scan_ports); do
+    "\$IPTABLES_BIN" -A "\$SCAN_CHAIN" -p "\$proto" --dport "\$port" -j REJECT
+  done
+done
+
+for chain in OUTPUT FORWARD; do
+  for proto in tcp udp; do
+    for port in \$(effective_scan_ports); do
+      delete_direct_port_rules "\$chain" "\$proto" "\$port" REJECT
+      delete_direct_port_rules "\$chain" "\$proto" "\$port" DROP
+    done
+  done
+
+  while "\$IPTABLES_BIN" -C "\$chain" -j "\$SCAN_CHAIN" >/dev/null 2>&1; do
+    "\$IPTABLES_BIN" -D "\$chain" -j "\$SCAN_CHAIN"
+  done
+  "\$IPTABLES_BIN" -I "\$chain" 1 -j "\$SCAN_CHAIN"
+done
+EOF
+  chmod +x "$APPLY_SCRIPT"
+
+  cat >"$RESTORE_HOOK" <<EOF
+#!/bin/sh
+[ -x "$APPLY_SCRIPT" ] && "$APPLY_SCRIPT"
+exit 0
+EOF
+  chmod +x "$RESTORE_HOOK"
+
+  install_ssr_restore_hook
+  echo "已安装：$APPLY_SCRIPT"
+  echo "已安装：$RESTORE_HOOK"
+}
+
+install_ssr_restore_hook() {
+  [ -f "$SSR_SERVER_SCRIPT" ] || return 0
+  [ -w "$SSR_SERVER_SCRIPT" ] || return 0
+  grep -qF "$APPLY_SCRIPT" "$SSR_SERVER_SCRIPT" && return 0
+
+  cp -a "$SSR_SERVER_SCRIPT" "${SSR_SERVER_SCRIPT}.bak.$(date +%Y%m%d%H%M%S)"
+  local tmp_file
+  tmp_file="$(mktemp)"
+  awk -v hook="[ -x \"$APPLY_SCRIPT\" ] && \"$APPLY_SCRIPT\"" '
+    {
+      print
+      if ($0 ~ /^[[:space:]]*iptables-restore < \/etc\/iptables\.up\.rules[[:space:]]*$/) {
+        print hook
+      }
+    }
+  ' "$SSR_SERVER_SCRIPT" >"$tmp_file"
+  cp "$tmp_file" "$SSR_SERVER_SCRIPT"
+  rm -f "$tmp_file"
+  echo "已给 SSR server.sh 添加 iptables-restore 后恢复钩子：$SSR_SERVER_SCRIPT"
 }
 
 persist_iptables() {
@@ -399,7 +548,9 @@ audit_all() {
 clean_all() {
   audit_scan_ports
   restore_ssh_22_access
+  clear_old_input_ip_blocks
   block_scan_ports
+  install_scan_restore_files
   kill_scan_processes
   delete_conntrack_scan_ports
   block_recent_ssh_abusers
