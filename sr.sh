@@ -14,6 +14,65 @@ fi
 
 #Check Root
 [ $(id -u) != "0" ] && { echo "Error: You must be root to run this script"; exit 1; }
+
+SetupSSRLegacyIptables(){
+    local bindir="/tmp/ssr-iptables-legacy"
+    mkdir -p "${bindir}"
+
+    if command -v iptables-legacy >/dev/null 2>&1;then
+        ln -sf "$(command -v iptables-legacy)" "${bindir}/iptables"
+    fi
+    if command -v iptables-legacy-save >/dev/null 2>&1;then
+        ln -sf "$(command -v iptables-legacy-save)" "${bindir}/iptables-save"
+    fi
+    if command -v iptables-legacy-restore >/dev/null 2>&1;then
+        ln -sf "$(command -v iptables-legacy-restore)" "${bindir}/iptables-restore"
+        SSR_IPTABLES_RESTORE="$(command -v iptables-legacy-restore)"
+    elif command -v iptables-restore-legacy >/dev/null 2>&1;then
+        ln -sf "$(command -v iptables-restore-legacy)" "${bindir}/iptables-restore"
+        SSR_IPTABLES_RESTORE="$(command -v iptables-restore-legacy)"
+    else
+        SSR_IPTABLES_RESTORE="$(command -v iptables-restore 2>/dev/null)"
+    fi
+
+    if command -v ip6tables-legacy >/dev/null 2>&1;then
+        ln -sf "$(command -v ip6tables-legacy)" "${bindir}/ip6tables"
+    fi
+    if command -v ip6tables-legacy-save >/dev/null 2>&1;then
+        ln -sf "$(command -v ip6tables-legacy-save)" "${bindir}/ip6tables-save"
+    fi
+    if command -v ip6tables-legacy-restore >/dev/null 2>&1;then
+        ln -sf "$(command -v ip6tables-legacy-restore)" "${bindir}/ip6tables-restore"
+    elif command -v ip6tables-restore-legacy >/dev/null 2>&1;then
+        ln -sf "$(command -v ip6tables-restore-legacy)" "${bindir}/ip6tables-restore"
+    fi
+
+    export PATH="${bindir}:${PATH}"
+    export SSR_IPTABLES_RESTORE
+
+    if [[ -n "${SSR_IPTABLES_RESTORE}" ]];then
+        echo "SSR安装脚本将使用 legacy iptables: ${SSR_IPTABLES_RESTORE}"
+    fi
+}
+
+SetupSSRLegacyIptables
+
+PatchSSRCommandLegacyIptables(){
+    local target="/usr/local/bin/ssr"
+    [ -f "${target}" ] || return 0
+    grep -q "SSR legacy iptables PATH" "${target}" && return 0
+    sed -i '/^export PATH=/a\
+# SSR legacy iptables PATH\
+if command -v iptables-legacy >/dev/null 2>\&1;then\
+    mkdir -p /tmp/ssr-iptables-legacy\
+    ln -sf "$(command -v iptables-legacy)" /tmp/ssr-iptables-legacy/iptables\
+    command -v iptables-legacy-save >/dev/null 2>\&1 \&\& ln -sf "$(command -v iptables-legacy-save)" /tmp/ssr-iptables-legacy/iptables-save\
+    command -v iptables-legacy-restore >/dev/null 2>\&1 \&\& ln -sf "$(command -v iptables-legacy-restore)" /tmp/ssr-iptables-legacy/iptables-restore\
+    command -v iptables-restore-legacy >/dev/null 2>\&1 \&\& ln -sf "$(command -v iptables-restore-legacy)" /tmp/ssr-iptables-legacy/iptables-restore\
+    export PATH=/tmp/ssr-iptables-legacy:$PATH\
+fi' "${target}"
+}
+
 #Check OS
 if [ -n "$(grep 'Aliyun Linux release' /etc/issue)" -o -e /etc/redhat-release ];then
     OS=CentOS
@@ -139,7 +198,9 @@ if [[ ${OS} == Debian ]];then
     # 安装iptables
     apt-get -y install iptables curl
 fi
-if [[ $? != 0 ]];then
+install_status=$?
+SetupSSRLegacyIptables
+if [[ ${install_status} != 0 ]];then
     echo "安装失败，请稍候重试！"
     exit 1 
 fi
@@ -328,7 +389,7 @@ if [[ ${OS} == Ubuntu || ${OS} == Debian ]];then
 # Short-Description: SSR-Bash-Python
 # Description: SSR-Bash-Python
 ### END INIT INFO
-iptables-restore < /etc/iptables.up.rules
+${SSR_IPTABLES_RESTORE:-iptables-restore} < /etc/iptables.up.rules
 bash /usr/local/shadowsocksr/logrun.sh
 EOF
     chmod 755 /etc/init.d/ssr-bash-python
@@ -339,7 +400,7 @@ fi
 
 if [[ ${OS} == CentOS ]];then
     echo "
-iptables-restore < /etc/iptables.up.rules
+${SSR_IPTABLES_RESTORE:-iptables-restore} < /etc/iptables.up.rules
 bash /usr/local/shadowsocksr/logrun.sh
 " > /etc/rc.d/init.d/ssr-bash-python
     chmod +x  /etc/rc.d/init.d/ssr-bash-python
@@ -383,6 +444,7 @@ else
     wget -q -N --no-check-certificate -O /usr/local/bin/ssr https://raw.githubusercontent.com/scssw/SSR-Bash-Python/master/ssr
     chmod +x /usr/local/bin/ssr
 fi
+PatchSSRCommandLegacyIptables
 
 #Modify ShadowsocksR API
 nowip=$(grep -E -o "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)" /usr/local/shadowsocksr/userapiconfig.py)
@@ -433,7 +495,20 @@ chmod +x /usr/local/SSR-Bash-Python/user/quickadd.sh
 if [ -e /usr/local/bin/s ]; then
     rm -f /usr/local/bin/s
 fi
-ln -s /usr/local/SSR-Bash-Python/user/quickadd.sh /usr/local/bin/s
+cat >/usr/local/bin/s <<'EOF'
+#!/bin/bash
+# SSR legacy iptables PATH
+if command -v iptables-legacy >/dev/null 2>&1;then
+    mkdir -p /tmp/ssr-iptables-legacy
+    ln -sf "$(command -v iptables-legacy)" /tmp/ssr-iptables-legacy/iptables
+    command -v iptables-legacy-save >/dev/null 2>&1 && ln -sf "$(command -v iptables-legacy-save)" /tmp/ssr-iptables-legacy/iptables-save
+    command -v iptables-legacy-restore >/dev/null 2>&1 && ln -sf "$(command -v iptables-legacy-restore)" /tmp/ssr-iptables-legacy/iptables-restore
+    command -v iptables-restore-legacy >/dev/null 2>&1 && ln -sf "$(command -v iptables-restore-legacy)" /tmp/ssr-iptables-legacy/iptables-restore
+    export PATH=/tmp/ssr-iptables-legacy:$PATH
+fi
+bash /usr/local/SSR-Bash-Python/user/quickadd.sh "$@"
+EOF
+chmod +x /usr/local/bin/s
 echo "已创建快捷方式"
 
 # 启用 BBR 拥塞控制算法
