@@ -9,15 +9,17 @@ set -euo pipefail
 #   bash net-scan-cleanup.sh restore-ssh
 #
 # 覆盖默认监控端口：
-#   SCAN_PORTS="445 3389 3306 8080 23 5900 1433 2323 2333" bash net-scan-cleanup.sh clean
+#   SCAN_PORTS="445 3389 3306 8080 23 223 5900 1433 2323 2333" bash net-scan-cleanup.sh clean
 
-SCAN_PORTS="${SCAN_PORTS:-445 3389 3306 8080 23 5900 1433 2323 2333}"
+SCAN_PORTS="${SCAN_PORTS:-445 3389 3306 8080 23 223 5900 1433 2323 2333}"
 SSH_PORT="${SSH_PORT:-22}"
 BLOCK_SSH_ABUSE="${BLOCK_SSH_ABUSE:-0}"
 SCAN_KILL_PROCS="${SCAN_KILL_PROCS:-1}"
 PERSIST="${PERSIST:-1}"
 TOP_N="${TOP_N:-30}"
 SCAN_CHAIN="${SCAN_CHAIN:-NET_SCAN_CLEANUP}"
+SSH_WHITELIST_CHAIN="${SSH_WHITELIST_CHAIN:-SSH22_WHITELIST}"
+SSH_WHITELIST_APPLY="${SSH_WHITELIST_APPLY:-/usr/local/sbin/ssh22-whitelist-apply}"
 APPLY_SCRIPT="${APPLY_SCRIPT:-/usr/local/sbin/net-scan-cleanup-apply}"
 RESTORE_HOOK="${RESTORE_HOOK:-/etc/network/if-pre-up.d/net-scan-cleanup}"
 SSR_SERVER_SCRIPT="${SSR_SERVER_SCRIPT:-/usr/local/SSR-Bash-Python/server.sh}"
@@ -173,8 +175,8 @@ audit_ssh() {
 
 add_drop_rule() {
   local chain="$1" proto="$2" port="$3"
-  iptables -C "$SCAN_CHAIN" -p "$proto" --dport "$port" -j REJECT 2>/dev/null \
-    || iptables -A "$SCAN_CHAIN" -p "$proto" --dport "$port" -j REJECT
+  iptables -C "$SCAN_CHAIN" -p "$proto" --dport "$port" -j DROP 2>/dev/null \
+    || iptables -A "$SCAN_CHAIN" -p "$proto" --dport "$port" -j DROP
   iptables -C "$chain" -j "$SCAN_CHAIN" 2>/dev/null \
     || iptables -I "$chain" 1 -j "$SCAN_CHAIN"
 }
@@ -235,6 +237,24 @@ delete_rule_if_exists() {
   done
 }
 
+ensure_ssh_whitelist_jump() {
+  local bin
+  if [ -x "$SSH_WHITELIST_APPLY" ]; then
+    "$SSH_WHITELIST_APPLY" || true
+    return 0
+  fi
+
+  for bin in $(iptables_bins); do
+    "$bin" -nL "$SSH_WHITELIST_CHAIN" >/dev/null 2>&1 || continue
+    while "$bin" -C INPUT -p tcp --dport "$SSH_PORT" -j "$SSH_WHITELIST_CHAIN" >/dev/null 2>&1; do
+      "$bin" -D INPUT -p tcp --dport "$SSH_PORT" -j "$SSH_WHITELIST_CHAIN"
+    done
+    "$bin" -I INPUT 1 -p tcp --dport "$SSH_PORT" -j "$SSH_WHITELIST_CHAIN"
+    echo "已恢复 INPUT tcp/$SSH_PORT -> $SSH_WHITELIST_CHAIN 白名单跳转。"
+    return 0
+  done
+}
+
 restore_ssh_22_access() {
   show_header "检查并恢复 SSH 22 端口访问"
   local bin chain proto direction target changed=0
@@ -269,8 +289,10 @@ EOF
     done
   done
 
+  ensure_ssh_whitelist_jump
+
   if [ "$changed" = "1" ]; then
-    echo "已移除 22 端口相关 DROP/REJECT 规则，保留 SSH22_WHITELIST 白名单跳转。"
+    echo "已移除 22 端口相关 DROP/REJECT 规则，并恢复 SSH22_WHITELIST 白名单跳转。"
   else
     echo "未发现 22 端口被本机 iptables 直接 DROP/REJECT。"
   fi
@@ -438,6 +460,7 @@ set -euo pipefail
 SCAN_PORTS="$SCAN_PORTS"
 SSH_PORT="$SSH_PORT"
 SCAN_CHAIN="$SCAN_CHAIN"
+SSH_WHITELIST_APPLY="$SSH_WHITELIST_APPLY"
 IPTABLES_BIN="\${IPTABLES_BIN:-$(command -v iptables 2>/dev/null || echo iptables)}"
 
 effective_scan_ports() {
@@ -463,7 +486,7 @@ fi
 
 for proto in tcp udp; do
   for port in \$(effective_scan_ports); do
-    "\$IPTABLES_BIN" -A "\$SCAN_CHAIN" -p "\$proto" --dport "\$port" -j REJECT
+    "\$IPTABLES_BIN" -A "\$SCAN_CHAIN" -p "\$proto" --dport "\$port" -j DROP
   done
 done
 
@@ -480,6 +503,8 @@ for chain in OUTPUT FORWARD; do
   done
   "\$IPTABLES_BIN" -I "\$chain" 1 -j "\$SCAN_CHAIN"
 done
+
+[ -x "\$SSH_WHITELIST_APPLY" ] && "\$SSH_WHITELIST_APPLY" || true
 EOF
   chmod +x "$APPLY_SCRIPT"
 
@@ -498,16 +523,23 @@ EOF
 install_ssr_restore_hook() {
   [ -f "$SSR_SERVER_SCRIPT" ] || return 0
   [ -w "$SSR_SERVER_SCRIPT" ] || return 0
-  grep -qF "$APPLY_SCRIPT" "$SSR_SERVER_SCRIPT" && return 0
 
   cp -a "$SSR_SERVER_SCRIPT" "${SSR_SERVER_SCRIPT}.bak.$(date +%Y%m%d%H%M%S)"
-  local tmp_file
+  local tmp_file scan_hook ssh_hook
   tmp_file="$(mktemp)"
-  awk -v hook="[ -x \"$APPLY_SCRIPT\" ] && \"$APPLY_SCRIPT\"" '
+  scan_hook="[ -x \"$APPLY_SCRIPT\" ] && \"$APPLY_SCRIPT\""
+  ssh_hook="[ -x \"$SSH_WHITELIST_APPLY\" ] && \"$SSH_WHITELIST_APPLY\""
+  awk -v scan_hook="$scan_hook" -v ssh_hook="$ssh_hook" '
     {
+      if ($0 == scan_hook || $0 == ssh_hook ||
+          $0 ~ /\[ -x ""\$(APPLY_SCRIPT|SSH_WHITELIST_APPLY)"" \]/ ||
+          $0 ~ /\[ -x "'\''\/usr\/local\/sbin\/(net-scan-cleanup-apply|ssh22-whitelist-apply)'\''" \]/) {
+        next
+      }
       print
-      if ($0 ~ /^[[:space:]]*iptables-restore < \/etc\/iptables\.up\.rules[[:space:]]*$/) {
-        print hook
+      if ($0 ~ /^[[:space:]]*iptables-restore[[:space:]]*<[[:space:]]*\/etc\/iptables\.up\.rules[[:space:]]*$/) {
+        print scan_hook
+        print ssh_hook
       }
     }
   ' "$SSR_SERVER_SCRIPT" >"$tmp_file"
