@@ -454,6 +454,37 @@ change_time() {
   echo "当前任务：${INSTALL_PATH} --run"
 }
 
+change_target_ip() {
+  local new_target_ip
+
+  need_root
+  load_config
+  if [ "${TRANSFER_ENABLED}" = "1" ]; then
+    require_cmd ssh
+    require_cmd ssh-copy-id
+    require_cmd ssh-keygen
+  fi
+
+  echo "当前目标 IP：${TARGET_IP}"
+  read -r -p "请输入新的目标 IP，例 38.76.188.74：" new_target_ip
+  if ! valid_ipv4 "$new_target_ip"; then
+    echo "目标 IP 格式不正确。"
+    exit 1
+  fi
+
+  TARGET_IP="$new_target_ip"
+  install_self
+  write_config "$TRANSFER_ENABLED"
+
+  echo "目标 IP 已修改为：${TARGET_IP}"
+  echo "后续定时任务会将 ${DOMAIN} 的 A 记录切换到 ${TARGET_IP}。"
+
+  if [ "${TRANSFER_ENABLED}" = "1" ]; then
+    echo "SSR 数据同步当前已开启，目标 IP 修改后需要确认 root SSH 免密登录。"
+    setup_ssh_login || true
+  fi
+}
+
 upgrade_script_only() {
   need_root
   install_self
@@ -485,16 +516,18 @@ show_menu() {
   echo "2、取消转移数据设置"
   echo "3、取消所有所有设置"
   echo "4、修改定时时间"
-  echo "5、升级脚本设置不变"
+  echo "5、修改目标 IP"
+  echo "6、升级脚本设置不变"
   echo
-  read -r -p "请输入选项 [1-5]：" choice
+  read -r -p "请输入选项 [1-6]：" choice
 
   case "$choice" in
     1) setup_switch ;;
     2) disable_transfer ;;
     3) cancel_all ;;
     4) change_time ;;
-    5) upgrade_script_only ;;
+    5) change_target_ip ;;
+    6) upgrade_script_only ;;
     *) echo "无效选项。" && exit 1 ;;
   esac
 }
