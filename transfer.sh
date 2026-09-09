@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
 
+# 本地和远程 SSR 配置文件路径
 LOCAL_SSR="/root/backup/ssr-conf.tar.gz"
 REMOTE_SSR="/root/backup/ssr-conf.tar.gz"
+# 本地和远程 h-ui 数据库路径
 LOCAL_HUI="/usr/local/h-ui/data/h_ui.db"
 REMOTE_HUI="/usr/local/h-ui/data/h_ui.db"
+# 本地和远程 x-ui 数据库路径
 LOCAL_XUI="/etc/x-ui/x-ui.db"
 REMOTE_XUI="/etc/x-ui/x-ui.db"
+# 本地和远程证书目录路径
 LOCAL_CERT_DIR="/root/cert"
 REMOTE_CERT_DIR="/root/cert"
+# 本地和远程额外证书目录路径
 LOCAL_EXTRA_CERT_DIR="/usr/local/h-ui/my_acme_dir/certificates/acme.zerossl.com-v2-dv90"
 REMOTE_EXTRA_CERT_DIR="/usr/local/h-ui/my_acme_dir/certificates/acme.zerossl.com-v2-dv90"
 
+# 检查命令是否存在
 need_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+# 检测包管理器
 detect_pm() {
   if need_cmd apt-get; then
     echo "apt"
@@ -30,6 +37,7 @@ detect_pm() {
   fi
 }
 
+# 安装软件包
 install_pkg() {
   local pkg="$1"
   local pm
@@ -56,6 +64,7 @@ install_pkg() {
   esac
 }
 
+# 确保 rsync 已安装
 ensure_rsync() {
   if ! need_cmd rsync; then
     echo "未找到 rsync；正在安装..."
@@ -63,6 +72,7 @@ ensure_rsync() {
   fi
 }
 
+# 确保 SSH 密钥存在
 ensure_ssh_key() {
   if [[ ! -f "$HOME/.ssh/id_rsa" || ! -f "$HOME/.ssh/id_rsa.pub" ]]; then
     echo "未找到 SSH 密钥；正在创建..."
@@ -73,6 +83,7 @@ ensure_ssh_key() {
   fi
 }
 
+# 尝试使用密钥认证
 try_key_auth() {
   local user="$1"
   local host="$2"
@@ -80,12 +91,13 @@ try_key_auth() {
     "${user}@${host}" "true" >/dev/null 2>&1
 }
 
+# 设置密钥认证
 setup_key_auth() {
   local user="$1"
   local host="$2"
 
   if try_key_auth "$user" "$host"; then
-    echo "密钥认证已生效；跳过密码输入。"
+    echo "密钥认证已工作；跳过密码输入。"
     return 0
   fi
 
@@ -101,6 +113,7 @@ setup_key_auth() {
   fi
 }
 
+# 检查本地文件是否存在
 require_file() {
   local path="$1"
   if [[ ! -f "$path" ]]; then
@@ -109,72 +122,116 @@ require_file() {
   fi
 }
 
+# 运行备份脚本
 run_backup() {
   sudo /bin/bash /usr/local/SSR-Bash-Python/user/backup.sh
 }
 
+# 主函数
 main() {
   if [[ "$(id -u)" -ne 0 ]]; then
-    echo "警告: 当前未以 root 身份运行。可能需要使用 sudo 进行安装或文件访问。"
+    echo "警告：当前不是以 root 用户运行。您可能需要使用 sudo 来安装软件或访问文件。"
   fi
 
   ensure_rsync
   ensure_ssh_key
 
-  read -r -p "远程 IP: " remote_ip
+  # 读取远程 IP 地址
+  read -r -p "远程 IP 地址: " remote_ip
   if [[ -z "$remote_ip" ]]; then
-    echo "远程 IP 是必需的。" >&2
+    echo "远程 IP 地址是必需的。" >&2
     exit 1
   fi
 
   remote_user="root"
 
+  # 设置密钥认证
   setup_key_auth "$remote_user" "$remote_ip"
 
-  echo "请选择传输选项:"
+  # 选择传输类型（支持多个数字，用空格分隔，如 "1 3 4"）
+  echo "选择传输类型:"
   echo "1) ssr 包"
   echo "2) hui 包"
   echo "3) 证书目录"
   echo "4) xui 数据库"
-  read -r -p "请输入 1, 2, 3 或 4: " choice
+  read -r -p "输入要转移的类型编号（多个用空格分隔，如 1 3 4）: " choices
 
-  case "$choice" in
-    1)
-      run_backup
-      require_file "$LOCAL_SSR"
-      ssh "${remote_user}@${remote_ip}" "mkdir -p /root/backup"
-      rsync -avz -e ssh "$LOCAL_SSR" "${remote_user}@${remote_ip}:$REMOTE_SSR"
-      ;;
-    2)
-      run_backup
-      require_file "$LOCAL_HUI"
-      ssh "${remote_user}@${remote_ip}" "mkdir -p /usr/local/h-ui/data"
-      rsync -avz -e ssh "$LOCAL_HUI" "${remote_user}@${remote_ip}:$REMOTE_HUI"
-      ;;
-    3)
-      if [[ ! -d "$LOCAL_CERT_DIR" ]]; then
-        echo "本地目录未找到: $LOCAL_CERT_DIR" >&2
-        exit 1
-      fi
-      ssh "${remote_user}@${remote_ip}" "mkdir -p \"$REMOTE_CERT_DIR\""
-      rsync -avz -e ssh "${LOCAL_CERT_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_CERT_DIR}/"
-      if [[ -d "$LOCAL_EXTRA_CERT_DIR" ]]; then
-        ssh "${remote_user}@${remote_ip}" "mkdir -p \"$REMOTE_EXTRA_CERT_DIR\""
-        rsync -avz -e ssh "${LOCAL_EXTRA_CERT_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_EXTRA_CERT_DIR}/"
-      else
-        echo "可选目录未找到，跳过: $LOCAL_EXTRA_CERT_DIR"
-      fi
-      ;;
-    4)
-      require_file "$LOCAL_XUI"
-      ssh "${remote_user}@${remote_ip}" "mkdir -p /etc/x-ui"
-      rsync -avz -e ssh "$LOCAL_XUI" "${remote_user}@${remote_ip}:$REMOTE_XUI"
-      ;;
-    *)
-      echo "无效的选择。" >&2
+  # 将输入拆分为数组并去重
+  read -r -a choice_array <<< "$choices"
+  declare -A seen_choices
+  unique_choices=()
+  for c in "${choice_array[@]}"; do
+    if [[ -n "$c" ]] && [[ -z "${seen_choices[$c]+x}" ]]; then
+      seen_choices[$c]=1
+      unique_choices+=("$c")
+    fi
+  done
+
+  # 验证输入是否有效
+  for c in "${unique_choices[@]}"; do
+    if [[ "$c" != "1" && "$c" != "2" && "$c" != "3" && "$c" != "4" ]]; then
+      echo "无效选择: $c。请输入 1-4 之间的数字。" >&2
       exit 1
-      ;;
-  esac
+    fi
+  done
+
+  if [[ ${#unique_choices[@]} -eq 0 ]]; then
+    echo "未输入任何选择。" >&2
+    exit 1
+  fi
+
+  # 标记是否需要运行备份脚本（选项1和2需要）
+  need_backup=false
+  for c in "${unique_choices[@]}"; do
+    if [[ "$c" == "1" || "$c" == "2" ]]; then
+      need_backup=true
+      break
+    fi
+  done
+
+  # 如果需要，执行一次备份
+  if $need_backup; then
+    run_backup
+  fi
+
+  # 根据选择的编号执行对应传输
+  for c in "${unique_choices[@]}"; do
+    case "$c" in
+      1)
+        echo "=== 正在转移 ssr 包 ==="
+        require_file "$LOCAL_SSR"
+        ssh "${remote_user}@${remote_ip}" "mkdir -p /root/backup"
+        rsync -avz -e ssh "$LOCAL_SSR" "${remote_user}@${remote_ip}:$REMOTE_SSR"
+        ;;
+      2)
+        echo "=== 正在转移 hui 包 ==="
+        require_file "$LOCAL_HUI"
+        ssh "${remote_user}@${remote_ip}" "mkdir -p /usr/local/h-ui/data"
+        rsync -avz -e ssh "$LOCAL_HUI" "${remote_user}@${remote_ip}:$REMOTE_HUI"
+        ;;
+      3)
+        echo "=== 正在转移证书目录 ==="
+        if [[ ! -d "$LOCAL_CERT_DIR" ]]; then
+          echo "本地目录未找到: $LOCAL_CERT_DIR" >&2
+          exit 1
+        fi
+        ssh "${remote_user}@${remote_ip}" "mkdir -p \"$REMOTE_CERT_DIR\""
+        rsync -avz -e ssh "${LOCAL_CERT_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_CERT_DIR}/"
+        if [[ -d "$LOCAL_EXTRA_CERT_DIR" ]]; then
+          ssh "${remote_user}@${remote_ip}" "mkdir -p \"$REMOTE_EXTRA_CERT_DIR\""
+          rsync -avz -e ssh "${LOCAL_EXTRA_CERT_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_EXTRA_CERT_DIR}/"
+        else
+          echo "可选目录未找到，跳过: $LOCAL_EXTRA_CERT_DIR"
+        fi
+        ;;
+      4)
+        echo "=== 正在转移 xui 数据库 ==="
+        require_file "$LOCAL_XUI"
+        ssh "${remote_user}@${remote_ip}" "mkdir -p /etc/x-ui"
+        rsync -avz -e ssh "$LOCAL_XUI" "${remote_user}@${remote_ip}:$REMOTE_XUI"
+        ;;
+    esac
+  done
 
   echo "完成。"
 }
