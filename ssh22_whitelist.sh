@@ -6,6 +6,7 @@ PORT="22"
 WHITELIST_FILE="/etc/ssh22_whitelist.list"
 APPLY_SCRIPT="/usr/local/sbin/ssh22-whitelist-apply"
 RESTORE_HOOK="/etc/network/if-pre-up.d/ssh22-whitelist"
+IPTABLES_RULES_FILE="/etc/iptables.up.rules"
 SSR_SERVER_SCRIPT="/usr/local/SSR-Bash-Python/server.sh"
 IPTABLES_BIN=""
 IPTABLES_SAVE_BIN=""
@@ -242,6 +243,28 @@ install_ssr_restore_hook() {
     rm -f "$tmp_file"
 }
 
+sync_iptables_rules_file() {
+    local tmp_file backup_file
+
+    if [[ ! -e "$IPTABLES_RULES_FILE" ]]; then
+        return 0
+    fi
+
+    tmp_file="$(mktemp)"
+    backup_file="${IPTABLES_RULES_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+
+    if iptables_save_cmd > "$tmp_file"; then
+        cp -a "$IPTABLES_RULES_FILE" "$backup_file"
+        mv "$tmp_file" "$IPTABLES_RULES_FILE"
+        chmod 600 "$IPTABLES_RULES_FILE" 2>/dev/null || true
+        echo "已同步当前 iptables 规则到：$IPTABLES_RULES_FILE"
+        echo "旧规则备份为：$backup_file"
+    else
+        rm -f "$tmp_file"
+        echo "警告：同步 $IPTABLES_RULES_FILE 失败，请检查 iptables-save。"
+    fi
+}
+
 print_whitelist_sources() {
     iptables_save_cmd | awk -v chain="$CHAIN" '
         $1 == "-A" && $2 == chain && $0 ~ /(^| )-j ACCEPT( |$)/ {
@@ -271,7 +294,7 @@ persist_whitelist() {
     echo "已持久化白名单到：$WHITELIST_FILE"
     echo "已安装独立开机恢复钩子：$RESTORE_HOOK"
     echo "当前使用 iptables 后端：$IPTABLES_BIN"
-    echo "不会修改或覆盖 /etc/iptables.up.rules"
+    sync_iptables_rules_file
 }
 
 read_batch_items() {
@@ -418,7 +441,8 @@ restore_open() {
 
     rm -f "$WHITELIST_FILE" "$RESTORE_HOOK" "$APPLY_SCRIPT"
     echo "已恢复：22 端口不再使用白名单限制。"
-    echo "已删除本脚本的持久化文件，未修改 /etc/iptables.up.rules。"
+    sync_iptables_rules_file
+    echo "已删除本脚本的持久化文件。"
 }
 
 show_menu() {
