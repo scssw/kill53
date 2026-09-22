@@ -2,18 +2,18 @@
 # ==============================================================================
 # 自动备份配置与定时任务脚本 (backup.sh)
 # 功能：
-# 1. 自动检测并安装 rsync、sshpass、cron 等必要依赖
-# 2. 获取本机IP末两位
-# 3. 交互式配置远程备份主机并打通SSH免密连接，保存连接记录
-# 4. 菜单支持多选 (如 1 2)，支持自定义目录 (选项4)
-# 5. 自动配置 crontab 定时备份任务并在远程主机预建目录
+# 1. 兼容 curl ... | bash 管道运行与终端直接运行
+# 2. 自动检测并安装 rsync、cron、curl 等必要依赖
+# 3. 自动识别本机公网 IP 并提取末两位
+# 4. 使用标准的 ssh-keygen 与 ssh-copy-id 原生交互免密方式记住密码
+# 5. 菜单支持 1~3 多选 (如 "1 2") 以及 4 自定义目录
+# 6. 自动写入 crontab 定时备份任务并在远程主机预建目录
 # ==============================================================================
 
 # 颜色输出定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 PLAIN='\033[0m'
 
@@ -33,6 +33,15 @@ echo_err() {
     echo -e "${RED}[错误]${PLAIN} $1"
 }
 
+# 统一终端输入读取函数，彻底解决 curl ... | bash 管道导致的 stdin 无法交互问题
+read_input() {
+    if [ -e /dev/tty ]; then
+        read "$@" < /dev/tty
+    else
+        read "$@"
+    fi
+}
+
 # 检查 root 权限
 if [[ $EUID -ne 0 ]]; then
     echo_err "请使用 root 权限运行此脚本 (例如: sudo bash $0)"
@@ -41,16 +50,12 @@ fi
 
 # 1. 自动检测并安装依赖
 check_and_install_dependencies() {
-    echo_info "正在检查并安装所需依赖 (rsync, sshpass, cron, curl)..."
+    echo_info "正在检查并安装所需依赖 (rsync, cron, curl, openssh)..."
     
     local pkgs_to_install=()
 
     if ! command -v rsync &>/dev/null; then
         pkgs_to_install+=("rsync")
-    fi
-
-    if ! command -v sshpass &>/dev/null; then
-        pkgs_to_install+=("sshpass")
     fi
 
     if ! command -v crontab &>/dev/null; then
@@ -71,12 +76,6 @@ check_and_install_dependencies() {
             apt-get update -y
             apt-get install -y "${pkgs_to_install[@]}"
         elif command -v yum &>/dev/null; then
-            # CentOS / RHEL / AlmaLinux
-            # sshpass 通常在 epel-release 中
-            if ! command -v sshpass &>/dev/null; then
-                yum install -y epel-release 2>/dev/null
-            fi
-            # cron 包名处理
             local yum_pkgs=()
             for pkg in "${pkgs_to_install[@]}"; do
                 if [ "$pkg" == "cron" ]; then
@@ -111,13 +110,13 @@ get_ip_tail() {
     echo_info "正在获取本机公网 IP 地址..."
     local local_ip=""
     
-    # 尝试公网 API
+    # 优先通过公网 API 获取公网 IPv4
     local_ip=$(curl -s4 -m 5 https://api.ipify.org 2>/dev/null || \
                curl -s4 -m 5 https://ip.sb 2>/dev/null || \
                curl -s4 -m 5 https://ifconfig.me 2>/dev/null || \
                curl -s4 -m 5 https://icanhazip.com 2>/dev/null)
 
-    # 若公网API获取失败，尝试从网卡获取
+    # 若公网 API 失败，尝试本地网卡
     if [[ -z "$local_ip" || ! "$local_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         local_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7}' | tr -d '\n')
     fi
@@ -127,10 +126,10 @@ get_ip_tail() {
 
     if [[ -z "$local_ip" ]]; then
         echo_warn "无法自动获取本机 IPv4，请输入本机 IP (如 1.2.113.24): "
-        read -r local_ip
+        read_input -r local_ip
     fi
 
-    # 提取末两位 (如 1.2.113.24 -> 113.24)
+    # 提取末两位 (如 107.173.39.53 -> 39.53)
     IP_TAIL=$(echo "$local_ip" | awk -F. '{print $(NF-1)"."$NF}')
     echo_success "本机 IP: ${local_ip}，末两位识别为: ${IP_TAIL}"
 }
@@ -142,49 +141,55 @@ setup_remote_host() {
     echo "              配置远程备份主机与免密认证"
     echo "--------------------------------------------------------"
     local default_host="168.138.219.203"
-    read -rp "请输入远程主机 IP [默认: ${default_host}]: " input_host
+    read_input -rp "请输入远程主机 IP [默认: ${default_host}]: " input_host
     REMOTE_HOST="${input_host:-$default_host}"
 
-    read -rp "请输入远程主机 SSH 端口 [默认: 22]: " input_port
+    read_input -rp "请输入远程主机 SSH 端口 [默认: 22]: " input_port
     REMOTE_PORT="${input_port:-22}"
 
-    read -rp "请输入远程主机用户 [默认: root]: " input_user
+    read_input -rp "请输入远程主机用户 [默认: root]: " input_user
     REMOTE_USER="${input_user:-root}"
 
-    # 生成本地 SSH 密钥对（若不存在）
-    if [ ! -f "$HOME/.ssh/id_rsa" ]; then
-        echo_info "正在生成本机 SSH 密钥对..."
+    # 1) 如果本机没有密钥，自动生成 ssh-keygen
+    if [ ! -f "$HOME/.ssh/id_rsa" ] && [ ! -f "$HOME/.ssh/id_ed25519" ]; then
+        echo_info "未检测到本地 SSH 密钥，正在自动生成 (ssh-keygen -t rsa -b 2048)..."
         mkdir -p "$HOME/.ssh"
         chmod 700 "$HOME/.ssh"
         ssh-keygen -t rsa -b 2048 -N "" -f "$HOME/.ssh/id_rsa" -q
+        echo_success "SSH 密钥已生成。"
     fi
 
-    # 输入密码并推送密钥
-    echo ""
-    read -rsp "请输入远程主机 (${REMOTE_USER}@${REMOTE_HOST}) 的密码: " REMOTE_PASS
-    echo ""
+    # 2) 检查是否已经免密连接
+    echo_info "正在测试是否已存在免密连接..."
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$REMOTE_PORT" -o StrictHostKeyChecking=no "${REMOTE_USER}@${REMOTE_HOST}" "echo 'auth_ok'" 2>/dev/null | grep -q "auth_ok"; then
+        echo_success "已检测到对远程主机 ${REMOTE_HOST} 的免密连接有效，无需重新分发密钥！"
+        return 0
+    fi
 
-    if [ -z "$REMOTE_PASS" ]; then
-        echo_warn "密码为空，尝试直接检测免密连接..."
+    # 3) 执行标准的 ssh-copy-id 将公钥分发至远程主机
+    echo_info "正在使用 ssh-copy-id 推送公钥，请在下方提示时输入远程主机密码："
+    echo "--------------------------------------------------------"
+    
+    # 将标准输入定向到 /dev/tty，确保在 curl ... | bash 下也能正常交互输入密码
+    if [ -e /dev/tty ]; then
+        ssh-copy-id -o StrictHostKeyChecking=no -p "$REMOTE_PORT" "${REMOTE_USER}@${REMOTE_HOST}" < /dev/tty
     else
-        echo_info "正在配置免密认证并保存远程主机记录..."
-        export SSHPASS="$REMOTE_PASS"
-        sshpass -e ssh-copy-id -o StrictHostKeyChecking=no -p "$REMOTE_PORT" "${REMOTE_USER}@${REMOTE_HOST}" 2>/dev/null
-        unset SSHPASS
+        ssh-copy-id -o StrictHostKeyChecking=no -p "$REMOTE_PORT" "${REMOTE_USER}@${REMOTE_HOST}"
     fi
+    echo "--------------------------------------------------------"
 
-    # 验证免密连接
-    echo_info "正在测试与远程主机 ${REMOTE_HOST} 的免密连接..."
+    # 4) 验证免密连接
+    echo_info "正在复核与远程主机 ${REMOTE_HOST} 的免密连接..."
     if ssh -o BatchMode=yes -o ConnectTimeout=8 -p "$REMOTE_PORT" -o StrictHostKeyChecking=no "${REMOTE_USER}@${REMOTE_HOST}" "echo 'auth_ok'" 2>/dev/null | grep -q "auth_ok"; then
-        echo_success "免密连接成功！远程主机记录已保存。"
+        echo_success "免密连接配置成功！远程主机记录已成功保存。"
     else
-        echo_err "免密连接失败，请检查远程主机 IP、端口或密码是否正确。"
-        read -rp "是否重新输入配置？(y/n) [默认: y]: " retry
+        echo_err "免密连接未能建立，可能密码输入有误或连接被拒绝。"
+        read_input -rp "是否重新尝试输入密码与配置？(y/n) [默认: y]: " retry
         retry="${retry:-y}"
         if [[ "$retry" =~ ^[Yy]$ ]]; then
             setup_remote_host
         else
-            echo_warn "跳过免密验证，后续定时任务可能因无权限无法执行。"
+            echo_warn "已跳过免密验证，请注意后续定时任务可能因权限不足而失败。"
         fi
     fi
 }
@@ -231,7 +236,7 @@ choose_backup_tasks() {
     echo "说明: 1~3 选项可组合多选，例如输入 '1 2' 或 '1 3' 即可同时配置多个任务"
     echo ""
 
-    read -rp "请输入选项编号 (如 1 或 1 2 或 4): " user_choice
+    read_input -rp "请输入选项编号 (如 1 或 1 2 或 4): " user_choice
 
     if [[ -z "$user_choice" ]]; then
         echo_err "未输入任何选项，退出。"
@@ -244,7 +249,7 @@ choose_backup_tasks() {
         rsync_ssh_arg="-e 'ssh -p ${REMOTE_PORT}' "
     fi
 
-    # 分词解析用户输入
+    # 分词解析用户输入（兼容空格或逗号分隔）
     local choices=()
     for item in $(echo "$user_choice" | tr ',' ' '); do
         choices+=("$item")
@@ -275,7 +280,7 @@ choose_backup_tasks() {
                 ;;
             4)
                 echo ""
-                read -rp "请输入要定时备份的目录绝对路径 (如 /usr/share/awk): " custom_dir
+                read_input -rp "请输入要定时备份的目录绝对路径 (如 /usr/share/awk): " custom_dir
                 if [[ -z "$custom_dir" ]]; then
                     echo_warn "未输入目录路径，跳过选项 4。"
                     continue
