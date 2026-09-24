@@ -87,7 +87,8 @@ ensure_ssh_key() {
 try_key_auth() {
   local user="$1"
   local host="$2"
-  ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+  local port="$3"
+  ssh -p "$port" -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
     "${user}@${host}" "true" >/dev/null 2>&1
 }
 
@@ -95,20 +96,21 @@ try_key_auth() {
 setup_key_auth() {
   local user="$1"
   local host="$2"
+  local port="$3"
 
-  if try_key_auth "$user" "$host"; then
+  if try_key_auth "$user" "$host" "$port"; then
     echo "密钥认证已工作；跳过密码输入。"
     return 0
   fi
 
   if need_cmd ssh-copy-id; then
     echo "将要求输入密码以安装密钥..."
-    ssh-copy-id -o StrictHostKeyChecking=accept-new "${user}@${host}"
+    ssh-copy-id -p "$port" -o StrictHostKeyChecking=accept-new "${user}@${host}"
   else
     echo "将要求输入密码以安装密钥..."
-    ssh -o StrictHostKeyChecking=accept-new "${user}@${host}" \
+    ssh -p "$port" -o StrictHostKeyChecking=accept-new "${user}@${host}" \
       "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
-    ssh -o StrictHostKeyChecking=accept-new "${user}@${host}" \
+    ssh -p "$port" -o StrictHostKeyChecking=accept-new "${user}@${host}" \
       "cat >> ~/.ssh/authorized_keys" < "$HOME/.ssh/id_rsa.pub"
   fi
 }
@@ -143,10 +145,17 @@ main() {
     exit 1
   fi
 
+  read -r -p "对方 SSH 端口（默认 22；如果不是 22 请输入实际端口）: " remote_port
+  remote_port="${remote_port:-22}"
+  if [[ ! "$remote_port" =~ ^[0-9]+$ ]] || (( remote_port < 1 || remote_port > 65535 )); then
+    echo "无效端口：请输入 1-65535 之间的数字。" >&2
+    exit 1
+  fi
+
   remote_user="root"
 
   # 设置密钥认证
-  setup_key_auth "$remote_user" "$remote_ip"
+  setup_key_auth "$remote_user" "$remote_ip" "$remote_port"
 
   # 选择传输类型（支持多个数字，用空格分隔，如 "1 3 4"）
   echo "选择传输类型:"
@@ -200,14 +209,14 @@ main() {
       1)
         echo "=== 正在转移 ssr 包 ==="
         require_file "$LOCAL_SSR"
-        ssh "${remote_user}@${remote_ip}" "mkdir -p /root/backup"
-        rsync -avz -e ssh "$LOCAL_SSR" "${remote_user}@${remote_ip}:$REMOTE_SSR"
+        ssh -p "$remote_port" "${remote_user}@${remote_ip}" "mkdir -p /root/backup"
+        rsync -avz -e "ssh -p $remote_port" "$LOCAL_SSR" "${remote_user}@${remote_ip}:$REMOTE_SSR"
         ;;
       2)
         echo "=== 正在转移 hui 包 ==="
         require_file "$LOCAL_HUI"
-        ssh "${remote_user}@${remote_ip}" "mkdir -p /usr/local/h-ui/data"
-        rsync -avz -e ssh "$LOCAL_HUI" "${remote_user}@${remote_ip}:$REMOTE_HUI"
+        ssh -p "$remote_port" "${remote_user}@${remote_ip}" "mkdir -p /usr/local/h-ui/data"
+        rsync -avz -e "ssh -p $remote_port" "$LOCAL_HUI" "${remote_user}@${remote_ip}:$REMOTE_HUI"
         ;;
       3)
         echo "=== 正在转移证书目录 ==="
@@ -215,11 +224,11 @@ main() {
           echo "本地目录未找到: $LOCAL_CERT_DIR" >&2
           exit 1
         fi
-        ssh "${remote_user}@${remote_ip}" "mkdir -p \"$REMOTE_CERT_DIR\""
-        rsync -avz -e ssh "${LOCAL_CERT_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_CERT_DIR}/"
+        ssh -p "$remote_port" "${remote_user}@${remote_ip}" "mkdir -p \"$REMOTE_CERT_DIR\""
+        rsync -avz -e "ssh -p $remote_port" "${LOCAL_CERT_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_CERT_DIR}/"
         if [[ -d "$LOCAL_EXTRA_CERT_DIR" ]]; then
-          ssh "${remote_user}@${remote_ip}" "mkdir -p \"$REMOTE_EXTRA_CERT_DIR\""
-          rsync -avz -e ssh "${LOCAL_EXTRA_CERT_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_EXTRA_CERT_DIR}/"
+          ssh -p "$remote_port" "${remote_user}@${remote_ip}" "mkdir -p \"$REMOTE_EXTRA_CERT_DIR\""
+          rsync -avz -e "ssh -p $remote_port" "${LOCAL_EXTRA_CERT_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_EXTRA_CERT_DIR}/"
         else
           echo "可选目录未找到，跳过: $LOCAL_EXTRA_CERT_DIR"
         fi
@@ -227,8 +236,8 @@ main() {
       4)
         echo "=== 正在转移 xui 数据库 ==="
         require_file "$LOCAL_XUI"
-        ssh "${remote_user}@${remote_ip}" "mkdir -p /etc/x-ui"
-        rsync -avz -e ssh "$LOCAL_XUI" "${remote_user}@${remote_ip}:$REMOTE_XUI"
+        ssh -p "$remote_port" "${remote_user}@${remote_ip}" "mkdir -p /etc/x-ui"
+        rsync -avz -e "ssh -p $remote_port" "$LOCAL_XUI" "${remote_user}@${remote_ip}:$REMOTE_XUI"
         ;;
     esac
   done
