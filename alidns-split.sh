@@ -129,7 +129,7 @@ make_job_script() {
 #!/usr/bin/env bash
 set -eu
 source "$CONFIG_FILE"
-exec aliyun alidns SetDomainRecordStatus --RecordId "\$RECORD_ID" --Status "$action" --access-key-id "\$ACCESS_KEY_ID" --access-key-secret "\$ACCESS_KEY_SECRET" --region "cn-hangzhou" --endpoint "https://alidns.aliyuncs.com"
+exec aliyun alidns SetDomainRecordStatus --RecordId "\$RECORD_ID" --Status "$action" --access-key-id "\$ACCESS_KEY_ID" --access-key-secret "\$ACCESS_KEY_SECRET" --region "cn-hangzhou" --endpoint "alidns.aliyuncs.com"
 EOF
   chmod 700 "$path"
 }
