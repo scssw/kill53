@@ -266,17 +266,17 @@ choose_backup_tasks() {
                 ;;
             2)
                 local src="/etc/x-ui/"
-                local dest_dir="/root/backup/x-ui/${IP_TAIL}hui"
+                local dest_dir="/root/backup/x-ui/${IP_TAIL}xui"
                 remote_mkdir "$dest_dir"
                 local cron_cmd="3 */2 * * * rsync -avz ${rsync_ssh_arg}${src} ${REMOTE_USER}@${REMOTE_HOST}:${dest_dir}"
-                add_cron_job "$cron_cmd" "2、备份hui (每2小时第3分钟)"
+                add_cron_job "$cron_cmd" "2、备份xui (每2小时第3分钟)"
                 ;;
             3)
                 local src="/usr/local/h-ui/data/"
                 local dest_dir="/root/backup/hui/${IP_TAIL}hui"
                 remote_mkdir "$dest_dir"
                 local cron_cmd="3 */3 * * * rsync -avz ${rsync_ssh_arg}${src} ${REMOTE_USER}@${REMOTE_HOST}:${dest_dir}"
-                add_cron_job "$cron_cmd" "3、备份xui (每3小时第3分钟)"
+                add_cron_job "$cron_cmd" "3、备份hui (每3小时第3分钟)"
                 ;;
             4)
                 echo ""
