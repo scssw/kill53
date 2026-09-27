@@ -131,20 +131,26 @@ def merge_traffic():
     except FileNotFoundError:
         ledger = {}
     local = {user_key(x): x for x in master}
+    added = {'u': 0, 'd': 0}
+    matched = 0
     for peer_row in replica:
         key = user_key(peer_row)
         if key not in local:
             continue
+        matched += 1
         last = ledger.get(key, {})
         for field in ('u', 'd'):
             current = max(0, int(peer_row.get(field, 0) or 0))
             previous = max(0, int(last.get(field, 0) or 0))
-            local[key][field] = int(local[key].get(field, 0) or 0) + max(0, current - previous)
+            delta = max(0, current - previous)
+            local[key][field] = int(local[key].get(field, 0) or 0) + delta
+            added[field] += delta
             last[field] = current
         ledger[key] = last
     write_json(MUD, master)
     write_json(ledger_path, ledger)
-    print('副机流量增量已合并到主机。')
+    print('副机流量已合并：匹配用户 %d 个，上传 +%d 字节，下载 +%d 字节。' %
+          (matched, added['u'], added['d']))
 
 
 def install_units():
@@ -170,9 +176,10 @@ def setup(role):
         raise RuntimeError('请使用 root 运行')
     data = {'role': role}
     if role == 'master':
-        peer = input('副机 SSH 地址（例 root@1.2.3.4）: ').strip()
-        if not re.fullmatch(r'[A-Za-z0-9_.-]+@[A-Za-z0-9.-]+', peer):
-            raise RuntimeError('SSH 地址格式无效；请使用 user@IPv4/域名')
+        host = input('副机 IP: ').strip()
+        if not re.fullmatch(r'[A-Za-z0-9.-]+', host) or host.startswith('-') or '..' in host:
+            raise RuntimeError('IP/主机名格式无效')
+        peer = 'root@' + host
         data['peer'] = peer
         # Check noninteractive SSH before enabling background jobs.
         ssh(peer, 'true')
@@ -198,11 +205,13 @@ def menu():
     print('1、设为主机')
     print('2、设为副机')
     print('3、取消绑定系统')
+    print('4、一键同步副机流量到主机')
     print('0、退出')
     choice = input('请选择: ').strip()
     if choice == '1': setup('master')
     elif choice == '2': setup('replica')
     elif choice == '3': unbind()
+    elif choice == '4': merge_traffic()
     elif choice == '0': return
     else: print('无效选项')
 
