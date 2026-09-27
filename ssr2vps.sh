@@ -10,13 +10,7 @@ fi
 dest=/usr/local/bin/ssr2vps
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT HUP INT TERM
-awk 'found { print } /^# --- embedded program ---$/ { found=1 }' "$0" > "$tmp"
-install -m 0755 "$tmp" "$dest"
-rm -f "$tmp"
-trap - EXIT HUP INT TERM
-exec "$dest" menu
-
-# --- embedded program ---
+cat > "$tmp" <<'__SSR2VPS_PYTHON__'
 #!/usr/bin/env python3
 """Bind a ShadowsocksR mudbjson master to a traffic-only replica."""
 import base64
@@ -231,3 +225,8 @@ def main():
 
 if __name__ == '__main__':
     main()
+__SSR2VPS_PYTHON__
+install -m 0755 "$tmp" "$dest"
+rm -f "$tmp"
+trap - EXIT HUP INT TERM
+exec "$dest" menu
