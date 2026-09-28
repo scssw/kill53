@@ -504,9 +504,10 @@ def install_units():
 
 def disable_units():
     subprocess.run(['systemctl', 'disable', '--now', 'xui2vps-watch.path',
-                    'xui2vps-traffic.timer'], check=False)
+                    'xui2vps-traffic.timer'], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for p in (PATH_UNIT, SERVICE_UNIT, TIMER_UNIT, NIGHT_UNIT):
-        p.unlink(missing_ok=True)
+        Path(p).unlink(missing_ok=True)
     subprocess.run(['systemctl', 'daemon-reload'], check=False)
 
 
