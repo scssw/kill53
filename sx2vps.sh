@@ -261,6 +261,7 @@ PATH_UNIT = '/etc/systemd/system/xui2vps-watch.path'
 SERVICE_UNIT = '/etc/systemd/system/xui2vps-watch.service'
 TIMER_UNIT = '/etc/systemd/system/xui2vps-traffic.timer'
 NIGHT_UNIT = '/etc/systemd/system/xui2vps-traffic.service'
+SYNC_TIMER_UNIT = '/etc/systemd/system/xui2vps-sync.timer'
 TABLES = ('inbounds', 'client_traffics')
 INBOUND_COUNTERS = ('up', 'down', 'all_time')
 CLIENT_COUNTERS = ('up', 'down', 'all_time', 'last_online')
@@ -490,23 +491,25 @@ def merge_traffic():
 
 
 def install_units():
-    path_content = '''[Unit]\nDescription=Watch x-ui SQLite database for xui2vps changes\n\n[Path]\nPathChanged=/etc/x-ui/x-ui.db\nPathChanged=/etc/x-ui/x-ui.db-wal\nUnit=xui2vps-watch.service\n\n[Install]\nWantedBy=multi-user.target\n'''
+    path_content = '''[Unit]\nDescription=Watch x-ui SQLite database for xui2vps changes\n\n[Path]\nPathChanged=/etc/x-ui/x-ui.db\nPathModified=/etc/x-ui/x-ui.db\nPathChanged=/etc/x-ui/x-ui.db-wal\nPathModified=/etc/x-ui/x-ui.db-wal\nUnit=xui2vps-watch.service\n\n[Install]\nWantedBy=multi-user.target\n'''
     service = '''[Unit]\nDescription=Synchronize x-ui configuration to xui2vps replica\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/xui2vps push-if-changed\n'''
     timer = '''[Unit]\nDescription=Merge xui2vps replica traffic at 03:00\n\n[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nUnit=xui2vps-traffic.service\n\n[Install]\nWantedBy=timers.target\n'''
+    sync_timer = '''[Unit]\nDescription=Retry xui2vps configuration sync\n\n[Timer]\nOnBootSec=10s\nOnUnitActiveSec=15s\nUnit=xui2vps-watch.service\n\n[Install]\nWantedBy=timers.target\n'''
     night = '''[Unit]\nDescription=Merge xui2vps replica traffic\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/xui2vps merge-traffic\n'''
     for path, content in ((PATH_UNIT, path_content), (SERVICE_UNIT, service),
-                          (TIMER_UNIT, timer), (NIGHT_UNIT, night)):
+                          (TIMER_UNIT, timer), (NIGHT_UNIT, night),
+                          (SYNC_TIMER_UNIT, sync_timer)):
         Path(path).write_text(content)
     subprocess.run(['systemctl', 'daemon-reload'], check=True)
     subprocess.run(['systemctl', 'enable', '--now', 'xui2vps-watch.path',
-                    'xui2vps-traffic.timer'], check=True)
+                    'xui2vps-traffic.timer', 'xui2vps-sync.timer'], check=True)
 
 
 def disable_units():
     subprocess.run(['systemctl', 'disable', '--now', 'xui2vps-watch.path',
-                    'xui2vps-traffic.timer'], check=False,
+                    'xui2vps-traffic.timer', 'xui2vps-sync.timer'], check=False,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for p in (PATH_UNIT, SERVICE_UNIT, TIMER_UNIT, NIGHT_UNIT):
+    for p in (PATH_UNIT, SERVICE_UNIT, TIMER_UNIT, NIGHT_UNIT, SYNC_TIMER_UNIT):
         Path(p).unlink(missing_ok=True)
     subprocess.run(['systemctl', 'daemon-reload'], check=False)
 
