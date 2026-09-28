@@ -155,7 +155,7 @@ def merge_traffic():
 def install_units():
     systemd = '''[Unit]\nDescription=Push SSR2VPS master configuration after local data changes\n\n[Path]\nPathChanged=/usr/local/shadowsocksr/mudb.json\nPathChanged=/usr/local/SSR-Bash-Python/timelimit.db\nUnit=ssr2vps-watch.service\n\n[Install]\nWantedBy=multi-user.target\n'''
     service = '''[Unit]\nDescription=Synchronize SSR2VPS configuration\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/ssr2vps push\n'''
-    timer = '''[Unit]\nDescription=Merge replica SSR traffic at 03:00\n\n[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nUnit=ssr2vps-traffic.service\n\n[Install]\nWantedBy=timers.target\n'''
+    timer = '''[Unit]\nDescription=Merge replica SSR traffic every 66 minutes\n\n[Timer]\nOnBootSec=66min\nOnUnitActiveSec=66min\nAccuracySec=1s\nUnit=ssr2vps-traffic.service\n\n[Install]\nWantedBy=timers.target\n'''
     night = '''[Unit]\nDescription=Merge SSR2VPS replica traffic\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/ssr2vps merge-traffic\n'''
     for path, content in ((PATH_UNIT, systemd), (SERVICE_UNIT, service), (TIMER_UNIT, timer), (NIGHT_UNIT, night)):
         Path(path).write_text(content)
@@ -472,6 +472,8 @@ def merge_traffic():
                             continue
                         current = max(0, int(peer_row.get(field) or 0))
                         previous = max(0, int(old.get(field, 0) or 0))
+                        # Add only the replica's unmerged delta to the master's
+                        # current value; never replace master usage with replica totals.
                         delta = max(0, current - previous)
                         if delta:
                             new_value = max(0, int(local_row.get(field) or 0)) + delta
@@ -497,7 +499,7 @@ def merge_traffic():
 def install_units():
     path_content = '''[Unit]\nDescription=Watch x-ui SQLite database for xui2vps changes\n\n[Path]\nPathChanged=/etc/x-ui/x-ui.db\nPathModified=/etc/x-ui/x-ui.db\nPathChanged=/etc/x-ui/x-ui.db-wal\nPathModified=/etc/x-ui/x-ui.db-wal\nUnit=xui2vps-watch.service\n\n[Install]\nWantedBy=multi-user.target\n'''
     service = '''[Unit]\nDescription=Synchronize x-ui configuration to xui2vps replica\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/xui2vps push-if-changed\n'''
-    timer = '''[Unit]\nDescription=Merge xui2vps replica traffic at 03:00\n\n[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nUnit=xui2vps-traffic.service\n\n[Install]\nWantedBy=timers.target\n'''
+    timer = '''[Unit]\nDescription=Merge xui2vps replica traffic every 64 minutes\n\n[Timer]\nOnBootSec=64min\nOnUnitActiveSec=64min\nAccuracySec=1s\nUnit=xui2vps-traffic.service\n\n[Install]\nWantedBy=timers.target\n'''
     sync_timer = '''[Unit]\nDescription=Retry xui2vps configuration sync\n\n[Timer]\nOnBootSec=10s\nOnUnitActiveSec=15s\nUnit=xui2vps-watch.service\n\n[Install]\nWantedBy=timers.target\n'''
     night = '''[Unit]\nDescription=Merge xui2vps replica traffic\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/xui2vps merge-traffic\n'''
     for path, content in ((PATH_UNIT, path_content), (SERVICE_UNIT, service),
