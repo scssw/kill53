@@ -422,6 +422,10 @@ def apply_config():
             db.rollback()
             raise
     print('副机已应用入站/用户配置，副机已有流量累计值保留。')
+    # x-ui keeps the active Xray runtime in memory; restart it after the DB
+    # transaction commits so new, changed, and deleted inbounds take effect.
+    subprocess.run(['systemctl', 'restart', 'x-ui'], check=True)
+    print('副机 x-ui 已重启，新线路配置已生效。')
 
 
 def snapshot():
