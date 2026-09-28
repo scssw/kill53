@@ -5,6 +5,7 @@ set -euo pipefail
 APP_NAME="alidns-split"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/alidns-split"
 CONFIG_FILE="$CONFIG_DIR/config"
+DOMAINS_DIR="$CONFIG_DIR/domains"
 CRON_TAG="# alidns-split managed"
 
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
@@ -128,8 +129,14 @@ make_job_script() {
   cat >"$path" <<EOF
 #!/usr/bin/env bash
 set -eu
-source "$CONFIG_FILE"
-exec aliyun alidns SetDomainRecordStatus --RecordId "\$RECORD_ID" --Status "$action" --access-key-id "\$ACCESS_KEY_ID" --access-key-secret "\$ACCESS_KEY_SECRET" --region "cn-hangzhou" --endpoint "alidns.aliyuncs.com"
+config_file="\${1:?用法: $action.sh 配置文件}"
+target_hour="\${2:?缺少目标小时}"
+[[ "\$target_hour" =~ ^([0-9]|1[0-9]|2[0-3])$ ]] || exit 2
+[[ "\$(TZ=Asia/Shanghai date +%H)" == "\$(printf '%02d' "\$target_hour")" ]] || exit 0
+source "\$config_file"
+aliyun_bin="\$(command -v aliyun || true)"
+[[ -x "\$aliyun_bin" ]] || exit 127
+exec "\$aliyun_bin" alidns SetDomainRecordStatus --RecordId "\$RECORD_ID" --Status "$action" --access-key-id "\$ACCESS_KEY_ID" --access-key-secret "\$ACCESS_KEY_SECRET" --region "cn-hangzhou" --endpoint "alidns.aliyuncs.com"
 EOF
   chmod 700 "$path"
 }
@@ -140,12 +147,46 @@ remove_managed_cron() {
   printf '%s\n' "$current" | awk -v tag="$CRON_TAG" 'index($0,tag)==0 && $0!=""' | crontab -
 }
 
+domain_key() {
+  printf '%s' "$1" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16])'
+}
+
+choose_saved_domain() {
+  local -a files=() names=()
+  local f name n choice
+  shopt -s nullglob
+  files=("$DOMAINS_DIR"/*.conf)
+  shopt -u nullglob
+  ((${#files[@]})) || return 1
+  printf '\n已有域名数据：\n'
+  for f in "${files[@]}"; do
+    name="$(awk -F= '/^DOMAIN_NAME=/{sub(/^[^=]*=/,""); gsub(/^\047|\047$/,"",$0); print; exit}' "$f")"
+    names+=("$name")
+    printf '%d) %s\n' "${#names[@]}" "$name"
+  done
+  printf '%d) 输入新域名数据\n' "$(( ${#files[@]} + 1 ))"
+  while true; do
+    choice="$(read_input '选择序号> ')"
+    [[ "$choice" =~ ^[1-9][0-9]*$ ]] && ((choice <= ${#files[@]}+1)) || { printf '序号无效。\n' >&2; continue; }
+    if (( choice <= ${#files[@]} )); then SELECTED_CONFIG="${files[$((choice-1))]}"; return 0; fi
+    return 1
+  done
+}
+
 create_task() {
   need_cmd python3
   ensure_aliyun
   need_cmd crontab
+  mkdir -p "$DOMAINS_DIR"
+  chmod 700 "$CONFIG_DIR" "$DOMAINS_DIR"
+  local key_id key_secret pasted req_id record_id domain ip on_hour off_hour tz choice key config
+  if choose_saved_domain; then
+    config="$SELECTED_CONFIG"
+    source "$config"
+    record_id="$RECORD_ID"; domain="$DOMAIN_NAME"; ip="$RECORD_VALUE"
+    printf '\n已选择 %s（RecordId: %s），直接设置启停时间即可。\n' "$domain" "$record_id"
+  else
   printf '\n请输入阿里云 AccessKeyId：\n'
-  local key_id key_secret pasted req_id record_id domain ip on_hour off_hour tz choice
   key_id="$(read_input 'AccessKeyId> ')"
   [[ "$key_id" == *' '* ]] && key_id="${key_id##* }"
   [[ -n "$key_id" ]] || die 'AccessKeyId 不能为空。'
@@ -180,7 +221,7 @@ create_task() {
   beijing_time="$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %Z %z')"
   printf '本机时间：%s\n北京时间：%s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z %z')" "$beijing_time"
   if [[ "$(date '+%z')" != '+0800' ]]; then
-    printf '本机时区与北京时间不一致，任务将按北京时间写入 cron（无需修改系统时区）。\n'
+    printf '本机时区与北京时间不一致；脚本会每小时检查一次北京时间，并只在设定小时执行。\n'
   else
     printf '本机时区与北京时间一致。\n'
   fi
@@ -191,10 +232,10 @@ create_task() {
     printf '开启和关闭时间不能相同，请重新输入关闭时间。\n'
   done
 
-  mkdir -p "$CONFIG_DIR"
-  chmod 700 "$CONFIG_DIR"
   umask 077
-  cat >"$CONFIG_FILE" <<EOF
+  key="$(domain_key "$domain")"
+  config="$DOMAINS_DIR/$key.conf"
+  cat >"$config" <<EOF
 ACCESS_KEY_ID=$(printf '%q' "$key_id")
 ACCESS_KEY_SECRET=$(printf '%q' "$key_secret")
 RECORD_ID=$(printf '%q' "$record_id")
@@ -202,23 +243,24 @@ DOMAIN_NAME=$(printf '%q' "$domain")
 RECORD_VALUE=$(printf '%q' "$ip")
 REQUEST_ID=$(printf '%q' "$req_id")
 EOF
-  chmod 600 "$CONFIG_FILE"
+  chmod 600 "$config"
+  fi
   make_job_script Enable
   make_job_script Disable
 
-  remove_managed_cron
   {
-    crontab -l 2>/dev/null || true
-    printf '0 %s * * * TZ=Asia/Shanghai %s/Enable.sh %s\n' "$on_hour" "$CONFIG_DIR" "$CRON_TAG"
-    printf '0 %s * * * TZ=Asia/Shanghai %s/Disable.sh %s\n' "$off_hour" "$CONFIG_DIR" "$CRON_TAG"
+    crontab -l 2>/dev/null | awk -v tag="$CRON_TAG" -v conf="$config" 'index($0,tag)==0 || index($0,conf)==0' || true
+    printf '0 * * * * TZ=Asia/Shanghai %s/Enable.sh %s %s >> %s/%s.log 2>&1 %s\n' "$CONFIG_DIR" "$config" "$on_hour" "$CONFIG_DIR" "${config##*/}" "$CRON_TAG"
+    printf '0 * * * * TZ=Asia/Shanghai %s/Disable.sh %s %s >> %s/%s.log 2>&1 %s\n' "$CONFIG_DIR" "$config" "$off_hour" "$CONFIG_DIR" "${config##*/}" "$CRON_TAG"
   } | crontab -
-  printf '\n任务创建完成：每天北京时间 %02d:00 开启、%02d:00 关闭。配置保存在 %s（权限 600）。\n' "$on_hour" "$off_hour" "$CONFIG_FILE"
+  printf '\n任务创建完成：%s 每天北京时间 %02d:00 开启、%02d:00 关闭。配置保存在 %s（权限 600），运行日志在 %s/%s.log。\n' "$domain" "$on_hour" "$off_hour" "$config" "$CONFIG_DIR" "${config##*/}"
 }
 
 delete_task() {
   need_cmd crontab
   remove_managed_cron
   rm -f "$CONFIG_DIR/Enable.sh" "$CONFIG_DIR/Disable.sh" "$CONFIG_FILE"
+  rm -rf "$DOMAINS_DIR"
   rmdir "$CONFIG_DIR" 2>/dev/null || true
   printf '已删除阿里 DNS 分流定时任务及本地配置。\n'
 }
