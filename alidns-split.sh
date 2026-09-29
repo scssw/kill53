@@ -216,6 +216,20 @@ create_task() {
   fi
   printf '\n识别到：\n  RequestId: %s\n  RecordId: %s\n  域名: %s\n  主机记录: %s\n  类型: %s\n  记录值/IP: %s\n  当前状态: %s\n\n' "$req_id" "$record_id" "${domain:-（未提供）}" "${rr:-（未提供）}" "${type:-（未提供）}" "${ip:-（未提供）}" "${status:-（未提供）}"
 
+  umask 077
+  key="$(domain_key "$domain")"
+  config="$DOMAINS_DIR/$key.conf"
+  cat >"$config" <<EOF
+ACCESS_KEY_ID=$(printf '%q' "$key_id")
+ACCESS_KEY_SECRET=$(printf '%q' "$key_secret")
+RECORD_ID=$(printf '%q' "$record_id")
+DOMAIN_NAME=$(printf '%q' "$domain")
+RECORD_VALUE=$(printf '%q' "$ip")
+REQUEST_ID=$(printf '%q' "$req_id")
+EOF
+  chmod 600 "$config"
+  fi
+
   local local_tz beijing_time
   local_tz="$(date '+%Z %z')"
   beijing_time="$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %Z %z')"
@@ -232,19 +246,6 @@ create_task() {
     printf '开启和关闭时间不能相同，请重新输入关闭时间。\n'
   done
 
-  umask 077
-  key="$(domain_key "$domain")"
-  config="$DOMAINS_DIR/$key.conf"
-  cat >"$config" <<EOF
-ACCESS_KEY_ID=$(printf '%q' "$key_id")
-ACCESS_KEY_SECRET=$(printf '%q' "$key_secret")
-RECORD_ID=$(printf '%q' "$record_id")
-DOMAIN_NAME=$(printf '%q' "$domain")
-RECORD_VALUE=$(printf '%q' "$ip")
-REQUEST_ID=$(printf '%q' "$req_id")
-EOF
-  chmod 600 "$config"
-  fi
   make_job_script Enable
   make_job_script Disable
 
