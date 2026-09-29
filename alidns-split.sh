@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # Create/remove cron jobs that enable and disable an Alibaba Cloud DNS record.
+# 修复版（2026-09-30）：make_job_script 生成任务时写死 aliyun 绝对路径，
+# 不再依赖 cron 的最小 PATH（旧逻辑在 cron 下找不到 /usr/local/bin/aliyun
+# 会静默 exit 127）；小时参数兼容前导零（如 06）；任务脚本内固定 LC_ALL=C
+# 以消除 cron 日志中的 setlocale 警告。
 set -euo pipefail
 
 APP_NAME="alidns-split"
@@ -124,19 +128,26 @@ except Exception:
 }
 
 make_job_script() {
-  local action="$1" path
+  local action="$1" path aliyun_bin
+  # 修复：在生成任务时就解析 aliyun 绝对路径并写死，不再依赖 cron 的最小 PATH。
+  # cron 下 PATH 常为 /usr/bin:/bin，而 aliyun 默认装在 /usr/local/bin，
+  # 旧逻辑用 command -v 查找失败会静默 exit 127，导致定时任务永远不执行。
+  aliyun_bin="$(command -v aliyun)"
+  [[ -n "$aliyun_bin" && -x "$aliyun_bin" ]] || die "找不到 aliyun 可执行文件，请先安装阿里云 CLI。"
   path="$CONFIG_DIR/$action.sh"
   cat >"$path" <<EOF
 #!/usr/bin/env bash
 set -eu
+export LC_ALL=C LANG=C
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
 config_file="\${1:?用法: $action.sh 配置文件}"
 target_hour="\${2:?缺少目标小时}"
-[[ "\$target_hour" =~ ^([0-9]|1[0-9]|2[0-3])$ ]] || exit 2
+# 修复：先去掉前导零再校验，兼容 06 / 6 / 006 等写法（旧正则会把 "06" 判为非法而 exit 2）
+target_hour="\$((10#\$target_hour))"
+[[ "\$target_hour" =~ ^([0-9]|1[0-9]|2[0-3])$ ]] || { echo "无效的小时参数: \${2}" >&2; exit 2; }
 [[ "\$(TZ=Asia/Shanghai date +%H)" == "\$(printf '%02d' "\$target_hour")" ]] || exit 0
 source "\$config_file"
-aliyun_bin="\$(command -v aliyun || true)"
-[[ -x "\$aliyun_bin" ]] || exit 127
-exec "\$aliyun_bin" alidns SetDomainRecordStatus --RecordId "\$RECORD_ID" --Status "$action" --access-key-id "\$ACCESS_KEY_ID" --access-key-secret "\$ACCESS_KEY_SECRET" --region "cn-hangzhou" --endpoint "alidns.aliyuncs.com"
+exec "$aliyun_bin" alidns SetDomainRecordStatus --RecordId "\$RECORD_ID" --Status "$action" --access-key-id "\$ACCESS_KEY_ID" --access-key-secret "\$ACCESS_KEY_SECRET" --region "cn-hangzhou" --endpoint "alidns.aliyuncs.com"
 EOF
   chmod 700 "$path"
 }
