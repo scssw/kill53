@@ -10,6 +10,7 @@ INSTALL_PATH="/usr/local/sbin/${APP_NAME}.sh"
 CONFIG_PATH="/etc/${APP_NAME}.conf"
 LOG_PATH="/var/log/${APP_NAME}.log"
 CRON_MARKER="# ${APP_NAME}_daily_job"
+CRON_TZ_MARKER="# ${APP_NAME}_timezone"
 DEFAULT_SSR_FILE="/usr/local/shadowsocksr/mudb.json"
 DEFAULT_TIMELIMIT_FILE="/usr/local/SSR-Bash-Python/timelimit.db"
 ROOT_SSH_DIR="/root/.ssh"
@@ -306,27 +307,27 @@ write_config() {
     printf 'CF_EMAIL=%q\n' "${CF_EMAIL:-}"
     printf 'CF_TOKEN=%q\n' "$CF_TOKEN"
     printf 'TARGET_IP=%q\n' "$TARGET_IP"
+    printf 'LOCAL_IP=%q\n' "${LOCAL_IP:-}"
     printf 'TARGET_PORT=%q\n' "${TARGET_PORT:-22}"
     printf 'SWITCH_TIME=%q\n' "${SWITCH_TIME:-}"
+    printf 'RETURN_TIME=%q\n' "${RETURN_TIME:-}"
     printf 'SSR_FILE=%q\n' "${SSR_FILE:-$DEFAULT_SSR_FILE}"
     printf 'TIMELIMIT_FILE=%q\n' "${TIMELIMIT_FILE:-$DEFAULT_TIMELIMIT_FILE}"
     printf 'TRANSFER_ENABLED=%q\n' "$transfer_enabled"
+    printf 'TRANSFER_MODE=%q\n' "${TRANSFER_MODE:-ssr}"
   } > "$CONFIG_PATH"
   chmod 600 "$CONFIG_PATH"
 }
 
 install_cron() {
-  local time_value="$1"
-  local hour minute tmp
-
-  hour="${time_value%:*}"
-  minute="${time_value#*:}"
-  hour="$((10#$hour))"
-  minute="$((10#$minute))"
+  local out="$1" back="$2" oh om bh bm tmp
+  oh="${out%:*}"; om="${out#*:}"; bh="${back%:*}"; bm="${back#*:}"
+  oh="$((10#$oh))"; om="$((10#$om))"; bh="$((10#$bh))"; bm="$((10#$bm))"
   tmp="$(mktemp)"
-
-  crontab -l 2>/dev/null | grep -vF "$CRON_MARKER" > "$tmp" || true
-  printf '%d %d * * * %s --run >> %s 2>&1 %s\n' "$minute" "$hour" "$INSTALL_PATH" "$LOG_PATH" "$CRON_MARKER" >> "$tmp"
+  crontab -l 2>/dev/null | grep -vF "$CRON_MARKER" | grep -vF "$CRON_TZ_MARKER" | grep -v '^CRON_TZ=Asia/Shanghai$' > "$tmp" || true
+  printf 'CRON_TZ=Asia/Shanghai\n%s\n' "$CRON_TZ_MARKER" >> "$tmp"
+  printf '%d %d * * * %s --out >> %s 2>&1 %s\n' "$om" "$oh" "$INSTALL_PATH" "$LOG_PATH" "$CRON_MARKER" >> "$tmp"
+  printf '%d %d * * * %s --back >> %s 2>&1 %s\n' "$bm" "$bh" "$INSTALL_PATH" "$LOG_PATH" "$CRON_MARKER" >> "$tmp"
   crontab "$tmp"
   rm -f "$tmp"
 }
@@ -371,7 +372,7 @@ setup_ssh_login() {
 remove_cron() {
   local tmp
   tmp="$(mktemp)"
-  crontab -l 2>/dev/null | grep -vF "$CRON_MARKER" > "$tmp" || true
+  crontab -l 2>/dev/null | grep -vF "$CRON_MARKER" | grep -vF "$CRON_TZ_MARKER" | grep -v '^CRON_TZ=Asia/Shanghai$' > "$tmp" || true
   crontab "$tmp"
   rm -f "$tmp"
 }
@@ -390,6 +391,9 @@ load_config() {
   TIMELIMIT_FILE="${TIMELIMIT_FILE:-$DEFAULT_TIMELIMIT_FILE}"
   TRANSFER_ENABLED="${TRANSFER_ENABLED:-1}"
   SWITCH_TIME="${SWITCH_TIME:-}"
+  RETURN_TIME="${RETURN_TIME:-}"
+  LOCAL_IP="${LOCAL_IP:-}"
+  TRANSFER_MODE="${TRANSFER_MODE:-ssr}"
 }
 
 load_config_silent() {
@@ -403,6 +407,9 @@ load_config_silent() {
     TIMELIMIT_FILE="${TIMELIMIT_FILE:-$DEFAULT_TIMELIMIT_FILE}"
     TRANSFER_ENABLED="${TRANSFER_ENABLED:-1}"
     SWITCH_TIME="${SWITCH_TIME:-}"
+    RETURN_TIME="${RETURN_TIME:-}"
+    LOCAL_IP="${LOCAL_IP:-}"
+    TRANSFER_MODE="${TRANSFER_MODE:-ssr}"
   fi
 }
 
@@ -420,6 +427,40 @@ sync_file_to_target() {
   echo "${label} 已同步到：root@${TARGET_IP}:${source_file} (端口: ${port})"
 }
 
+sync_data() {
+  local direction="$1" port="${TARGET_PORT:-22}" remote="root@${TARGET_IP}"
+  local -a paths
+  case "${TRANSFER_MODE:-ssr}" in
+    ssr) paths=("$SSR_FILE" "$TIMELIMIT_FILE") ;;
+    xui) paths=("/etc/x-ui/") ;;
+    both) paths=("$SSR_FILE" "$TIMELIMIT_FILE" "/etc/x-ui/") ;;
+    *) echo "未知数据转移模式：${TRANSFER_MODE}" >&2; return 1 ;;
+  esac
+  if [ "$direction" = "out" ]; then
+    for path in "${paths[@]}"; do
+      [ -e "$path" ] || { echo "待同步路径不存在：$path" >&2; return 1; }
+      rsync -aHAX --numeric-ids -e "ssh -p ${port}" "$path" "${remote}:$path"
+    done
+    if [ "$TRANSFER_MODE" = "ssr" ] || [ "$TRANSFER_MODE" = "both" ]; then
+      ssh -p "$port" "$remote" "systemctl restart ssr-bash-python.service"
+    fi
+    if [ "$TRANSFER_MODE" = "xui" ] || [ "$TRANSFER_MODE" = "both" ]; then
+      ssh -p "$port" "$remote" "systemctl restart x-ui.service"
+    fi
+  else
+    for path in "${paths[@]}"; do
+      [ -e "$path" ] || { echo "目标机待同步路径不存在：$path" >&2; return 1; }
+      rsync -aHAX --numeric-ids -e "ssh -p ${port}" "${remote}:$path" "$path"
+    done
+    if [ "$TRANSFER_MODE" = "ssr" ] || [ "$TRANSFER_MODE" = "both" ]; then
+      systemctl restart ssr-bash-python.service
+    fi
+    if [ "$TRANSFER_MODE" = "xui" ] || [ "$TRANSFER_MODE" = "both" ]; then
+      systemctl restart x-ui.service
+    fi
+  fi
+}
+
 run_job() {
   need_root
   require_cmd curl
@@ -427,17 +468,18 @@ run_job() {
   require_cmd rsync
   load_config
 
-  echo "[$(date '+%F %T')] 开始执行定时切换"
-  update_cloudflare_record "$DOMAIN" "$TARGET_IP"
-
-  if [ "${TRANSFER_ENABLED:-1}" = "1" ]; then
-    sync_file_to_target "$SSR_FILE" "SSR 用户数据"
-    sync_file_to_target "$TIMELIMIT_FILE" "SSR 到期时间数据"
+  local direction="${1:-out}" destination action_label
+  if [ "$direction" = "out" ]; then action_label="传送到 B"; else action_label="从 B 传回 A"; fi
+  echo "[$(date '+%F %T %Z')] 开始${action_label}"
+  if [ "$direction" = "out" ]; then
+    destination="$TARGET_IP"
+    if [ "${TRANSFER_ENABLED:-1}" = "1" ]; then sync_data out; else echo "数据同步已关闭，仅切换 DNS。"; fi
   else
-    echo "SSR 数据同步已关闭，仅执行 DNS 切换。"
+    destination="$LOCAL_IP"
+    if [ "${TRANSFER_ENABLED:-1}" = "1" ]; then sync_data back; else echo "数据同步已关闭，仅切换 DNS。"; fi
   fi
-
-  echo "[$(date '+%F %T')] 执行完成"
+  update_cloudflare_record "$DOMAIN" "$destination"
+  echo "[$(date '+%F %T %Z')] 执行完成，域名已指向 ${destination}"
 }
 
 prompt_switch_time() {
@@ -479,10 +521,52 @@ prompt_domain() {
       return 0
     fi
     if [ -n "$input" ]; then
-      DOMAIN="$input"
+      input="${input#http://}"
+      input="${input#https://}"
+      input="${input%%/*}"
+      if [[ "$input" != *.* ]]; then input="${input}.ssrr.today"; fi
+      DOMAIN="${input,,}"
       return 0
     fi
     echo "域名不能为空，请重新输入！"
+  done
+}
+
+prompt_transfer_mode() {
+  local choice
+  echo
+  echo "选择定时转移的数据类型："
+  echo "1、默认定时转移 SSR"
+  echo "2、定时转移 xui"
+  echo "3、定时转移 SSR+xui"
+  read -r -p "请输入选项 [1-3]：" choice
+  case "$choice" in
+    1|"") TRANSFER_MODE=ssr ;;
+    2) TRANSFER_MODE=xui ;;
+    3) TRANSFER_MODE=both ;;
+    *) echo "无效选项，保持当前设置：${TRANSFER_MODE:-ssr}" ;;
+  esac
+}
+
+prompt_return_time() {
+  local current="${RETURN_TIME:-}" input result prompt_str="请输入传回时间（北京时间，小时或 HH:MM）"
+  [ -n "$current" ] && prompt_str+=" [当前: ${current}] (回车保持)"
+  prompt_str+="："
+  while true; do
+    read -r -p "$prompt_str" input
+    if [ -z "$input" ] && [ -n "$current" ]; then printf '%s\n' "$current"; return 0; fi
+    if result="$(parse_and_validate_time "$input")"; then printf '%s\n' "$result"; return 0; fi
+    echo "时间无效，请输入 0-23 小时或 HH:MM。"
+  done
+}
+
+prompt_local_ip() {
+  local ip_input
+  while true; do
+    read -r -p "请输入 A 机公网 IPv4（传回时域名将指向此地址）${LOCAL_IP:+ [当前: $LOCAL_IP]}：" ip_input
+    ip_input="${ip_input:-${LOCAL_IP:-}}"
+    if valid_ipv4 "$ip_input"; then LOCAL_IP="$ip_input"; return 0; fi
+    echo "A 机 IP 格式不正确。"
   done
 }
 
@@ -684,8 +768,9 @@ setup_switch() {
   echo "        配置定时切换与数据同步"
   echo "=========================================="
 
-  # 1. 切换时间 (只需输入小时)
+  # A 机负责传送与传回两个定时动作。
   SWITCH_TIME="$(prompt_switch_time "${SWITCH_TIME:-}")"
+  RETURN_TIME="$(prompt_return_time)"
 
   # 2. 域名
   prompt_domain
@@ -695,26 +780,26 @@ setup_switch() {
 
   # 4. 目标 IP 与端口检测匹配
   prompt_target_ip_and_port
+  prompt_local_ip
+  prompt_transfer_mode
 
   SSR_FILE="$DEFAULT_SSR_FILE"
   TIMELIMIT_FILE="$DEFAULT_TIMELIMIT_FILE"
 
   install_self
   write_config "1"
-  install_cron "$SWITCH_TIME"
+  install_cron "$SWITCH_TIME" "$RETURN_TIME"
 
   echo
   echo "=========================================="
   echo "设置完成！配置信息已保存至 ${CONFIG_PATH}"
-  echo "每天 ${SWITCH_TIME} 将自动执行："
-  echo "  1. 将 ${DOMAIN} 的 A 记录解析切换到 ${TARGET_IP}"
-  echo "  2. 执行 rsync 同步 SSR 用户数据 (端口: ${TARGET_PORT:-22})"
-  echo "  3. 执行 rsync 同步 SSR 到期时间 (端口: ${TARGET_PORT:-22})"
+  echo "每天北京时间 ${SWITCH_TIME}：同步 ${TRANSFER_MODE} 到 B (${TARGET_IP})、重启 B 上对应服务，再将域名指向 B。"
+  echo "每天北京时间 ${RETURN_TIME}：从 B 同步回 A (${LOCAL_IP})、重启 A 上对应服务，再将域名指回 A。"
   echo
   echo "配置文件：$CONFIG_PATH"
   echo "执行脚本：$INSTALL_PATH"
   echo "日志文件：$LOG_PATH"
-  echo "手动测试：sudo $INSTALL_PATH --run"
+  echo "手动执行传送：sudo $INSTALL_PATH --out；传回：sudo $INSTALL_PATH --back"
   echo "=========================================="
 
   setup_ssh_login || true
@@ -726,13 +811,30 @@ change_time() {
   load_config_silent
 
   SWITCH_TIME="$(prompt_switch_time "${SWITCH_TIME:-}")"
+  RETURN_TIME="$(prompt_return_time)"
 
   install_self
   write_config "${TRANSFER_ENABLED:-1}"
-  install_cron "$SWITCH_TIME"
+  install_cron "$SWITCH_TIME" "$RETURN_TIME"
 
-  echo "定时时间已修改为每天 ${SWITCH_TIME}。"
-  echo "当前任务：${INSTALL_PATH} --run"
+  echo "定时时间已修改：北京时间 ${SWITCH_TIME} 传送、${RETURN_TIME} 传回。"
+  echo "当前任务：${INSTALL_PATH} --out 和 ${INSTALL_PATH} --back"
+}
+
+change_transfer_mode() {
+  need_root
+  require_cmd crontab
+  load_config_silent
+  if [ ! -f "$CONFIG_PATH" ] || [ -z "${SWITCH_TIME:-}" ] || [ -z "${RETURN_TIME:-}" ]; then
+    echo "请先使用菜单 1 完成双向定时转移设置。"
+    return 1
+  fi
+  prompt_transfer_mode
+  install_self
+  write_config "1"
+  install_cron "$SWITCH_TIME" "$RETURN_TIME"
+  echo "数据转移类型已修改为：${TRANSFER_MODE}。"
+  echo "定时任务已按当前传送和传回时间重新部署。"
 }
 
 change_target_ip() {
@@ -795,17 +897,15 @@ show_menu() {
     echo "【当前配置记录】"
     echo "  • 切换域名: ${DOMAIN}"
     echo "  • 目标地址: ${TARGET_IP} (SSH 端口: ${TARGET_PORT:-22})"
-    echo "  • 切换时间: 每天 ${SWITCH_TIME:-未设置}"
+    echo "  • 传送时间: 每天 ${SWITCH_TIME:-未设置}（北京时间）"
+    echo "  • 传回时间: 每天 ${RETURN_TIME:-未设置}（北京时间）"
+    echo "  • A 机地址: ${LOCAL_IP:-未设置}"
     if [ "${CF_AUTH_TYPE:-token}" = "global_key" ]; then
       echo "  • 认证方式: Global API Key (${CF_EMAIL})"
     else
       echo "  • 认证方式: API Token"
     fi
-    if [ "${TRANSFER_ENABLED:-1}" = "1" ]; then
-      echo "  • 数据同步: 已开启 (SSR 数据及到期时间)"
-    else
-      echo "  • 数据同步: 已关闭 (仅切换 DNS)"
-    fi
+    echo "  • 数据同步: ${TRANSFER_MODE:-ssr}"
     echo "  • 定时任务: $(check_cron_status)"
   else
     echo "【当前配置记录】暂无保存的配置记录"
@@ -817,9 +917,10 @@ show_menu() {
   echo "4、修改定时时间"
   echo "5、修改目标 IP 及端口"
   echo "6、升级脚本设置不变"
+  echo "7、修改转移数据"
   echo "0、退出"
   echo
-  read -r -p "请输入选项 [0-6]：" choice
+  read -r -p "请输入选项 [0-7]：" choice
 
   case "$choice" in
     1) setup_switch ;;
@@ -828,6 +929,7 @@ show_menu() {
     4) change_time ;;
     5) change_target_ip ;;
     6) upgrade_script_only ;;
+    7) change_transfer_mode ;;
     0) exit 0 ;;
     *) echo "无效选项。" && exit 1 ;;
   esac
@@ -835,8 +937,11 @@ show_menu() {
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   case "${1:-}" in
-    --run)
-      run_job
+    --run|--out)
+      run_job out
+      ;;
+    --back)
+      run_job back
       ;;
     *)
       show_menu
