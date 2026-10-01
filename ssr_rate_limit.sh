@@ -104,7 +104,9 @@ def main():
 
                 if len(history) > 1 and window_bytes >= THRESHOLD_BYTES and port not in active:
                     active[port] = {
+                        "started": now,
                         "until": now + LIMIT_SECONDS,
+                        "speed": LIMIT_SPEED,
                         "original": int(user.get("speed_limit_per_user", 0) or 0),
                     }
                     print("LIMIT port={} bytes_10m={} speed={}".format(
@@ -190,8 +192,31 @@ show_status() {
         echo "定时任务：未启用"
     fi
     if [[ -f "$BASE_DIR/ssr_rate_limit_state.json" ]]; then
-        "$PYTHON" -c 'import json,sys; s=json.load(open(sys.argv[1])); a=s.get("active",{}); print("当前限速端口：" + (", ".join(a) if a else "无"))' \
-            "$BASE_DIR/ssr_rate_limit_state.json"
+        "$PYTHON" - "$BASE_DIR/ssr_rate_limit_state.json" "$CONFIG" <<'SSR_STATUS_PYTHON'
+import datetime
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    active = json.load(stream).get("active", {})
+config = {}
+if os.path.exists(sys.argv[2]):
+    with open(sys.argv[2], encoding="utf-8") as stream:
+        config = dict(line.strip().split("=", 1) for line in stream if "=" in line)
+restore_seconds = int(config.get("RESTORE_MINUTES", "20")) * 60
+default_speed = config.get("LIMIT_SPEED", "2000")
+fmt = lambda stamp: datetime.datetime.fromtimestamp(stamp).strftime("%Y-%m-%d %H:%M:%S")
+if not active:
+    print("当前限速端口：无")
+else:
+    print("当前限速端口：")
+    for port, item in sorted(active.items(), key=lambda pair: int(pair[0])):
+        until = int(item["until"])
+        started = int(item.get("started", until - restore_seconds))
+        print("  端口 {}：限速 {}，开始 {}，预计解禁 {}".format(
+            port, item.get("speed", default_speed), fmt(started), fmt(until)))
+SSR_STATUS_PYTHON
     fi
 }
 
