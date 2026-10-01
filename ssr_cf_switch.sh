@@ -18,7 +18,7 @@ SELF_DOWNLOAD_URL="https://raw.githubusercontent.com/scssw/kill53/refs/heads/mai
 
 need_root() {
   if [ "$(id -u)" -ne 0 ]; then
-    echo "请使用 root 用户运行：sudo bash $0"
+    echo "请使用 root 用户运行：bash $0"
     exit 1
   fi
 }
@@ -338,6 +338,7 @@ write_config() {
     printf 'CF_TOKEN=%q\n' "$CF_TOKEN"
     printf 'TARGET_IP=%q\n' "$TARGET_IP"
     printf 'LOCAL_IP=%q\n' "${LOCAL_IP:-}"
+    printf 'LOCAL_SSH_PORT=%q\n' "${LOCAL_SSH_PORT:-22}"
     printf 'TARGET_PORT=%q\n' "${TARGET_PORT:-22}"
     printf 'SWITCH_TIME=%q\n' "${SWITCH_TIME:-}"
     printf 'RETURN_TIME=%q\n' "${RETURN_TIME:-}"
@@ -427,6 +428,7 @@ load_config() {
   SWITCH_TIME="${SWITCH_TIME:-}"
   RETURN_TIME="${RETURN_TIME:-}"
   LOCAL_IP="${LOCAL_IP:-}"
+  LOCAL_SSH_PORT="${LOCAL_SSH_PORT:-22}"
   TRANSFER_MODE="${TRANSFER_MODE:-ssr}"
   DOMAINS="${DOMAINS:-${DOMAIN:-}}"
   if [ -z "${DOMAIN:-}" ]; then DOMAIN="${DOMAINS%% *}"; fi
@@ -445,6 +447,7 @@ load_config_silent() {
     SWITCH_TIME="${SWITCH_TIME:-}"
     RETURN_TIME="${RETURN_TIME:-}"
     LOCAL_IP="${LOCAL_IP:-}"
+    LOCAL_SSH_PORT="${LOCAL_SSH_PORT:-22}"
     TRANSFER_MODE="${TRANSFER_MODE:-ssr}"
     DOMAINS="${DOMAINS:-${DOMAIN:-}}"
     if [ -z "${DOMAIN:-}" ]; then DOMAIN="${DOMAINS%% *}"; fi
@@ -487,8 +490,7 @@ sync_data() {
     fi
   else
     for path in "${paths[@]}"; do
-      [ -e "$path" ] || { echo "目标机待同步路径不存在：$path" >&2; return 1; }
-      rsync -aHAX --numeric-ids -e "ssh -p ${port}" "${remote}:$path" "$path"
+      ssh -p "$port" "$remote" "rsync -aHAX --numeric-ids -e 'ssh -p ${LOCAL_SSH_PORT}' '${path}' 'root@${LOCAL_IP}:${path}'"
     done
     if [ "$TRANSFER_MODE" = "ssr" ] || [ "$TRANSFER_MODE" = "both" ]; then
       systemctl restart ssr-bash-python.service
@@ -619,12 +621,21 @@ prompt_schedule_times() {
 }
 
 prompt_local_ip() {
-  local ip_input
+  local ip_input port_input
   while true; do
     read -r -p "请输入 A 机公网 IPv4（传回时域名将指向此地址）${LOCAL_IP:+ [当前: $LOCAL_IP]}：" ip_input
     ip_input="${ip_input:-${LOCAL_IP:-}}"
-    if valid_ipv4 "$ip_input"; then LOCAL_IP="$ip_input"; return 0; fi
+    if valid_ipv4 "$ip_input"; then LOCAL_IP="$ip_input"; break; fi
     echo "A 机 IP 格式不正确。"
+  done
+  while true; do
+    read -r -p "请输入 A 机 SSH 端口（B 机回传数据到此端口） [当前: ${LOCAL_SSH_PORT:-22}]：" port_input
+    port_input="${port_input:-${LOCAL_SSH_PORT:-22}}"
+    if [[ "$port_input" =~ ^[0-9]+$ ]] && [ "$port_input" -ge 1 ] && [ "$port_input" -le 65535 ]; then
+      LOCAL_SSH_PORT="$port_input"
+      return 0
+    fi
+    echo "端口号无效，请输入 1-65535 之间的数字。"
   done
 }
 
@@ -832,7 +843,7 @@ setup_switch() {
   echo "配置文件：$CONFIG_PATH"
   echo "执行脚本：$INSTALL_PATH"
   echo "日志文件：$LOG_PATH"
-  echo "手动执行传送：sudo $INSTALL_PATH --out；传回：sudo $INSTALL_PATH --back"
+  echo "手动执行传送：$INSTALL_PATH --out；传回：$INSTALL_PATH --back（当前为 root 时直接运行）"
   echo "=========================================="
 
   setup_ssh_login || true
