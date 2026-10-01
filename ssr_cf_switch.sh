@@ -45,23 +45,32 @@ urlencode() {
 
 json_first_id() {
   python3 -c 'import json, sys
-d = json.load(sys.stdin)
-r = d.get("result") or []
-print(r[0].get("id", "") if d.get("success") and r else "")'
+try:
+    d = json.load(sys.stdin)
+    r = d.get("result") or []
+    print(r[0].get("id", "") if d.get("success") and r else "")
+except Exception:
+    print("")'
 }
 
 json_success() {
   python3 -c 'import json, sys
-d = json.load(sys.stdin)
-print("1" if d.get("success") else "0")'
+try:
+    d = json.load(sys.stdin)
+    print("1" if d.get("success") else "0")
+except Exception:
+    print("0")'
 }
 
 json_errors() {
   python3 -c 'import json, sys
-d = json.load(sys.stdin)
-errors = d.get("errors") or []
-messages = [e.get("message", str(e)) for e in errors]
-print("; ".join(messages) if messages else "未知错误")'
+try:
+    d = json.load(sys.stdin)
+    errors = d.get("errors") or []
+    messages = [e.get("message", str(e)) for e in errors]
+    print("; ".join(messages) if messages else "未知错误")
+except Exception:
+    print("解析返回结果失败")'
 }
 
 cf_api() {
@@ -107,7 +116,7 @@ find_zone_id() {
     done
 
     encoded="$(urlencode "$zone")"
-    resp="$(cf_api GET "/zones?name=${encoded}&status=active&page=1&per_page=1")"
+    resp="$(cf_api GET "/zones?name=${encoded}&status=active&page=1&per_page=1" 2>/dev/null || true)"
     zone_id="$(printf '%s' "$resp" | json_first_id)"
     if [ -n "$zone_id" ]; then
       printf '%s' "$zone_id"
@@ -157,14 +166,29 @@ update_cloudflare_record() {
   echo "Cloudflare DNS 已更新：${domain} -> ${target_ip}"
 }
 
-valid_time() {
-  local value="$1"
+parse_and_validate_time() {
+  local input="$1"
   local hour minute
 
-  [[ "$value" =~ ^([0-9]{1,2}):([0-9]{2})$ ]] || return 1
-  hour="${BASH_REMATCH[1]}"
-  minute="${BASH_REMATCH[2]}"
-  [ "$hour" -ge 0 ] && [ "$hour" -le 23 ] && [ "$minute" -ge 0 ] && [ "$minute" -le 59 ]
+  if [[ "$input" =~ ^([0-9]{1,2})$ ]]; then
+    hour="$((10#${BASH_REMATCH[1]}))"
+    minute=0
+  elif [[ "$input" =~ ^([0-9]{1,2}):([0-9]{1,2})$ ]]; then
+    hour="$((10#${BASH_REMATCH[1]}))"
+    minute="$((10#${BASH_REMATCH[2]}))"
+  else
+    return 1
+  fi
+
+  if [ "$hour" -ge 0 ] && [ "$hour" -le 23 ] && [ "$minute" -ge 0 ] && [ "$minute" -le 59 ]; then
+    printf "%02d:%02d\n" "$hour" "$minute"
+    return 0
+  fi
+  return 1
+}
+
+valid_time() {
+  parse_and_validate_time "$1" >/dev/null 2>&1
 }
 
 valid_ipv4() {
@@ -177,6 +201,49 @@ valid_ipv4() {
   for part in "${ip_parts[@]}"; do
     [ "$part" -ge 0 ] && [ "$part" -le 255 ] || return 1
   done
+}
+
+check_port() {
+  local ip="$1"
+  local port="$2"
+  local timeout="${3:-3}"
+
+  if command -v python3 >/dev/null 2>&1; then
+    if python3 -c '
+import socket, sys
+ip = sys.argv[1]
+port = int(sys.argv[2])
+timeout = float(sys.argv[3])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(timeout)
+try:
+    code = s.connect_ex((ip, port))
+    sys.exit(0 if code == 0 else 1)
+except Exception:
+    sys.exit(1)
+finally:
+    s.close()
+' "$ip" "$port" "$timeout" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  # 备用方案：/dev/tcp 检测
+  if timeout "$timeout" bash -c "cat < /dev/null > /dev/tcp/${ip}/${port}" 2>/dev/null; then
+    return 0
+  fi
+
+  return 1
+}
+
+check_cron_status() {
+  if crontab -l 2>/dev/null | grep -Fq "$CRON_MARKER"; then
+    local cron_line
+    cron_line="$(crontab -l 2>/dev/null | grep -F "$CRON_MARKER" | head -n 1)"
+    echo "运行中 (${cron_line%% $CRON_MARKER*})"
+  else
+    echo "未设置"
+  fi
 }
 
 resolve_script_path() {
@@ -229,7 +296,7 @@ install_self() {
 }
 
 write_config() {
-  local transfer_enabled="$1"
+  local transfer_enabled="${1:-1}"
 
   umask 077
   {
@@ -239,8 +306,10 @@ write_config() {
     printf 'CF_EMAIL=%q\n' "${CF_EMAIL:-}"
     printf 'CF_TOKEN=%q\n' "$CF_TOKEN"
     printf 'TARGET_IP=%q\n' "$TARGET_IP"
-    printf 'SSR_FILE=%q\n' "$SSR_FILE"
-    printf 'TIMELIMIT_FILE=%q\n' "$TIMELIMIT_FILE"
+    printf 'TARGET_PORT=%q\n' "${TARGET_PORT:-22}"
+    printf 'SWITCH_TIME=%q\n' "${SWITCH_TIME:-}"
+    printf 'SSR_FILE=%q\n' "${SSR_FILE:-$DEFAULT_SSR_FILE}"
+    printf 'TIMELIMIT_FILE=%q\n' "${TIMELIMIT_FILE:-$DEFAULT_TIMELIMIT_FILE}"
     printf 'TRANSFER_ENABLED=%q\n' "$transfer_enabled"
   } > "$CONFIG_PATH"
   chmod 600 "$CONFIG_PATH"
@@ -252,10 +321,12 @@ install_cron() {
 
   hour="${time_value%:*}"
   minute="${time_value#*:}"
+  hour="$((10#$hour))"
+  minute="$((10#$minute))"
   tmp="$(mktemp)"
 
   crontab -l 2>/dev/null | grep -vF "$CRON_MARKER" > "$tmp" || true
-  printf '%s %s * * * %s --run >> %s 2>&1 %s\n' "$minute" "$hour" "$INSTALL_PATH" "$LOG_PATH" "$CRON_MARKER" >> "$tmp"
+  printf '%d %d * * * %s --run >> %s 2>&1 %s\n' "$minute" "$hour" "$INSTALL_PATH" "$LOG_PATH" "$CRON_MARKER" >> "$tmp"
   crontab "$tmp"
   rm -f "$tmp"
 }
@@ -273,22 +344,23 @@ ensure_ssh_key() {
 
 setup_ssh_login() {
   local target="root@${TARGET_IP}"
+  local port="${TARGET_PORT:-22}"
 
   echo
-  echo "开始配置 SSH 免密登录：${target}"
+  echo "开始配置 SSH 免密登录：${target} (端口: ${port})"
   echo "下面可能会要求输入一次目标服务器 root 密码，用来写入公钥。"
 
   ensure_ssh_key
 
-  if ! ssh-copy-id "$target"; then
+  if ! ssh-copy-id -p "$port" "$target"; then
     echo
     echo "警告：ssh-copy-id 执行失败。定时 DNS 切换已设置，但 SSR 数据同步可能仍需要密码。"
-    echo "你可以稍后手动执行：ssh-copy-id ${target}"
+    echo "你可以稍后手动执行：ssh-copy-id -p ${port} ${target}"
     return 1
   fi
 
   echo "正在验证 SSH 免密登录..."
-  if ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" "true"; then
+  if ssh -p "$port" -o BatchMode=yes -o ConnectTimeout=10 "$target" "true"; then
     echo "SSH 免密登录验证通过，定时 rsync 可以正常执行。"
   else
     echo "警告：ssh-copy-id 已执行，但免密验证未通过。请手动检查 SSH 登录设置。"
@@ -298,7 +370,6 @@ setup_ssh_login() {
 
 remove_cron() {
   local tmp
-
   tmp="$(mktemp)"
   crontab -l 2>/dev/null | grep -vF "$CRON_MARKER" > "$tmp" || true
   crontab "$tmp"
@@ -314,22 +385,39 @@ load_config() {
   source "$CONFIG_PATH"
   CF_AUTH_TYPE="${CF_AUTH_TYPE:-token}"
   CF_EMAIL="${CF_EMAIL:-}"
+  TARGET_PORT="${TARGET_PORT:-22}"
   SSR_FILE="${SSR_FILE:-$DEFAULT_SSR_FILE}"
   TIMELIMIT_FILE="${TIMELIMIT_FILE:-$DEFAULT_TIMELIMIT_FILE}"
   TRANSFER_ENABLED="${TRANSFER_ENABLED:-1}"
+  SWITCH_TIME="${SWITCH_TIME:-}"
+}
+
+load_config_silent() {
+  if [ -f "$CONFIG_PATH" ]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_PATH" 2>/dev/null || true
+    CF_AUTH_TYPE="${CF_AUTH_TYPE:-token}"
+    CF_EMAIL="${CF_EMAIL:-}"
+    TARGET_PORT="${TARGET_PORT:-22}"
+    SSR_FILE="${SSR_FILE:-$DEFAULT_SSR_FILE}"
+    TIMELIMIT_FILE="${TIMELIMIT_FILE:-$DEFAULT_TIMELIMIT_FILE}"
+    TRANSFER_ENABLED="${TRANSFER_ENABLED:-1}"
+    SWITCH_TIME="${SWITCH_TIME:-}"
+  fi
 }
 
 sync_file_to_target() {
   local source_file="$1"
   local label="$2"
+  local port="${TARGET_PORT:-22}"
 
   if [ ! -f "$source_file" ]; then
     echo "${label} 文件不存在：$source_file" >&2
     return 1
   fi
 
-  rsync -avz "$source_file" "root@${TARGET_IP}:${source_file}"
-  echo "${label} 已同步到：root@${TARGET_IP}:${source_file}"
+  rsync -avz -e "ssh -p ${port}" "$source_file" "root@${TARGET_IP}:${source_file}"
+  echo "${label} 已同步到：root@${TARGET_IP}:${source_file} (端口: ${port})"
 }
 
 run_job() {
@@ -342,7 +430,7 @@ run_job() {
   echo "[$(date '+%F %T')] 开始执行定时切换"
   update_cloudflare_record "$DOMAIN" "$TARGET_IP"
 
-  if [ "${TRANSFER_ENABLED}" = "1" ]; then
+  if [ "${TRANSFER_ENABLED:-1}" = "1" ]; then
     sync_file_to_target "$SSR_FILE" "SSR 用户数据"
     sync_file_to_target "$TIMELIMIT_FILE" "SSR 到期时间数据"
   else
@@ -352,134 +440,319 @@ run_job() {
   echo "[$(date '+%F %T')] 执行完成"
 }
 
-setup_switch() {
-  local switch_time zone_id auth_choice
+prompt_switch_time() {
+  local current="${1:-}"
+  local input time_res
+  local prompt_str="请输入每天切换时间的小时 (0-23，如 16 为 16:00)"
+  if [ -n "$current" ]; then
+    prompt_str+=" [当前记录: ${current}] (直接回车保持不变)"
+  fi
+  prompt_str+="："
 
+  while true; do
+    read -r -p "$prompt_str" input
+    if [ -z "$input" ] && [ -n "$current" ]; then
+      printf '%s\n' "$current"
+      return 0
+    fi
+    if time_res="$(parse_and_validate_time "$input")"; then
+      printf '%s\n' "$time_res"
+      return 0
+    fi
+    echo "时间输入无效！只需输入小时 (0-23，如 16 表示 16:00) 或 HH:MM。"
+  done
+}
+
+prompt_domain() {
+  local input
+  local domain_prompt="请输入要切换的域名"
+  if [ -n "${DOMAIN:-}" ]; then
+    domain_prompt+=" [当前记录: ${DOMAIN}] (直接回车保持不变)"
+  else
+    domain_prompt+=" (例 hk.ssrr.today)"
+  fi
+  domain_prompt+="："
+
+  while true; do
+    read -r -p "$domain_prompt" input
+    if [ -z "$input" ] && [ -n "${DOMAIN:-}" ]; then
+      return 0
+    fi
+    if [ -n "$input" ]; then
+      DOMAIN="$input"
+      return 0
+    fi
+    echo "域名不能为空，请重新输入！"
+  done
+}
+
+prompt_cf_api() {
+  local input_key input_email resp ok zone_id
+  local has_saved=0
+  if [ -n "${CF_TOKEN:-}" ]; then
+    has_saved=1
+  fi
+
+  while true; do
+    local api_prompt="请输入域名 API (Cloudflare API Token 或 Global API Key)"
+    if [ "$has_saved" -eq 1 ]; then
+      api_prompt+=" [当前已保存] (直接回车保持不变)"
+    fi
+    api_prompt+="："
+
+    read -r -p "$api_prompt" input_key
+    if [ -z "$input_key" ] && [ "$has_saved" -eq 1 ]; then
+      echo "使用已保存的 Cloudflare API 认证配置。"
+      return 0
+    fi
+
+    if [ -z "$input_key" ]; then
+      echo "域名 API 密钥不能为空，请重新输入！"
+      continue
+    fi
+
+    echo "正在自动识别并校验 API..."
+
+    # 1. 尝试作为 API Token 校验 (Bearer Token)
+    resp="$(curl -sS -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
+      -H "Authorization: Bearer ${input_key}" \
+      -H "Content-Type: application/json" 2>&1 || true)"
+    ok="$(printf '%s' "$resp" | json_success)"
+
+    if [ "$ok" = "1" ]; then
+      echo "[OK] 自动识别为: Cloudflare API Token (校验通过)"
+      CF_AUTH_TYPE="token"
+      CF_TOKEN="$input_key"
+      CF_EMAIL=""
+
+      if [ -n "${DOMAIN:-}" ]; then
+        echo "正在验证该 API 对域名 ${DOMAIN} 的访问权限..."
+        if zone_id="$(find_zone_id "$DOMAIN" 2>/dev/null)"; then
+          echo "[OK] 域名匹配成功，Zone ID: ${zone_id}"
+        else
+          echo "警告：API Token 校验通过，但未能找到域名 ${DOMAIN} 的有效 Zone。"
+          echo "请确保该 Token 拥有域名所在 Zone 的 DNS 编辑权限。"
+          read -r -p "是否仍然保存该 API？(y/n) [y]: " confirm_save
+          confirm_save="${confirm_save:-y}"
+          if [[ ! "$confirm_save" =~ ^[Yy]$ ]]; then
+            echo "请重新输入域名 API！"
+            continue
+          fi
+        fi
+      fi
+      return 0
+    fi
+
+    # 2. 未识别为 API Token，尝试作为 Global API Key，提示输入邮箱完成校验
+    echo "未识别为有效 API Token，识别为 Global API Key。"
+    while true; do
+      local email_prompt="请输入关联的 Cloudflare 账号邮箱"
+      if [ -n "${CF_EMAIL:-}" ]; then
+        email_prompt+=" [当前记录: ${CF_EMAIL}] (直接回车保持不变)"
+      fi
+      email_prompt+="："
+
+      read -r -p "$email_prompt" input_email
+      if [ -z "$input_email" ] && [ -n "${CF_EMAIL:-}" ]; then
+        input_email="$CF_EMAIL"
+      fi
+
+      if [ -z "$input_email" ]; then
+        echo "账号邮箱不能为空！"
+        continue
+      fi
+      break
+    done
+
+    echo "正在使用账号邮箱校验 Global API Key..."
+    resp="$(curl -sS -X GET "https://api.cloudflare.com/client/v4/user" \
+      -H "X-Auth-Email: ${input_email}" \
+      -H "X-Auth-Key: ${input_key}" \
+      -H "Content-Type: application/json" 2>&1 || true)"
+    ok="$(printf '%s' "$resp" | json_success)"
+
+    if [ "$ok" = "1" ]; then
+      echo "[OK] 自动识别为: Cloudflare Global API Key (账号校验通过)"
+      CF_AUTH_TYPE="global_key"
+      CF_TOKEN="$input_key"
+      CF_EMAIL="$input_email"
+
+      if [ -n "${DOMAIN:-}" ]; then
+        echo "正在验证对域名 ${DOMAIN} 的访问权限..."
+        if zone_id="$(find_zone_id "$DOMAIN" 2>/dev/null)"; then
+          echo "[OK] 域名匹配成功，Zone ID: ${zone_id}"
+        else
+          echo "警告：Global API Key 校验通过，但未找到域名 ${DOMAIN} 的有效 Zone。"
+          echo "请确保该域名已接入此 Cloudflare 账号。"
+          read -r -p "是否仍然保存该 API？(y/n) [y]: " confirm_save
+          confirm_save="${confirm_save:-y}"
+          if [[ ! "$confirm_save" =~ ^[Yy]$ ]]; then
+            echo "请重新输入域名 API！"
+            continue
+          fi
+        fi
+      fi
+      return 0
+    else
+      local err_msg
+      err_msg="$(printf '%s' "$resp" | json_errors)"
+      echo "校验失败：${err_msg}"
+      echo "API 或邮箱验证不通过，请重新输入！"
+      echo
+    fi
+  done
+}
+
+prompt_target_ip_and_port() {
+  local current_ip="${TARGET_IP:-}"
+  local current_port="${TARGET_PORT:-22}"
+  local ip_input port_input
+
+  while true; do
+    local ip_prompt="请输入目标 IP"
+    if [ -n "$current_ip" ]; then
+      ip_prompt+=" [当前记录: ${current_ip}] (直接回车保持不变)"
+    else
+      ip_prompt+=" (例 38.76.188.74)"
+    fi
+    ip_prompt+="："
+
+    read -r -p "$ip_prompt" ip_input
+    if [ -z "$ip_input" ] && [ -n "$current_ip" ]; then
+      ip_input="$current_ip"
+    fi
+
+    if ! valid_ipv4 "$ip_input"; then
+      echo "目标 IP 格式不正确，请输入有效的 IPv4 地址。"
+      continue
+    fi
+
+    TARGET_IP="$ip_input"
+    echo "正在检测目标 ${TARGET_IP} 的 22 端口..."
+
+    if check_port "$TARGET_IP" 22; then
+      echo "[OK] 目标 ${TARGET_IP} 的 22 端口连通正常。"
+      TARGET_PORT=22
+      return 0
+    else
+      echo "目标 ${TARGET_IP} 的 22 端口未开放或无法连通。"
+      while true; do
+        local port_prompt="请输入端口继续匹配 (1-65535)"
+        if [ -n "$current_port" ] && [ "$current_port" != "22" ]; then
+          port_prompt+=" [当前记录: ${current_port}]"
+        fi
+        port_prompt+="："
+
+        read -r -p "$port_prompt" port_input
+        if [ -z "$port_input" ] && [ -n "$current_port" ] && [ "$current_port" != "22" ]; then
+          port_input="$current_port"
+        fi
+
+        if ! [[ "$port_input" =~ ^[0-9]+$ ]] || [ "$port_input" -lt 1 ] || [ "$port_input" -gt 65535 ]; then
+          echo "端口号无效，请输入 1-65535 之间的数字。"
+          continue
+        fi
+
+        echo "正在检测目标 ${TARGET_IP} 的 ${port_input} 端口..."
+        if check_port "$TARGET_IP" "$port_input"; then
+          echo "[OK] 端口 ${port_input} 匹配连通成功！"
+          TARGET_PORT="$port_input"
+          return 0
+        else
+          echo "警告：目标 ${TARGET_IP}:${port_input} 依然无法连通。"
+          read -r -p "是否重新输入端口匹配？(y: 重新输端口 / n: 强制使用该端口 / r: 重新输目标 IP) [y]: " retry_choice
+          retry_choice="${retry_choice:-y}"
+          if [[ "$retry_choice" =~ ^[Nn]$ ]]; then
+            echo "已设定使用端口: ${port_input}"
+            TARGET_PORT="$port_input"
+            return 0
+          elif [[ "$retry_choice" =~ ^[Rr]$ ]]; then
+            break
+          fi
+        fi
+      done
+    fi
+  done
+}
+
+setup_switch() {
   need_root
   require_base_cmds
+  load_config_silent
 
-  read -r -p "请输入每天切换时间，例 23:30：" switch_time
-  if ! valid_time "$switch_time"; then
-    echo "时间格式不正确，请使用 HH:MM，例如 23:30"
-    exit 1
-  fi
+  echo "=========================================="
+  echo "        配置定时切换与数据同步"
+  echo "=========================================="
 
-  read -r -p "请输入要切换的域名，例 hk.ssrr.today：" DOMAIN
-  if [ -z "$DOMAIN" ]; then
-    echo "域名不能为空。"
-    exit 1
-  fi
+  # 1. 切换时间 (只需输入小时)
+  SWITCH_TIME="$(prompt_switch_time "${SWITCH_TIME:-}")"
 
-  echo "请选择 Cloudflare 认证方式："
-  echo "1、API Token（推荐）"
-  echo "2、Global API Key"
-  read -r -p "请输入选项 [1-2]：" auth_choice
-  case "$auth_choice" in
-    1)
-      CF_AUTH_TYPE="token"
-      CF_EMAIL=""
-      read -r -s -p "请输入 Cloudflare API Token：" CF_TOKEN
-      echo
-      ;;
-    2)
-      CF_AUTH_TYPE="global_key"
-      read -r -p "请输入 Cloudflare 账号邮箱：" CF_EMAIL
-      if [ -z "$CF_EMAIL" ]; then
-        echo "Cloudflare 账号邮箱不能为空。"
-        exit 1
-      fi
-      read -r -s -p "请输入 Cloudflare Global API Key：" CF_TOKEN
-      echo
-      ;;
-    *)
-      echo "无效选项。"
-      exit 1
-      ;;
-  esac
-  if [ -z "$CF_TOKEN" ]; then
-    echo "Cloudflare 认证密钥不能为空。"
-    exit 1
-  fi
+  # 2. 域名
+  prompt_domain
 
-  read -r -p "请输入目标 IP，例 38.76.188.74：" TARGET_IP
-  if ! valid_ipv4 "$TARGET_IP"; then
-    echo "目标 IP 格式不正确。"
-    exit 1
-  fi
+  # 3. 域名 API (自动识别 Token / Global Key 及校验)
+  prompt_cf_api
+
+  # 4. 目标 IP 与端口检测匹配
+  prompt_target_ip_and_port
 
   SSR_FILE="$DEFAULT_SSR_FILE"
   TIMELIMIT_FILE="$DEFAULT_TIMELIMIT_FILE"
 
-  echo "正在验证 Cloudflare 认证信息和域名..."
-  zone_id="$(find_zone_id "$DOMAIN")"
-  echo "验证通过，Zone ID：$zone_id"
-
   install_self
   write_config "1"
-  install_cron "$switch_time"
+  install_cron "$SWITCH_TIME"
 
   echo
-  echo "设置完成。"
-  echo "每天 ${switch_time} 会执行："
-  echo "1. 将 ${DOMAIN} 的 A 记录切换到 ${TARGET_IP}"
-  echo "2. 执行 rsync -avz ${SSR_FILE} root@${TARGET_IP}:${SSR_FILE}"
-  echo "3. 执行 rsync -avz ${TIMELIMIT_FILE} root@${TARGET_IP}:${TIMELIMIT_FILE}"
+  echo "=========================================="
+  echo "设置完成！配置信息已保存至 ${CONFIG_PATH}"
+  echo "每天 ${SWITCH_TIME} 将自动执行："
+  echo "  1. 将 ${DOMAIN} 的 A 记录解析切换到 ${TARGET_IP}"
+  echo "  2. 执行 rsync 同步 SSR 用户数据 (端口: ${TARGET_PORT:-22})"
+  echo "  3. 执行 rsync 同步 SSR 到期时间 (端口: ${TARGET_PORT:-22})"
   echo
   echo "配置文件：$CONFIG_PATH"
   echo "执行脚本：$INSTALL_PATH"
   echo "日志文件：$LOG_PATH"
   echo "手动测试：sudo $INSTALL_PATH --run"
-  echo "注意：rsync 定时执行需要提前配置 root SSH 免密登录。"
+  echo "=========================================="
 
   setup_ssh_login || true
 }
 
 change_time() {
-  local switch_time
-
   need_root
   require_cmd crontab
-  load_config
+  load_config_silent
 
-  read -r -p "请输入新的每天切换时间，例 23:30：" switch_time
-  if ! valid_time "$switch_time"; then
-    echo "时间格式不正确，请使用 HH:MM，例如 23:30"
-    exit 1
-  fi
+  SWITCH_TIME="$(prompt_switch_time "${SWITCH_TIME:-}")"
 
   install_self
-  install_cron "$switch_time"
+  write_config "${TRANSFER_ENABLED:-1}"
+  install_cron "$SWITCH_TIME"
 
-  echo "定时时间已修改为每天 ${switch_time}。"
+  echo "定时时间已修改为每天 ${SWITCH_TIME}。"
   echo "当前任务：${INSTALL_PATH} --run"
 }
 
 change_target_ip() {
-  local new_target_ip
-
   need_root
-  load_config
-  if [ "${TRANSFER_ENABLED}" = "1" ]; then
+  load_config_silent
+  if [ "${TRANSFER_ENABLED:-1}" = "1" ]; then
     require_cmd ssh
     require_cmd ssh-copy-id
     require_cmd ssh-keygen
   fi
 
-  echo "当前目标 IP：${TARGET_IP}"
-  read -r -p "请输入新的目标 IP，例 38.76.188.74：" new_target_ip
-  if ! valid_ipv4 "$new_target_ip"; then
-    echo "目标 IP 格式不正确。"
-    exit 1
-  fi
+  prompt_target_ip_and_port
 
-  TARGET_IP="$new_target_ip"
   install_self
-  write_config "$TRANSFER_ENABLED"
+  write_config "${TRANSFER_ENABLED:-1}"
 
-  echo "目标 IP 已修改为：${TARGET_IP}"
+  echo "目标信息已修改为：${TARGET_IP} (SSH 端口: ${TARGET_PORT:-22})"
   echo "后续定时任务会将 ${DOMAIN} 的 A 记录切换到 ${TARGET_IP}。"
 
-  if [ "${TRANSFER_ENABLED}" = "1" ]; then
+  if [ "${TRANSFER_ENABLED:-1}" = "1" ]; then
     echo "SSR 数据同步当前已开启，目标 IP 修改后需要确认 root SSH 免密登录。"
     setup_ssh_login || true
   fi
@@ -496,7 +769,11 @@ upgrade_script_only() {
 
 disable_transfer() {
   need_root
-  load_config
+  load_config_silent
+  if [ -z "${DOMAIN:-}" ]; then
+    echo "未找到有效配置，无需取消。"
+    return 0
+  fi
   write_config "0"
   echo "已取消转移数据设置。后续定时任务只切换 Cloudflare DNS，不再同步 SSR 数据。"
 }
@@ -509,17 +786,40 @@ cancel_all() {
 }
 
 show_menu() {
-  echo "=============================="
-  echo " 定时切换服务器域名和 SSR 数据"
-  echo "=============================="
+  load_config_silent
+
+  echo "=========================================="
+  echo "      定时切换服务器域名和 SSR 数据"
+  echo "=========================================="
+  if [ -n "${DOMAIN:-}" ] && [ -n "${TARGET_IP:-}" ]; then
+    echo "【当前配置记录】"
+    echo "  • 切换域名: ${DOMAIN}"
+    echo "  • 目标地址: ${TARGET_IP} (SSH 端口: ${TARGET_PORT:-22})"
+    echo "  • 切换时间: 每天 ${SWITCH_TIME:-未设置}"
+    if [ "${CF_AUTH_TYPE:-token}" = "global_key" ]; then
+      echo "  • 认证方式: Global API Key (${CF_EMAIL})"
+    else
+      echo "  • 认证方式: API Token"
+    fi
+    if [ "${TRANSFER_ENABLED:-1}" = "1" ]; then
+      echo "  • 数据同步: 已开启 (SSR 数据及到期时间)"
+    else
+      echo "  • 数据同步: 已关闭 (仅切换 DNS)"
+    fi
+    echo "  • 定时任务: $(check_cron_status)"
+  else
+    echo "【当前配置记录】暂无保存的配置记录"
+  fi
+  echo "=========================================="
   echo "1、设置定时切换域名和数据"
   echo "2、取消转移数据设置"
   echo "3、取消所有所有设置"
   echo "4、修改定时时间"
-  echo "5、修改目标 IP"
+  echo "5、修改目标 IP 及端口"
   echo "6、升级脚本设置不变"
+  echo "0、退出"
   echo
-  read -r -p "请输入选项 [1-6]：" choice
+  read -r -p "请输入选项 [0-6]：" choice
 
   case "$choice" in
     1) setup_switch ;;
@@ -528,15 +828,18 @@ show_menu() {
     4) change_time ;;
     5) change_target_ip ;;
     6) upgrade_script_only ;;
+    0) exit 0 ;;
     *) echo "无效选项。" && exit 1 ;;
   esac
 }
 
-case "${1:-}" in
-  --run)
-    run_job
-    ;;
-  *)
-    show_menu
-    ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  case "${1:-}" in
+    --run)
+      run_job
+      ;;
+    *)
+      show_menu
+      ;;
+  esac
+fi
