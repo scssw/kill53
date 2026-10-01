@@ -14,6 +14,7 @@ cat > "$tmp" <<'__SX_SSR2VPS_PYTHON__'
 """Bind a ShadowsocksR mudbjson master to a traffic-only replica."""
 import base64
 import getpass
+import ipaddress
 import json
 import os
 import re
@@ -258,6 +259,10 @@ def setup(role):
         save_config(data)
         install_units()
         push()
+        try:
+            ssh(peer, BIN + ' register-master-ip')
+        except (OSError, subprocess.CalledProcessError):
+            print('无法获取副机看到的主机 IP。', file=sys.stderr)
     else:
         disable_units()
         save_config(data)
@@ -282,6 +287,15 @@ def status_report():
     if not c.get('role'):
         return
     print('SSR：' + ('主机' if c['role'] == 'master' else '副机'))
+    if c['role'] == 'master' and c.get('peer'):
+        try:
+            host_ip = ssh(c['peer'], BIN + ' register-master-ip').decode().strip()
+        except (OSError, subprocess.CalledProcessError):
+            host_ip = ''
+        if host_ip:
+            print('  主机 IP：' + host_ip)
+    elif c.get('master_ip'):
+        print('  主机 IP：' + c['master_ip'])
     peer = c.get('peer', '')
     if peer.startswith('root@'):
         peer = peer[5:]
@@ -298,6 +312,20 @@ def status_report():
                 print('  流量同步间隔：%s（约 %.2f 小时）' % (value, seconds / 3600))
     except OSError:
         pass
+
+
+def register_master_ip():
+    c = config()
+    if c.get('role') != 'replica':
+        return
+    fields = os.environ.get('SSH_CONNECTION', '').split()
+    if len(fields) >= 4:
+        try:
+            c['master_ip'] = str(ipaddress.ip_address(fields[0]))
+        except ValueError:
+            return
+        save_config(c)
+        print(c['master_ip'])
 
 
 def set_interval():
@@ -356,6 +384,7 @@ def main():
         elif cmd == 'status': print(config().get('role', 'unbound'))
         elif cmd == 'status-report': status_report()
         elif cmd == 'set-interval': set_interval()
+        elif cmd == 'register-master-ip': register_master_ip()
         elif cmd == 'peer-status': peer_status()
         elif cmd == 'unbind-peer': apply_peer_unbind()
         else: raise RuntimeError('用法: ssr2vps [menu|push|apply-config|snapshot|merge-traffic]')
@@ -379,6 +408,7 @@ cat > "$tmp" <<'__SX_XUI2VPS_PYTHON__'
 #!/usr/bin/env python3
 """Sync 3xs x-ui inbound/client config and merge replica traffic deltas."""
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -726,6 +756,10 @@ def setup(role):
     save_config(data)
     install_units()
     push(force=True)
+    try:
+        ssh(peer, BIN + ' register-master-ip')
+    except (OSError, subprocess.CalledProcessError):
+        print('无法获取副机看到的主机 IP。', file=sys.stderr)
 
 
 def unbind():
@@ -746,6 +780,15 @@ def status_report():
     if not c.get('role'):
         return
     print('XUI：' + ('主机' if c['role'] == 'master' else '副机'))
+    if c['role'] == 'master' and c.get('peer'):
+        try:
+            host_ip = ssh(c['peer'], BIN + ' register-master-ip').decode().strip()
+        except (OSError, subprocess.CalledProcessError):
+            host_ip = ''
+        if host_ip:
+            print('  主机 IP：' + host_ip)
+    elif c.get('master_ip'):
+        print('  主机 IP：' + c['master_ip'])
     peer = c.get('peer', '')
     if peer.startswith('root@'):
         peer = peer[5:]
@@ -762,6 +805,20 @@ def status_report():
                 print('  流量同步间隔：%s（约 %.2f 小时）' % (value, seconds / 3600))
     except OSError:
         pass
+
+
+def register_master_ip():
+    c = config()
+    if c.get('role') != 'replica':
+        return
+    fields = os.environ.get('SSH_CONNECTION', '').split()
+    if len(fields) >= 4:
+        try:
+            c['master_ip'] = str(ipaddress.ip_address(fields[0]))
+        except ValueError:
+            return
+        save_config(c)
+        print(c['master_ip'])
 
 
 def set_interval():
@@ -821,6 +878,7 @@ def main():
         elif cmd == 'status': print(config().get('role', 'unbound'))
         elif cmd == 'status-report': status_report()
         elif cmd == 'set-interval': set_interval()
+        elif cmd == 'register-master-ip': register_master_ip()
         elif cmd == 'unbind-peer': apply_peer_unbind()
         else: raise RuntimeError('用法: xui2vps [menu|push|apply-config|snapshot|merge-traffic]')
     except (OSError, ValueError, KeyError, sqlite3.Error,
