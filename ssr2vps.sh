@@ -122,8 +122,37 @@ def enforce_limits(data):
 
 def ssh(target, command, stdin=None):
     # target is constrained during setup; command is always a fixed literal.
-    return subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', target, command],
+    c = config()
+    args = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
+    if target == c.get('peer') and c.get('peer_port'):
+        args += ['-p', str(c['peer_port'])]
+    return subprocess.run(args + [target, command],
                           input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout
+
+
+def connect_peer(peer):
+    c = config()
+    try:
+        ssh(peer, 'true')
+        return int(c['peer_port']) if peer == c.get('peer') and c.get('peer_port') else None
+    except (OSError, subprocess.CalledProcessError):
+        print('未检测到可用的 SSH 密钥连接，请输入副机 SSH 端口并安装公钥。')
+    port = input('对方 SSH 端口（默认 22；如果不是 22 请输入实际端口）: ').strip() or '22'
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise RuntimeError('SSH 端口无效')
+    key = Path.home() / '.ssh/id_rsa'
+    key.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not key.exists():
+        subprocess.run(['ssh-keygen', '-q', '-t', 'rsa', '-b', '4096', '-N', '', '-f', str(key)], check=True)
+    elif not Path(str(key) + '.pub').exists():
+        pub = subprocess.run(['ssh-keygen', '-y', '-f', str(key)], check=True,
+                             stdout=subprocess.PIPE).stdout
+        Path(str(key) + '.pub').write_bytes(pub)
+    print('将要求输入副机登录密码以安装密钥...')
+    subprocess.run(['ssh-copy-id', '-o', 'StrictHostKeyChecking=accept-new', '-p', port, peer], check=True)
+    subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o',
+                    'StrictHostKeyChecking=accept-new', '-p', port, peer, 'true'], check=True)
+    return int(port)
 
 
 def push():
@@ -222,8 +251,10 @@ def setup(role):
             raise RuntimeError('IP/主机名格式无效')
         peer = 'root@' + host
         data['peer'] = peer
-        # Check noninteractive SSH before enabling background jobs.
-        ssh(peer, 'true')
+        # Install a key interactively when noninteractive SSH is not ready.
+        port = connect_peer(peer)
+        if port:
+            data['peer_port'] = port
         save_config(data)
         install_units()
         push()
@@ -244,6 +275,58 @@ def unbind():
             print('无法联系副机；主机本地绑定仍会取消。', file=sys.stderr)
     apply_peer_unbind()
     print('绑定已取消；SSR 用户和流量数据未删除。')
+
+
+def status_report():
+    c = config()
+    if not c.get('role'):
+        return
+    print('SSR：' + ('主机' if c['role'] == 'master' else '副机'))
+    peer = c.get('peer', '')
+    if peer.startswith('root@'):
+        peer = peer[5:]
+    if peer:
+        print('  同步 IP：' + peer)
+    try:
+        raw = Path(TIMER_UNIT).read_text()
+        match = re.search(r'^OnUnitActiveSec=(.+)$', raw, re.M)
+        if match:
+            value = match.group(1)
+            duration = re.fullmatch(r'(\d+)(s|min|h)', value)
+            if duration:
+                seconds = int(duration.group(1)) * {'s': 1, 'min': 60, 'h': 3600}[duration.group(2)]
+                print('  流量同步间隔：%s（约 %.2f 小时）' % (value, seconds / 3600))
+    except OSError:
+        pass
+
+
+def set_interval():
+    path = Path(TIMER_UNIT)
+    if not path.is_file():
+        print('SSR 尚未配置主机流量同步定时器。')
+        return
+    value = input('请输入 SSR 流量同步间隔（小时，支持小数）: ').strip()
+    try:
+        hours = float(value)
+        if not 0.01 <= hours <= 8760:
+            raise ValueError
+    except ValueError:
+        print('请输入 0.01 到 8760 之间的小时数。')
+        return
+    seconds = int(hours * 3600)
+    interval = (str(seconds // 3600) + 'h' if seconds % 3600 == 0 else
+                str(seconds // 60) + 'min' if seconds % 60 == 0 else str(seconds) + 's')
+    raw = path.read_text()
+    raw, count = re.subn(r'(?m)^OnBootSec=.*$', 'OnBootSec=' + interval, raw, count=1)
+    if not count:
+        raise RuntimeError('SSR 定时器缺少 OnBootSec')
+    raw, count = re.subn(r'(?m)^OnUnitActiveSec=.*$', 'OnUnitActiveSec=' + interval, raw, count=1)
+    if not count:
+        raise RuntimeError('SSR 定时器缺少 OnUnitActiveSec')
+    path.write_text(raw)
+    subprocess.run(['systemctl', 'daemon-reload'], check=True)
+    subprocess.run(['systemctl', 'restart', 'ssr2vps-traffic.timer'], check=True)
+    print('SSR 流量同步间隔已改为 ' + interval)
 
 
 def menu():
@@ -271,6 +354,8 @@ def main():
         elif cmd == 'snapshot': snapshot()
         elif cmd == 'merge-traffic': merge_traffic()
         elif cmd == 'status': print(config().get('role', 'unbound'))
+        elif cmd == 'status-report': status_report()
+        elif cmd == 'set-interval': set_interval()
         elif cmd == 'peer-status': peer_status()
         elif cmd == 'unbind-peer': apply_peer_unbind()
         else: raise RuntimeError('用法: ssr2vps [menu|push|apply-config|snapshot|merge-traffic]')
@@ -372,8 +457,37 @@ def apply_peer_unbind():
 
 
 def ssh(target, command, stdin=None):
-    return subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', target, command],
+    c = config()
+    args = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
+    if target == c.get('peer') and c.get('peer_port'):
+        args += ['-p', str(c['peer_port'])]
+    return subprocess.run(args + [target, command],
                           input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout
+
+
+def connect_peer(peer):
+    c = config()
+    try:
+        ssh(peer, 'true')
+        return int(c['peer_port']) if peer == c.get('peer') and c.get('peer_port') else None
+    except (OSError, subprocess.CalledProcessError):
+        print('未检测到可用的 SSH 密钥连接，请输入副机 SSH 端口并安装公钥。')
+    port = input('对方 SSH 端口（默认 22；如果不是 22 请输入实际端口）: ').strip() or '22'
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise RuntimeError('SSH 端口无效')
+    key = Path.home() / '.ssh/id_rsa'
+    key.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not key.exists():
+        subprocess.run(['ssh-keygen', '-q', '-t', 'rsa', '-b', '4096', '-N', '', '-f', str(key)], check=True)
+    elif not Path(str(key) + '.pub').exists():
+        pub = subprocess.run(['ssh-keygen', '-y', '-f', str(key)], check=True,
+                             stdout=subprocess.PIPE).stdout
+        Path(str(key) + '.pub').write_bytes(pub)
+    print('将要求输入副机登录密码以安装密钥...')
+    subprocess.run(['ssh-copy-id', '-o', 'StrictHostKeyChecking=accept-new', '-p', port, peer], check=True)
+    subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o',
+                    'StrictHostKeyChecking=accept-new', '-p', port, peer, 'true'], check=True)
+    return int(port)
 
 
 def open_db(path=DB):
@@ -605,8 +719,11 @@ def setup(role):
     if not re.fullmatch(r'[A-Za-z0-9.-]+', host) or host.startswith('-') or '..' in host:
         raise RuntimeError('IP/主机名格式无效')
     peer = 'root@' + host
-    ssh(peer, 'true')
-    save_config({'role': 'master', 'peer': peer})
+    port = connect_peer(peer)
+    data = {'role': 'master', 'peer': peer}
+    if port:
+        data['peer_port'] = port
+    save_config(data)
     install_units()
     push(force=True)
 
@@ -622,6 +739,58 @@ def unbind():
             print('无法联系副机；主机本地绑定仍会取消。', file=sys.stderr)
     apply_peer_unbind()
     print('绑定已取消；x-ui 数据库未删除。')
+
+
+def status_report():
+    c = config()
+    if not c.get('role'):
+        return
+    print('XUI：' + ('主机' if c['role'] == 'master' else '副机'))
+    peer = c.get('peer', '')
+    if peer.startswith('root@'):
+        peer = peer[5:]
+    if peer:
+        print('  同步 IP：' + peer)
+    try:
+        raw = Path(TIMER_UNIT).read_text()
+        match = re.search(r'^OnUnitActiveSec=(.+)$', raw, re.M)
+        if match:
+            value = match.group(1)
+            duration = re.fullmatch(r'(\d+)(s|min|h)', value)
+            if duration:
+                seconds = int(duration.group(1)) * {'s': 1, 'min': 60, 'h': 3600}[duration.group(2)]
+                print('  流量同步间隔：%s（约 %.2f 小时）' % (value, seconds / 3600))
+    except OSError:
+        pass
+
+
+def set_interval():
+    path = Path(TIMER_UNIT)
+    if not path.is_file():
+        print('XUI 尚未配置主机流量同步定时器。')
+        return
+    value = input('请输入 XUI 流量同步间隔（小时，支持小数）: ').strip()
+    try:
+        hours = float(value)
+        if not 0.01 <= hours <= 8760:
+            raise ValueError
+    except ValueError:
+        print('请输入 0.01 到 8760 之间的小时数。')
+        return
+    seconds = int(hours * 3600)
+    interval = (str(seconds // 3600) + 'h' if seconds % 3600 == 0 else
+                str(seconds // 60) + 'min' if seconds % 60 == 0 else str(seconds) + 's')
+    raw = path.read_text()
+    raw, count = re.subn(r'(?m)^OnBootSec=.*$', 'OnBootSec=' + interval, raw, count=1)
+    if not count:
+        raise RuntimeError('XUI 定时器缺少 OnBootSec')
+    raw, count = re.subn(r'(?m)^OnUnitActiveSec=.*$', 'OnUnitActiveSec=' + interval, raw, count=1)
+    if not count:
+        raise RuntimeError('XUI 定时器缺少 OnUnitActiveSec')
+    path.write_text(raw)
+    subprocess.run(['systemctl', 'daemon-reload'], check=True)
+    subprocess.run(['systemctl', 'restart', 'xui2vps-traffic.timer'], check=True)
+    print('XUI 流量同步间隔已改为 ' + interval)
 
 
 def menu():
@@ -650,6 +819,8 @@ def main():
         elif cmd == 'snapshot': snapshot()
         elif cmd == 'merge-traffic': merge_traffic()
         elif cmd == 'status': print(config().get('role', 'unbound'))
+        elif cmd == 'status-report': status_report()
+        elif cmd == 'set-interval': set_interval()
         elif cmd == 'unbind-peer': apply_peer_unbind()
         else: raise RuntimeError('用法: xui2vps [menu|push|apply-config|snapshot|merge-traffic]')
     except (OSError, ValueError, KeyError, sqlite3.Error,
@@ -667,10 +838,23 @@ install -m 0755 "$tmp" /usr/local/bin/xui2vps
 rm -f "$tmp"
 trap - EXIT HUP INT TERM
 
-printf '\n同步工具：\n1、SSR 同步（默认）\n2、x-ui 同步\n请选择 [1]: '
+printf '\n当前同步状态：\n'
+/usr/local/bin/ssr2vps status-report
+/usr/local/bin/xui2vps status-report
+printf '\n主菜单：\n1、SSR 同步\n2、XUI 同步\n3、同步时间修改\n0、退出\n请选择: '
 IFS= read -r choice || choice=
 case "$choice" in
-    ''|1) exec /usr/local/bin/ssr2vps menu ;;
+    1) exec /usr/local/bin/ssr2vps menu ;;
     2) exec /usr/local/bin/xui2vps menu ;;
+    3)
+        printf '\n同步时间修改：\n1、修改 SSR\n2、修改 XUI\n0、返回\n请选择: '
+        IFS= read -r timer_choice || timer_choice=
+        case "$timer_choice" in
+            1) exec /usr/local/bin/ssr2vps set-interval ;;
+            2) exec /usr/local/bin/xui2vps set-interval ;;
+            0) exit 0 ;;
+            *) echo '无效选项'; exit 1 ;;
+        esac ;;
+    0) exit 0 ;;
     *) echo '无效选项'; exit 1 ;;
 esac
