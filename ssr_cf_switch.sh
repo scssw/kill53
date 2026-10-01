@@ -351,6 +351,10 @@ write_config() {
 
 install_cron() {
   local out="$1" back="$2" oh om bh bm tmp
+  if ! valid_time "$out" || ! valid_time "$back"; then
+    echo "定时时间无效：传送时间和传回时间都必须填写（例：18 2）。" >&2
+    return 1
+  fi
   oh="${out%:*}"; om="${out#*:}"; bh="${back%:*}"; bm="${back#*:}"
   oh="$((10#$oh))"; om="$((10#$om))"; bh="$((10#$bh))"; bm="$((10#$bm))"
   tmp="$(mktemp)"
@@ -593,6 +597,27 @@ prompt_return_time() {
   done
 }
 
+prompt_schedule_times() {
+  local input out back parsed_out parsed_back
+  while true; do
+    read -r -p "请输入传送和传回时间（北京时间，例：18 2；也可写 18:00 02:00）${SWITCH_TIME:+ [当前: $SWITCH_TIME $RETURN_TIME]}：" input
+    if [ -z "$input" ] && [ -n "${SWITCH_TIME:-}" ] && [ -n "${RETURN_TIME:-}" ]; then
+      printf '%s %s\n' "$SWITCH_TIME" "$RETURN_TIME"
+      return 0
+    fi
+    read -r out back _ <<< "$input"
+    if [ -z "$out" ] || [ -z "$back" ]; then
+      echo "请同时输入两个时间，例如：18 2。"
+      continue
+    fi
+    if parsed_out="$(parse_and_validate_time "$out")" && parsed_back="$(parse_and_validate_time "$back")"; then
+      printf '%s %s\n' "$parsed_out" "$parsed_back"
+      return 0
+    fi
+    echo "时间无效，请输入 0-23 小时或 HH:MM，例如：18 2。"
+  done
+}
+
 prompt_local_ip() {
   local ip_input
   while true; do
@@ -745,50 +770,26 @@ prompt_target_ip_and_port() {
     fi
 
     TARGET_IP="$ip_input"
-    echo "正在检测目标 ${TARGET_IP} 的 22 端口..."
-
-    if check_port "$TARGET_IP" 22; then
-      echo "[OK] 目标 ${TARGET_IP} 的 22 端口连通正常。"
-      TARGET_PORT=22
-      return 0
-    else
-      echo "目标 ${TARGET_IP} 的 22 端口未开放或无法连通。"
-      while true; do
-        local port_prompt="请输入端口继续匹配 (1-65535)"
-        if [ -n "$current_port" ] && [ "$current_port" != "22" ]; then
-          port_prompt+=" [当前记录: ${current_port}]"
-        fi
-        port_prompt+="："
-
-        read -r -p "$port_prompt" port_input
-        if [ -z "$port_input" ] && [ -n "$current_port" ] && [ "$current_port" != "22" ]; then
-          port_input="$current_port"
-        fi
-
-        if ! [[ "$port_input" =~ ^[0-9]+$ ]] || [ "$port_input" -lt 1 ] || [ "$port_input" -gt 65535 ]; then
-          echo "端口号无效，请输入 1-65535 之间的数字。"
-          continue
-        fi
-
-        echo "正在检测目标 ${TARGET_IP} 的 ${port_input} 端口..."
-        if check_port "$TARGET_IP" "$port_input"; then
-          echo "[OK] 端口 ${port_input} 匹配连通成功！"
-          TARGET_PORT="$port_input"
-          return 0
-        else
-          echo "警告：目标 ${TARGET_IP}:${port_input} 依然无法连通。"
-          read -r -p "是否重新输入端口匹配？(y: 重新输端口 / n: 强制使用该端口 / r: 重新输目标 IP) [y]: " retry_choice
-          retry_choice="${retry_choice:-y}"
-          if [[ "$retry_choice" =~ ^[Nn]$ ]]; then
-            echo "已设定使用端口: ${port_input}"
-            TARGET_PORT="$port_input"
-            return 0
-          elif [[ "$retry_choice" =~ ^[Rr]$ ]]; then
-            break
-          fi
-        fi
-      done
-    fi
+    while true; do
+      read -r -p "请输入 B 机 SSH 端口（传送和回传都会使用） [当前: ${current_port}]：" port_input
+      port_input="${port_input:-$current_port}"
+      if ! [[ "$port_input" =~ ^[0-9]+$ ]] || [ "$port_input" -lt 1 ] || [ "$port_input" -gt 65535 ]; then
+        echo "端口号无效，请输入 1-65535 之间的数字。"
+        continue
+      fi
+      echo "正在检测目标 ${TARGET_IP} 的 ${port_input} 端口..."
+      if check_port "$TARGET_IP" "$port_input"; then
+        echo "[OK] 目标 ${TARGET_IP}:${port_input} 连通正常。"
+        TARGET_PORT="$port_input"
+        return 0
+      fi
+      echo "警告：目标 ${TARGET_IP}:${port_input} 无法连通。"
+      read -r -p "仍然使用此端口？(y 使用 / n 重输端口 / r 重输 IP) [n]：" retry_choice
+      case "${retry_choice:-n}" in
+        [Yy]) TARGET_PORT="$port_input"; return 0 ;;
+        [Rr]) break ;;
+      esac
+    done
   done
 }
 
@@ -802,8 +803,7 @@ setup_switch() {
   echo "=========================================="
 
   # A 机负责传送与传回两个定时动作。
-  SWITCH_TIME="$(prompt_switch_time "${SWITCH_TIME:-}")"
-  RETURN_TIME="$(prompt_return_time)"
+  read -r SWITCH_TIME RETURN_TIME <<< "$(prompt_schedule_times)"
 
   # 2. 域名
   prompt_domain
@@ -843,8 +843,7 @@ change_time() {
   require_cmd crontab
   load_config_silent
 
-  SWITCH_TIME="$(prompt_switch_time "${SWITCH_TIME:-}")"
-  RETURN_TIME="$(prompt_return_time)"
+  read -r SWITCH_TIME RETURN_TIME <<< "$(prompt_schedule_times)"
 
   install_self
   write_config "${TRANSFER_ENABLED:-1}"
