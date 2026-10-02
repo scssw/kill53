@@ -536,7 +536,7 @@ if [[ "${1:-}" == "--check" ]]; then python3 "$PY_HELPER" --check; exit 0; fi
 
 while true; do
     echo
-    echo "====== x-ui 端口限速管理 ======"
+    echo "====== x-ui 端口限速管理1.0 ======"
     echo "1. 启用默认自动策略（IPv4，15 分钟 / 3 GB / 2000 KB/s / 30 分钟恢复）"
     echo "2. 配置/更新基础端口限速（IPv4，上下行 Mbps）"
     echo "3. 查看状态"
