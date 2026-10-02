@@ -11,25 +11,288 @@ if [[ $EUID -ne 0 ]]; then
     echo "请使用 root 运行此面板。"
     exit 1
 fi
-for tool in tc ip python3; do
+mkdir -p "$BASE_DIR"
+
+# Keep the helper bundled so this file is the only file needed for deployment.
+cat > "$PY_HELPER" <<'XUI_RATE_LIMIT_PYTHON'
+#!/usr/bin/env python3
+"""Traffic-volume policy helper for x-ui/XRay and ShadowsocksR ports."""
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+BASE = "/root/speex"
+CONFIG = os.path.join(BASE, "xui_rate_limit.conf")
+STATE = os.path.join(BASE, "xui_rate_limit_state.json")
+THRESHOLD = 3 * 1024**3
+WINDOW = 15 * 60
+LIMIT_MBIT = 16  # 2000 KB/s
+LIMIT_SECONDS = 30 * 60
+
+
+def config():
+    values = {}
+    with open(CONFIG, encoding="utf-8") as stream:
+        for line in stream:
+            if "=" in line:
+                key, value = line.rstrip().split("=", 1)
+                values[key] = value.strip("'\"")
+    values["ports"] = values.get("PORTS", "").split(",")
+    values["auto_discover"] = values.get("AUTO_DISCOVER", "0") == "1"
+    values["down"] = float(values["DOWN_MBIT"])
+    values["up"] = float(values["UP_MBIT"])
+    return values
+
+
+def run(args, capture=False):
+    return subprocess.run(args, check=True, text=True,
+                          stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                          stderr=subprocess.PIPE if capture else subprocess.DEVNULL)
+
+
+def discover_ports():
+    result = run(["ss", "-H", "-lntup"], True)
+    found = set()
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 5:
+            continue
+        netid, state = fields[0], fields[1]
+        if (netid == "tcp" and state != "LISTEN") or (netid == "udp" and state != "UNCONN"):
+            continue
+        owners = re.findall(r'users:\(\("([^\"]+)",pid=(\d+),', line)
+        is_proxy = False
+        for process_name, pid in owners:
+            name = process_name.lower()
+            if "xray" in name:
+                is_proxy = True
+                break
+            try:
+                with open("/proc/{}/cmdline".format(pid), "rb") as stream:
+                    command = stream.read().replace(b"\0", b" ").decode(errors="ignore").lower()
+                cwd = os.readlink("/proc/{}/cwd".format(pid)).lower()
+            except OSError:
+                continue
+            if ("shadowsocksr" in command or "ssserver" in command or
+                    "shadowsocksr" in cwd or name.startswith("ssserver")):
+                is_proxy = True
+                break
+        if is_proxy:
+            match = re.search(r":(\d+)$", fields[4])
+            if match and int(match.group(1)) > 0:
+                found.add(int(match.group(1)))
+    return [str(port) for port in sorted(found)]
+
+
+def counters(dev, pref):
+    total = 0
+    for direction in ("ingress", "egress"):
+        result = run(["tc", "-s", "filter", "show", "dev", dev, direction], True)
+        active_pref = None
+        for line in result.stdout.splitlines():
+            match = re.search(r"\bpref\s+(\d+)\b", line)
+            if match:
+                active_pref = int(match.group(1))
+            if active_pref == pref:
+                sent = re.search(r"\bSent\s+(\d+)\s+bytes\b", line)
+                if sent:
+                    total += int(sent.group(1))
+    return total
+
+
+def set_rate(dev, port, index, down, up):
+    pref = 42000 + index
+    for direction, rate, field in (("egress", down, "src_port"),
+                                   ("ingress", up, "dst_port")):
+        for protocol, handle, family in (("tcp", 1, "ip"), ("udp", 2, "ip"),
+                                         ("tcp", 3, "ipv6"), ("udp", 4, "ipv6")):
+            run(["tc", "filter", "replace", "dev", dev, direction,
+                 "protocol", family, "pref", str(pref), "handle", str(handle),
+                 "flower", "ip_proto", protocol, field, str(port), "action",
+                 "police", "rate", "{}mbit".format(rate), "burst", "128k", "drop"])
+
+
+def remove_pref(dev, pref):
+    for direction in ("ingress", "egress"):
+        subprocess.run(["tc", "filter", "del", "dev", dev, direction,
+                        "pref", str(pref)], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+
+
+def reconcile(cfg, state, ports):
+    old_ports = state.get("ports", [])
+    old_iface = state.get("iface", cfg["IFACE"])
+    if old_ports == ports and old_iface == cfg["IFACE"]:
+        return
+    for index in range(max(len(old_ports), len(ports))):
+        remove_pref(old_iface, 42000 + index)
+    subprocess.run(["tc", "qdisc", "add", "dev", cfg["IFACE"], "clsact"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for index, port in enumerate(ports):
+        active = state.get("active", {}).get(port)
+        if active and int(time.time()) < active["until"]:
+            down, up = min(cfg["down"], LIMIT_MBIT), min(cfg["up"], LIMIT_MBIT)
+        else:
+            down, up = cfg["down"], cfg["up"]
+        set_rate(cfg["IFACE"], port, index, down, up)
+    state["ports"] = ports
+    state["iface"] = cfg["IFACE"]
+    state["last"] = {port: 0 for port in ports}
+    state["samples"] = {port: state.get("samples", {}).get(port, []) for port in ports}
+    state["active"] = {port: active for port, active in state.get("active", {}).items() if port in ports}
+    state["blocked"] = [port for port in state.get("blocked", []) if port in ports]
+
+
+def save(state):
+    fd, path = tempfile.mkstemp(prefix=".xui-rate-", dir=BASE)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(state, stream, indent=2)
+            stream.write("\n")
+        os.chmod(path, 0o600)
+        os.replace(path, STATE)
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def main():
+    os.makedirs(BASE, mode=0o700, exist_ok=True)
+    cfg = config()
+    if cfg.get("AUTO_ENABLED") != "1":
+        raise SystemExit("Automatic policy is disabled")
+    try:
+        with open(STATE, encoding="utf-8") as stream:
+            state = json.load(stream)
+    except (OSError, ValueError):
+        state = {"last": {}, "samples": {}, "active": {}, "blocked": []}
+    now = int(time.time())
+    ports = discover_ports() if cfg["auto_discover"] else [p for p in cfg["ports"] if p]
+    reconcile(cfg, state, ports)
+    if not ports:
+        print("未发现 xray 或 ShadowsocksR 监听端口")
+        save(state)
+        return
+    for index, port in enumerate(ports):
+        key = str(port)
+        value = counters(cfg["IFACE"], 42000 + index)
+        previous = state["last"].get(key)
+        delta = max(0, value - previous) if previous is not None else 0
+        state["last"][key] = value
+        samples = state["samples"].setdefault(key, [])
+        samples.append([now, delta])
+        samples[:] = [sample for sample in samples if sample[0] >= now - WINDOW]
+        amount = sum(sample[1] for sample in samples)
+        blocked = set(state.get("blocked", []))
+        active = state["active"].get(key)
+        if active and now >= active["until"]:
+            set_rate(cfg["IFACE"], port, index, cfg["down"], cfg["up"])
+            state["last"][key] = 0
+            state["active"].pop(key, None)
+            blocked.add(key)
+            print("RESTORE port={}".format(key))
+        elif active:
+            pass
+        elif key in blocked:
+            if amount < THRESHOLD:
+                blocked.remove(key)
+        elif len(samples) > 1 and amount >= THRESHOLD:
+            set_rate(cfg["IFACE"], port, index,
+                     min(cfg["down"], LIMIT_MBIT), min(cfg["up"], LIMIT_MBIT))
+            state["last"][key] = 0
+            state["active"][key] = {"started": now, "until": now + LIMIT_SECONDS}
+            print("LIMIT port={} window_bytes={} speed={}mbit".format(key, amount, LIMIT_MBIT))
+        state["blocked"] = sorted(blocked)
+    save(state)
+
+
+def restore_all():
+    cfg = config()
+    try:
+        with open(STATE, encoding="utf-8") as stream:
+            state = json.load(stream)
+    except (OSError, ValueError):
+        return
+    ports = state.get("ports", []) if cfg["auto_discover"] else [p for p in cfg["ports"] if p]
+    for index, port in enumerate(ports):
+        if str(port) in state.get("active", {}):
+            set_rate(cfg["IFACE"], port, index, cfg["down"], cfg["up"])
+    state["active"] = {}
+    state["blocked"] = []
+    save(state)
+
+
+def restore_boot():
+    cfg = config()
+    try:
+        with open(STATE, encoding="utf-8") as stream:
+            state = json.load(stream)
+    except (OSError, ValueError):
+        state = {"last": {}, "samples": {}, "active": {}, "blocked": []}
+    now = int(time.time())
+    ports = discover_ports() if cfg["auto_discover"] else [p for p in cfg["ports"] if p]
+    state["ports"] = []
+    reconcile(cfg, state, ports)
+    for index, port in enumerate(ports):
+        active = state.get("active", {}).get(str(port))
+        if active and now < active["until"]:
+            set_rate(cfg["IFACE"], port, index,
+                     min(cfg["down"], LIMIT_MBIT), min(cfg["up"], LIMIT_MBIT))
+        elif active:
+            set_rate(cfg["IFACE"], port, index, cfg["down"], cfg["up"])
+            state["active"].pop(str(port), None)
+    save(state)
+
+
+def remove_all():
+    cfg = config()
+    try:
+        with open(STATE, encoding="utf-8") as stream:
+            state = json.load(stream)
+    except (OSError, ValueError):
+        return
+    dev = state.get("iface", cfg["IFACE"])
+    for index in range(len(state.get("ports", []))):
+        remove_pref(dev, 42000 + index)
+    state["ports"] = []
+    state["active"] = {}
+    save(state)
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--restore-all"]:
+        restore_all()
+    elif sys.argv[1:] == ["--boot"]:
+        restore_boot()
+    elif sys.argv[1:] == ["--remove-all"]:
+        remove_all()
+    else:
+        main()
+XUI_RATE_LIMIT_PYTHON
+chmod 700 "$PY_HELPER"
+
+for tool in tc ip ss python3; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "缺少命令：$tool（通常由 iproute2 提供）"
         exit 1
     fi
 done
-mkdir -p "$BASE_DIR"
 
 get_iface() {
     ip -o route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'
 }
 read_config() {
-    IFACE=""; PORTS=""; DOWN_MBIT=""; UP_MBIT=""; AUTO_ENABLED="0"
+    IFACE=""; PORTS=""; DOWN_MBIT=""; UP_MBIT=""; AUTO_ENABLED="0"; AUTO_DISCOVER="0"
     if [[ -f "$CONFIG" ]]; then source "$CONFIG"; fi
 }
 write_config() {
     {
-        printf 'IFACE=%q\nPORTS=%q\nDOWN_MBIT=%q\nUP_MBIT=%q\nAUTO_ENABLED=%q\n' \
-            "$IFACE" "$PORTS" "$DOWN_MBIT" "$UP_MBIT" "$AUTO_ENABLED"
+        printf 'IFACE=%q\nPORTS=%q\nDOWN_MBIT=%q\nUP_MBIT=%q\nAUTO_ENABLED=%q\nAUTO_DISCOVER=%q\n' \
+            "$IFACE" "$PORTS" "$DOWN_MBIT" "$UP_MBIT" "$AUTO_ENABLED" "$AUTO_DISCOVER"
     } > "$CONFIG"
     chmod 600 "$CONFIG"
 }
@@ -108,19 +371,35 @@ enable_limits() {
     ports="$PORTS_CLEAN"
     read_positive "每个端口的下载上限" "${DOWN_MBIT:-100}"; down="$REPLY"
     read_positive "每个端口的上传上限" "${UP_MBIT:-100}"; up="$REPLY"
-    if [[ "${AUTO_ENABLED:-0}" == "1" ]]; then python3 "$PY_HELPER" --restore-all; fi
+    if [[ "${AUTO_ENABLED:-0}" == "1" ]]; then
+        python3 "$PY_HELPER" --restore-all
+        remove_policy_cron
+        AUTO_ENABLED=0
+    fi
+    if [[ "${AUTO_DISCOVER:-0}" == "1" ]]; then python3 "$PY_HELPER" --remove-all; fi
     remove_rules "${IFACE:-$iface}" "${PORTS:-}"
     apply_rules "$iface" "$ports" "$down" "$up"
-    IFACE="$iface"; PORTS="$ports"; DOWN_MBIT="$down"; UP_MBIT="$up"
+    IFACE="$iface"; PORTS="$ports"; DOWN_MBIT="$down"; UP_MBIT="$up"; AUTO_DISCOVER=0
     write_config
     echo "已应用：端口 $ports；每端口下载 ${down} Mbps、上传 ${up} Mbps。"
     echo "同一端口上的用户共享该端口上限。"
 }
 show_status() {
     read_config
-    if [[ -z "$PORTS" ]]; then echo "尚未配置限速端口。"; return; fi
+    if [[ -z "$PORTS" && "$AUTO_DISCOVER" != "1" ]]; then echo "尚未配置限速端口。"; return; fi
     echo "配置接口：$IFACE"
-    echo "端口：$PORTS"
+    if [[ "$AUTO_DISCOVER" == "1" ]]; then
+        echo "端口：自动发现 xray / ShadowsocksR 监听端口"
+        if [[ -f "$BASE_DIR/xui_rate_limit_state.json" ]]; then
+            python3 - "$BASE_DIR/xui_rate_limit_state.json" <<'STATUS_PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print("当前发现端口：" + ",".join(json.load(stream).get("ports", [])))
+STATUS_PY
+        fi
+    else
+        echo "端口：$PORTS"
+    fi
     echo "每端口下载上限：${DOWN_MBIT} Mbps；上传上限：${UP_MBIT} Mbps"
     if [[ "$AUTO_ENABLED" == "1" ]]; then echo "自动策略：已启用（15 分钟 / 3 GB / 2000 KB/s / 30 分钟恢复）"; else echo "自动策略：未启用"; fi
     echo "tc 规则："
@@ -129,6 +408,7 @@ show_status() {
 }
 disable_limits() {
     read_config
+    if [[ "$AUTO_DISCOVER" == "1" ]]; then python3 "$PY_HELPER" --remove-all; fi
     [[ -z "$PORTS" ]] || remove_rules "$IFACE" "$PORTS"
     rm -f "$CONFIG"
     echo "已移除本脚本配置的端口限速规则。"
@@ -141,11 +421,15 @@ remove_policy_cron() {
 }
 enable_default_policy() {
     read_config
-    if [[ -z "$PORTS" ]]; then
-        echo "自动策略需要先配置监控端口和基础限速。"
-        enable_limits || return 1
-        read_config
-    fi
+    local default_iface="${IFACE:-$(get_iface)}" iface_input down up
+    read -r -p "公网网络接口（默认 ${default_iface:-需手动填写}）: " iface_input
+    IFACE="${iface_input:-$default_iface}"
+    [[ -n "$IFACE" ]] || { echo "无法自动识别接口。"; return 1; }
+    read_positive "发现端口的基础下载上限" "${DOWN_MBIT:-100}"; down="$REPLY"
+    read_positive "发现端口的基础上传上限" "${UP_MBIT:-100}"; up="$REPLY"
+    if [[ "$AUTO_ENABLED" == "1" ]]; then python3 "$PY_HELPER" --restore-all; fi
+    if [[ "$AUTO_DISCOVER" != "1" && -n "$PORTS" ]]; then remove_rules "$IFACE" "$PORTS"; fi
+    PORTS=""; DOWN_MBIT="$down"; UP_MBIT="$up"; AUTO_DISCOVER=1
     AUTO_ENABLED=1
     write_config
     remove_policy_cron
@@ -154,7 +438,7 @@ enable_default_policy() {
     python="$(command -v python3)"
     printf '%s\n' "$old_cron" "*/2 * * * * $python $PY_HELPER --check >> $BASE_DIR/xui_rate_limit.log 2>&1" | crontab -
     python3 "$PY_HELPER" --check
-    echo "默认策略已启用：15 分钟内达到 3 GB 后限速 2000 KB/s（约 16 Mbps），30 分钟后恢复基础限速。"
+    echo "默认策略已启用：自动扫描 xray / ShadowsocksR 监听端口；15 分钟内达到 3 GB 后限速 2000 KB/s（约 16 Mbps），30 分钟后恢复基础限速。"
 }
 disable_default_policy() {
     read_config
@@ -176,6 +460,7 @@ install_boot_restore() {
 }
 restore_rules() {
     read_config
+    if [[ "$AUTO_DISCOVER" == "1" ]]; then python3 "$PY_HELPER" --boot; return; fi
     [[ -n "$PORTS" ]] || exit 0
     apply_rules "$IFACE" "$PORTS" "$DOWN_MBIT" "$UP_MBIT"
     if [[ "$AUTO_ENABLED" == "1" ]]; then python3 "$PY_HELPER" --boot; fi
