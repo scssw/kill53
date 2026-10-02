@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+import shlex
 import tempfile
 import time
 
@@ -32,7 +33,6 @@ THRESHOLD = 3 * 1024**3
 WINDOW = 15 * 60
 LIMIT_MBIT = 16  # 2000 KB/s
 LIMIT_SECONDS = 30 * 60
-IPV6_WARNING_SHOWN = False
 
 
 def config():
@@ -89,8 +89,8 @@ def discover_ports():
     return [str(port) for port in sorted(found)]
 
 
-def counters(dev, pref):
-    total = 0
+def all_counters(dev):
+    totals = {}
     for direction in ("ingress", "egress"):
         result = run(["tc", "-s", "filter", "show", "dev", dev, direction], True)
         active_pref = None
@@ -98,35 +98,48 @@ def counters(dev, pref):
             match = re.search(r"\bpref\s+(\d+)\b", line)
             if match:
                 active_pref = int(match.group(1))
-            if active_pref == pref:
+            if active_pref is not None:
                 sent = re.search(r"\bSent\s+(\d+)\s+bytes\b", line)
                 if sent:
-                    total += int(sent.group(1))
-    return total
+                    totals[active_pref] = totals.get(active_pref, 0) + int(sent.group(1))
+    return totals
 
 
 def set_rate(dev, port, index, down, up):
-    global IPV6_WARNING_SHOWN
     pref = 42000 + index
     for direction, rate, field in (("egress", down, "src_port"),
                                    ("ingress", up, "dst_port")):
-        for protocol, handle, family in (("tcp", 1, "ip"), ("udp", 2, "ip"),
-                                         ("tcp", 3, "ipv6"), ("udp", 4, "ipv6")):
+        for protocol, handle in (("tcp", 1), ("udp", 2)):
             args = ["tc", "filter", "replace", "dev", dev, direction,
-                    "protocol", family, "pref", str(pref), "handle", str(handle),
+                    "protocol", "ip", "pref", str(pref), "handle", str(handle),
                     "flower", "ip_proto", protocol, field, str(port), "action",
                     "police", "rate", "{}mbit".format(rate), "burst", "128k", "drop"]
             result = subprocess.run(args, text=True, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.PIPE)
             if result.returncode:
-                if family == "ipv6":
-                    if not IPV6_WARNING_SHOWN:
-                        print("警告：系统不支持 IPv6 tc 规则，当前只能对 IPv4 流量限速。tc 提示：{}".format(
-                            result.stderr.strip()))
-                        IPV6_WARNING_SHOWN = True
-                    continue
-                raise RuntimeError("tc 规则添加失败（端口 {}，{}）：{}".format(
-                    port, family, result.stderr.strip()))
+                raise RuntimeError("tc 规则添加失败（端口 {}）：{}".format(
+                    port, result.stderr.strip()))
+
+
+def set_rates_bulk(dev, rules):
+    commands = []
+    for port, index, down, up in rules:
+        pref = 42000 + index
+        for direction, rate, field in (("egress", down, "src_port"),
+                                       ("ingress", up, "dst_port")):
+            for protocol, handle in (("tcp", 1), ("udp", 2)):
+                args = ["filter", "replace", "dev", dev, direction,
+                        "protocol", "ip", "pref", str(pref), "handle", str(handle),
+                        "flower", "ip_proto", protocol, field, str(port), "action",
+                        "police", "rate", "{}mbit".format(rate), "burst", "128k", "drop"]
+                commands.append(shlex.join(args))
+    if not commands:
+        return
+    result = subprocess.run(["tc", "-batch", "-"], input="\n".join(commands) + "\n",
+                            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode:
+        raise RuntimeError("tc 批量添加规则失败：{}{}".format(
+            result.stderr.strip(), result.stdout.strip()))
 
 
 def remove_pref(dev, pref):
@@ -136,24 +149,39 @@ def remove_pref(dev, pref):
                        stderr=subprocess.DEVNULL)
 
 
+def remove_prefs(dev, indexes):
+    commands = ["filter del dev {} {} pref {}".format(dev, direction, 42000 + index)
+                for index in indexes for direction in ("ingress", "egress")]
+    if commands:
+        subprocess.run(["tc", "-force", "-batch", "-"],
+                       input="\n".join(commands) + "\n", text=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def reconcile(cfg, state, ports):
     old_ports = state.get("ports", [])
     old_iface = state.get("iface", cfg["IFACE"])
-    if old_ports == ports and old_iface == cfg["IFACE"]:
+    if state.get("version") == 2 and old_ports == ports and old_iface == cfg["IFACE"]:
         return
-    for index in range(max(len(old_ports), len(ports))):
-        remove_pref(old_iface, 42000 + index)
+    remove_prefs(old_iface, range(max(len(old_ports), len(ports))))
     subprocess.run(["tc", "qdisc", "add", "dev", cfg["IFACE"], "clsact"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    rules = []
     for index, port in enumerate(ports):
         active = state.get("active", {}).get(port)
         if active and int(time.time()) < active["until"]:
             down, up = min(cfg["down"], LIMIT_MBIT), min(cfg["up"], LIMIT_MBIT)
         else:
             down, up = cfg["down"], cfg["up"]
-        set_rate(cfg["IFACE"], port, index, down, up)
+        rules.append((port, index, down, up))
+    try:
+        set_rates_bulk(cfg["IFACE"], rules)
+    except BaseException:
+        remove_prefs(cfg["IFACE"], range(max(len(old_ports), len(ports))))
+        raise
     state["ports"] = ports
     state["iface"] = cfg["IFACE"]
+    state["version"] = 2
     state["last"] = {port: 0 for port in ports}
     state["samples"] = {port: state.get("samples", {}).get(port, []) for port in ports}
     state["active"] = {port: active for port, active in state.get("active", {}).items() if port in ports}
@@ -190,9 +218,10 @@ def main():
         print("未发现 xray 或 ShadowsocksR 监听端口")
         save(state)
         return
+    byte_counters = all_counters(cfg["IFACE"])
     for index, port in enumerate(ports):
         key = str(port)
-        value = counters(cfg["IFACE"], 42000 + index)
+        value = byte_counters.get(42000 + index, 0)
         previous = state["last"].get(key)
         delta = max(0, value - previous) if previous is not None else 0
         state["last"][key] = value
@@ -269,8 +298,7 @@ def remove_all():
     except (OSError, ValueError):
         return
     dev = state.get("iface", cfg["IFACE"])
-    for index in range(len(state.get("ports", []))):
-        remove_pref(dev, 42000 + index)
+    remove_prefs(dev, range(len(state.get("ports", []))))
     state["ports"] = []
     state["active"] = {}
     save(state)
@@ -329,8 +357,6 @@ apply_direction() {
     # Police drops packets above the cap; TCP adapts, while UDP may lose packets.
     tc filter replace dev "$dev" "$direction" protocol ip pref "$pref" handle 1 flower ip_proto tcp "$field" "$port" action police rate "${rate}mbit" burst 128k drop
     tc filter replace dev "$dev" "$direction" protocol ip pref "$pref" handle 2 flower ip_proto udp "$field" "$port" action police rate "${rate}mbit" burst 128k drop
-    tc filter replace dev "$dev" "$direction" protocol ipv6 pref "$pref" handle 3 flower ip_proto tcp "$field" "$port" action police rate "${rate}mbit" burst 128k drop
-    tc filter replace dev "$dev" "$direction" protocol ipv6 pref "$pref" handle 4 flower ip_proto udp "$field" "$port" action police rate "${rate}mbit" burst 128k drop
 }
 apply_rules() {
     local dev="$1" ports="$2" down="$3" up="$4" index=0 port
@@ -394,7 +420,7 @@ enable_limits() {
     apply_rules "$iface" "$ports" "$down" "$up"
     IFACE="$iface"; PORTS="$ports"; DOWN_MBIT="$down"; UP_MBIT="$up"; AUTO_DISCOVER=0
     write_config
-    echo "已应用：端口 $ports；每端口下载 ${down} Mbps、上传 ${up} Mbps。"
+    echo "已应用 IPv4 规则：端口 $ports；每端口下载 ${down} Mbps、上传 ${up} Mbps。"
     echo "同一端口上的用户共享该端口上限。"
 }
 show_status() {
@@ -451,7 +477,7 @@ enable_default_policy() {
     python="$(command -v python3)"
     printf '%s\n' "$old_cron" "*/2 * * * * $python $PY_HELPER --check >> $BASE_DIR/xui_rate_limit.log 2>&1" | crontab -
     python3 "$PY_HELPER" --check
-    echo "默认策略已启用：自动扫描 xray / ShadowsocksR 监听端口；15 分钟内达到 3 GB 后限速 2000 KB/s（约 16 Mbps），30 分钟后恢复基础限速。"
+    echo "默认策略已启用：自动扫描 xray / ShadowsocksR 监听端口；仅限 IPv4；15 分钟内达到 3 GB 后限速 2000 KB/s（约 16 Mbps），30 分钟后恢复基础限速。"
 }
 disable_default_policy() {
     read_config
@@ -484,8 +510,8 @@ if [[ "${1:-}" == "--check" ]]; then python3 "$PY_HELPER" --check; exit 0; fi
 while true; do
     echo
     echo "====== x-ui 端口限速管理 ======"
-    echo "1. 启用默认自动策略（15 分钟 / 3 GB / 2000 KB/s / 30 分钟恢复）"
-    echo "2. 配置/更新基础端口限速（上下行，Mbps）"
+    echo "1. 启用默认自动策略（IPv4，15 分钟 / 3 GB / 2000 KB/s / 30 分钟恢复）"
+    echo "2. 配置/更新基础端口限速（IPv4，上下行 Mbps）"
     echo "3. 查看状态"
     echo "4. 停止自动策略（保留基础限速）"
     echo "5. 移除全部端口限速规则"
