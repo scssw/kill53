@@ -32,6 +32,7 @@ THRESHOLD = 3 * 1024**3
 WINDOW = 15 * 60
 LIMIT_MBIT = 16  # 2000 KB/s
 LIMIT_SECONDS = 30 * 60
+IPV6_WARNING_SHOWN = False
 
 
 def config():
@@ -105,15 +106,27 @@ def counters(dev, pref):
 
 
 def set_rate(dev, port, index, down, up):
+    global IPV6_WARNING_SHOWN
     pref = 42000 + index
     for direction, rate, field in (("egress", down, "src_port"),
                                    ("ingress", up, "dst_port")):
         for protocol, handle, family in (("tcp", 1, "ip"), ("udp", 2, "ip"),
                                          ("tcp", 3, "ipv6"), ("udp", 4, "ipv6")):
-            run(["tc", "filter", "replace", "dev", dev, direction,
-                 "protocol", family, "pref", str(pref), "handle", str(handle),
-                 "flower", "ip_proto", protocol, field, str(port), "action",
-                 "police", "rate", "{}mbit".format(rate), "burst", "128k", "drop"])
+            args = ["tc", "filter", "replace", "dev", dev, direction,
+                    "protocol", family, "pref", str(pref), "handle", str(handle),
+                    "flower", "ip_proto", protocol, field, str(port), "action",
+                    "police", "rate", "{}mbit".format(rate), "burst", "128k", "drop"]
+            result = subprocess.run(args, text=True, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE)
+            if result.returncode:
+                if family == "ipv6":
+                    if not IPV6_WARNING_SHOWN:
+                        print("警告：系统不支持 IPv6 tc 规则，当前只能对 IPv4 流量限速。tc 提示：{}".format(
+                            result.stderr.strip()))
+                        IPV6_WARNING_SHOWN = True
+                    continue
+                raise RuntimeError("tc 规则添加失败（端口 {}，{}）：{}".format(
+                    port, family, result.stderr.strip()))
 
 
 def remove_pref(dev, pref):
