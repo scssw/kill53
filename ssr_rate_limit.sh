@@ -468,9 +468,9 @@ STATUS_PY
     if [[ "$AUTO_DISCOVER" != "1" ]]; then
         echo "当前限速端口：$PORTS（基础限速，无自动解除时间）"
     fi
-    echo "tc 规则："
-    tc filter show dev "$IFACE" ingress 2>/dev/null | grep -E 'pref 42[0-9][0-9][0-9]' || true
-    tc filter show dev "$IFACE" egress 2>/dev/null | grep -E 'pref 42[0-9][0-9][0-9]' || true
+    local tc_count
+    tc_count="$({ tc filter show dev "$IFACE" ingress 2>/dev/null || true; tc filter show dev "$IFACE" egress 2>/dev/null || true; } | grep -Ec 'pref 42[0-9][0-9][0-9]' || true)"
+    echo "tc 过滤器条目：$tc_count"
 }
 disable_limits() {
     read_config
