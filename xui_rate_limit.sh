@@ -429,21 +429,48 @@ show_status() {
     echo "配置接口：$IFACE"
     if [[ "$AUTO_DISCOVER" == "1" ]]; then
         echo "端口：自动发现 xray / ShadowsocksR 监听端口"
-        if [[ -f "$BASE_DIR/xui_rate_limit_state.json" ]]; then
-            python3 - "$BASE_DIR/xui_rate_limit_state.json" <<'STATUS_PY'
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as stream:
-    print("当前发现端口：" + ",".join(json.load(stream).get("ports", [])))
+        python3 - "$BASE_DIR/xui_rate_limit_state.json" <<'STATUS_PY'
+import datetime
+import json
+import os
+import sys
+import time
+
+state_path = sys.argv[1]
+if os.path.isfile(state_path):
+    try:
+        with open(state_path, encoding="utf-8") as stream:
+            state = json.load(stream)
+    except (OSError, ValueError):
+        state = {}
+    ports = state.get("ports", [])
+    print("当前发现端口：" + (",".join(map(str, ports)) if ports else "无"))
+    now = int(time.time())
+    active = [(str(port), item) for port, item in state.get("active", {}).items()
+              if int(item.get("until", 0)) > now]
+    if not active:
+        print("当前限速端口：无")
+    else:
+        print("当前限速端口：")
+        for port, item in sorted(active, key=lambda pair: int(pair[0])):
+            fmt = lambda stamp: datetime.datetime.fromtimestamp(int(stamp)).strftime("%Y-%m-%d %H:%M:%S")
+            print("  端口 {}：限速开始 {}，预计解除 {}".format(
+                port, fmt(item.get("started", 0)), fmt(item["until"])))
+else:
+    print("当前发现端口：暂无检测数据")
+    print("当前限速端口：暂无检测数据")
 STATUS_PY
-        fi
     else
         echo "端口：$PORTS"
     fi
     echo "每端口下载上限：${DOWN_MBIT} Mbps；上传上限：${UP_MBIT} Mbps"
     if [[ "$AUTO_ENABLED" == "1" ]]; then echo "自动策略：已启用（15 分钟 / 3 GB / 2000 KB/s / 30 分钟恢复）"; else echo "自动策略：未启用"; fi
-    echo "tc 规则："
-    tc filter show dev "$IFACE" ingress 2>/dev/null | grep -E 'pref 42[0-9][0-9][0-9]' || true
-    tc filter show dev "$IFACE" egress 2>/dev/null | grep -E 'pref 42[0-9][0-9][0-9]' || true
+    if [[ "$AUTO_DISCOVER" != "1" ]]; then
+        echo "当前限速端口：$PORTS（基础限速，无自动解除时间）"
+    fi
+    local tc_count
+    tc_count="$({ tc filter show dev "$IFACE" ingress 2>/dev/null || true; tc filter show dev "$IFACE" egress 2>/dev/null || true; } | grep -Ec 'pref 42[0-9][0-9][0-9]' || true)"
+    echo "tc 过滤器条目：$tc_count"
 }
 disable_limits() {
     read_config
@@ -509,7 +536,7 @@ if [[ "${1:-}" == "--check" ]]; then python3 "$PY_HELPER" --check; exit 0; fi
 
 while true; do
     echo
-    echo "====== x-ui 端口限速管理 ======"
+    echo "====== x-ui 端口限速管理1.0 ======"
     echo "1. 启用默认自动策略（IPv4，15 分钟 / 3 GB / 2000 KB/s / 30 分钟恢复）"
     echo "2. 配置/更新基础端口限速（IPv4，上下行 Mbps）"
     echo "3. 查看状态"
