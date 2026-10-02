@@ -16,6 +16,7 @@ REMOTE_CERT_DIR="/root/cert"
 # 本地和远程额外证书目录路径
 LOCAL_EXTRA_CERT_DIR="/usr/local/h-ui/my_acme_dir/certificates/acme.zerossl.com-v2-dv90"
 REMOTE_EXTRA_CERT_DIR="/usr/local/h-ui/my_acme_dir/certificates/acme.zerossl.com-v2-dv90"
+HOSTS_FILE="$HOME/.config/kill53-transfer/hosts"
 
 # 检查命令是否存在
 need_cmd() {
@@ -129,6 +130,44 @@ run_backup() {
   sudo /bin/bash /usr/local/SSR-Bash-Python/user/backup.sh
 }
 
+port_open() {
+  local host="$1" port="$2"
+  timeout 3 bash -c '>/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null
+}
+
+choose_host() {
+  local entries=() choice
+  if [[ -f "$HOSTS_FILE" ]]; then
+    mapfile -t entries < <(awk 'NF && !seen[$0]++' "$HOSTS_FILE")
+  fi
+  if (( ${#entries[@]} )); then
+    echo "已保存的目标 IP："
+    for i in "${!entries[@]}"; do echo "$((i+1))) ${entries[$i]}"; done
+    echo "$(( ${#entries[@]} + 1 ))) 输入新的 IP"
+    read -r -p "输入编号选择目标: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#entries[@]} )); then
+      remote_ip="${entries[$((choice-1))]}"
+      return
+    elif [[ "$choice" != "$(( ${#entries[@]} + 1 ))" ]]; then
+      echo "无效选择。" >&2; exit 1
+    fi
+  fi
+  read -r -p "远程 IP 地址: " remote_ip
+  [[ -n "$remote_ip" ]] || { echo "远程 IP 地址是必需的。" >&2; exit 1; }
+}
+
+save_host() {
+  mkdir -p "$(dirname "$HOSTS_FILE")"
+  touch "$HOSTS_FILE"
+  if ! grep -Fxq "$remote_ip" "$HOSTS_FILE"; then printf '%s\n' "$remote_ip" >> "$HOSTS_FILE"; fi
+  chmod 600 "$HOSTS_FILE"
+}
+
+remote_restart() {
+  local service="$1"
+  ssh -p "$remote_port" "${remote_user}@${remote_ip}" "/bin/systemctl restart '${service}'"
+}
+
 # 主函数
 main() {
   if [[ "$(id -u)" -ne 0 ]]; then
@@ -138,15 +177,12 @@ main() {
   ensure_rsync
   ensure_ssh_key
 
-  # 读取远程 IP 地址
-  read -r -p "远程 IP 地址: " remote_ip
-  if [[ -z "$remote_ip" ]]; then
-    echo "远程 IP 地址是必需的。" >&2
-    exit 1
+  choose_host
+  remote_port=22
+  if ! port_open "$remote_ip" "$remote_port"; then
+    echo "${remote_ip}:22 无法连接。"
+    read -r -p "请输入对方 SSH 端口: " remote_port
   fi
-
-  read -r -p "对方 SSH 端口（默认 22；如果不是 22 请输入实际端口）: " remote_port
-  remote_port="${remote_port:-22}"
   if [[ ! "$remote_port" =~ ^[0-9]+$ ]] || (( remote_port < 1 || remote_port > 65535 )); then
     echo "无效端口：请输入 1-65535 之间的数字。" >&2
     exit 1
@@ -156,6 +192,7 @@ main() {
 
   # 设置密钥认证
   setup_key_auth "$remote_user" "$remote_ip" "$remote_port"
+  save_host
 
   # 选择传输类型（支持多个数字，用空格分隔，如 "1 3 4"）
   echo "选择传输类型:"
@@ -209,14 +246,16 @@ main() {
       1)
         echo "=== 正在转移 ssr 包 ==="
         require_file "$LOCAL_SSR"
-        ssh -p "$remote_port" "${remote_user}@${remote_ip}" "mkdir -p /root/backup"
-        rsync -avz -e "ssh -p $remote_port" "$LOCAL_SSR" "${remote_user}@${remote_ip}:$REMOTE_SSR"
+        ssh -p "$remote_port" "${remote_user}@${remote_ip}" "mkdir -p /root/backup; stamp=\$(date +%Y%m%d%H%M%S); for f in /usr/local/shadowsocksr/mudb.json /usr/local/SSR-Bash-Python/timelimit.db; do if [ -f \$f ]; then cp -a \$f \$f.before-transfer.\$stamp; fi; done; if [ -f '$REMOTE_SSR' ]; then cp -a '$REMOTE_SSR' '$REMOTE_SSR.before-transfer.'\$stamp; fi"
+        rsync -avz -e "ssh -p $remote_port" "$LOCAL_SSR" "${remote_user}@${remote_ip}:/root/backup/ssr-conf.incoming.tar.gz"
+        ssh -p "$remote_port" "${remote_user}@${remote_ip}" "set -e; a=/root/backup/ssr-conf.incoming.tar.gz; tar -tzf \$a | grep -Fxq './mudb.json'; tar -tzf \$a | grep -Fxq './timelimit.db'; mkdir -p /usr/local/shadowsocksr /usr/local/SSR-Bash-Python; tar -xOf \$a ./mudb.json > /usr/local/shadowsocksr/mudb.json.new; chmod 600 /usr/local/shadowsocksr/mudb.json.new; mv /usr/local/shadowsocksr/mudb.json.new /usr/local/shadowsocksr/mudb.json; tar -xOf \$a ./timelimit.db > /usr/local/SSR-Bash-Python/timelimit.db.new; chmod 755 /usr/local/SSR-Bash-Python/timelimit.db.new; mv /usr/local/SSR-Bash-Python/timelimit.db.new /usr/local/SSR-Bash-Python/timelimit.db; mv \$a '$REMOTE_SSR'; /bin/systemctl restart ssr-bash-python.service"
         ;;
       2)
         echo "=== 正在转移 hui 包 ==="
         require_file "$LOCAL_HUI"
-        ssh -p "$remote_port" "${remote_user}@${remote_ip}" "mkdir -p /usr/local/h-ui/data"
+        ssh -p "$remote_port" "${remote_user}@${remote_ip}" "mkdir -p /usr/local/h-ui/data; if [ -f '$REMOTE_HUI' ]; then cp -a '$REMOTE_HUI' '$REMOTE_HUI.before-transfer.'\$(date +%Y%m%d%H%M%S); fi"
         rsync -avz -e "ssh -p $remote_port" "$LOCAL_HUI" "${remote_user}@${remote_ip}:$REMOTE_HUI"
+        remote_restart h-ui
         ;;
       3)
         echo "=== 正在转移证书目录 ==="
@@ -236,8 +275,9 @@ main() {
       4)
         echo "=== 正在转移 xui 数据库 ==="
         require_file "$LOCAL_XUI"
-        ssh -p "$remote_port" "${remote_user}@${remote_ip}" "mkdir -p /etc/x-ui"
+        ssh -p "$remote_port" "${remote_user}@${remote_ip}" "mkdir -p /etc/x-ui; if [ -f '$REMOTE_XUI' ]; then cp -a '$REMOTE_XUI' '$REMOTE_XUI.before-transfer.'\$(date +%Y%m%d%H%M%S); fi"
         rsync -avz -e "ssh -p $remote_port" "$LOCAL_XUI" "${remote_user}@${remote_ip}:$REMOTE_XUI"
+        remote_restart x-ui
         ;;
     esac
   done
