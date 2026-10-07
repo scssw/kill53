@@ -314,7 +314,18 @@ delete_task() {
   fi
   printf '\n已有域名数据：\n'
   print_domain_list
-  choose_domain_by_index
+  printf '0) 返回主菜单\n'
+  local choice
+  while true; do
+    choice="$(read_input '选择要删除的域名序号> ')"
+    if [[ "$choice" == "0" ]]; then
+      printf '已取消删除。\n'
+      return
+    fi
+    [[ "$choice" =~ ^[1-9][0-9]*$ ]] && ((choice <= ${#ALL_CONF_FILES[@]})) || { printf '序号无效，请输入 0 到 %d。\n' "${#ALL_CONF_FILES[@]}" >&2; continue; }
+    SELECTED_CONFIG="${ALL_CONF_FILES[$((choice-1))]}"
+    break
+  done
   local name
   name="$(awk -F= '/^DOMAIN_NAME=/{sub(/^[^=]*=/,""); gsub(/^\047|\047$/,"",$0); print; exit}' "$SELECTED_CONFIG")"
   printf '确认删除 %s 的启停任务？(y/N) ' "$name" >&2
