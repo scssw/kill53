@@ -162,26 +162,58 @@ domain_key() {
   printf '%s' "$1" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16])'
 }
 
-choose_saved_domain() {
-  local -a files=() names=()
-  local f name n choice
+# 列出所有已保存的域名，返回 0 表示有数据；通过全局数组 ALL_CONF_FILES 输出
+list_saved_domains() {
+  local -a files=()
+  local f
   shopt -s nullglob
   files=("$DOMAINS_DIR"/*.conf)
   shopt -u nullglob
+  ALL_CONF_FILES=()
   ((${#files[@]})) || return 1
-  printf '\n已有域名数据：\n'
   for f in "${files[@]}"; do
-    name="$(awk -F= '/^DOMAIN_NAME=/{sub(/^[^=]*=/,""); gsub(/^\047|\047$/,"",$0); print; exit}' "$f")"
-    names+=("$name")
-    printf '%d) %s\n' "${#names[@]}" "$name"
+    ALL_CONF_FILES+=("$f")
   done
-  printf '%d) 输入新域名数据\n' "$(( ${#files[@]} + 1 ))"
+  return 0
+}
+
+# 打印已有域名列表（带序号），供各菜单复用
+print_domain_list() {
+  local f name i=1
+  for f in "${ALL_CONF_FILES[@]}"; do
+    name="$(awk -F= '/^DOMAIN_NAME=/{sub(/^[^=]*=/,""); gsub(/^\047|\047$/,"",$0); print; exit}' "$f")"
+    printf '%d) %s\n' "$i" "$name"
+    i=$((i+1))
+  done
+}
+
+# 根据序号选择已有域名配置，成功返回 0 并设置 SELECTED_CONFIG
+choose_domain_by_index() {
+  local choice
   while true; do
     choice="$(read_input '选择序号> ')"
-    [[ "$choice" =~ ^[1-9][0-9]*$ ]] && ((choice <= ${#files[@]}+1)) || { printf '序号无效。\n' >&2; continue; }
-    if (( choice <= ${#files[@]} )); then SELECTED_CONFIG="${files[$((choice-1))]}"; return 0; fi
-    return 1
+    [[ "$choice" =~ ^[1-9][0-9]*$ ]] && ((choice <= ${#ALL_CONF_FILES[@]})) || { printf '序号无效，请输入 1 到 %d。\n' "${#ALL_CONF_FILES[@]}" >&2; continue; }
+    SELECTED_CONFIG="${ALL_CONF_FILES[$((choice-1))]}"
+    return 0
   done
+}
+
+choose_saved_domain() {
+  local choice
+  list_saved_domains || true
+  if ((${#ALL_CONF_FILES[@]})); then
+    printf '\n已有域名数据：\n'
+    print_domain_list
+    printf '%d) 输入新域名数据\n' "$(( ${#ALL_CONF_FILES[@]} + 1 ))"
+    while true; do
+      choice="$(read_input '选择序号> ')"
+      [[ "$choice" =~ ^[1-9][0-9]*$ ]] && ((choice <= ${#ALL_CONF_FILES[@]}+1)) || { printf '序号无效。\n' >&2; continue; }
+      if (( choice <= ${#ALL_CONF_FILES[@]} )); then SELECTED_CONFIG="${ALL_CONF_FILES[$((choice-1))]}"; return 0; fi
+      return 1
+    done
+  else
+    return 1
+  fi
 }
 
 create_task() {
@@ -197,12 +229,17 @@ create_task() {
     record_id="$RECORD_ID"; domain="$DOMAIN_NAME"; ip="$RECORD_VALUE"
     printf '\n已选择 %s（RecordId: %s），直接设置启停时间即可。\n' "$domain" "$record_id"
   else
-  printf '\n请输入阿里云 AccessKeyId：\n'
+  printf '\n请输入阿里云 AccessKey（支持直接粘贴两行：\n  accessKeyId LTAI5t...\n  accessKeySecret YHkOX...\n回车即可自动识别）：\n'
   key_id="$(read_input 'AccessKeyId> ')"
-  [[ "$key_id" == *' '* ]] && key_id="${key_id##* }"
+  # 支持粘贴 "accessKeyId LTAI5t..." 整行，自动提取 key
+  key_id="$(sed -E 's/^[[:space:]]*(accessKeyId|access_key_id|AccessKeyId)[[:space:]]+//i' <<<"$key_id")"
+  key_id="${key_id%%$'\n'*}"
+  key_id="$(sed -E 's/[[:space:]]+$//' <<<"$key_id")"
   [[ -n "$key_id" ]] || die 'AccessKeyId 不能为空。'
   key_secret="$(read_input 'AccessKeySecret> ')"
-  [[ "$key_secret" == *' '* ]] && key_secret="${key_secret##* }"
+  key_secret="$(sed -E 's/^[[:space:]]*(accessKeySecret|access_key_secret|AccessKeySecret)[[:space:]]+//i' <<<"$key_secret")"
+  key_secret="${key_secret%%$'\n'*}"
+  key_secret="$(sed -E 's/[[:space:]]+$//' <<<"$key_secret")"
   [[ -n "$key_secret" ]] || die 'AccessKeySecret 不能为空。'
   printf '\n请粘贴完整 JSON 响应（支持多行，粘贴完会自动识别结束）：\n'
   pasted="$(read_json_block 'JSON> ')"
@@ -270,21 +307,105 @@ EOF
 
 delete_task() {
   need_cmd crontab
-  remove_managed_cron
-  rm -f "$CONFIG_DIR/Enable.sh" "$CONFIG_DIR/Disable.sh" "$CONFIG_FILE"
-  rm -rf "$DOMAINS_DIR"
-  rmdir "$CONFIG_DIR" 2>/dev/null || true
-  printf '已删除阿里 DNS 分流定时任务及本地配置。\n'
+  list_saved_domains || true
+  if ((${#ALL_CONF_FILES[@]} == 0)); then
+    printf '没有已保存的域名数据。\n'
+    return
+  fi
+  printf '\n已有域名数据：\n'
+  print_domain_list
+  choose_domain_by_index
+  local name
+  name="$(awk -F= '/^DOMAIN_NAME=/{sub(/^[^=]*=/,""); gsub(/^\047|\047$/,"",$0); print; exit}' "$SELECTED_CONFIG")"
+  printf '确认删除 %s 的启停任务？(y/N) ' "$name" >&2
+  local confirm
+  IFS= read -r confirm || true
+  [[ "$confirm" =~ ^[Yy]$ ]] || { printf '已取消。\n'; return; }
+  # 从 crontab 中移除该域名的任务行
+  local config_name
+  config_name="${SELECTED_CONFIG##*/}"
+  local current
+  current="$(crontab -l 2>/dev/null || true)"
+  printf '%s\n' "$current" | awk -v conf="$config_name" 'index($0,conf)==0' | crontab -
+  rm -f "$SELECTED_CONFIG"
+  # 如果没有任何域名配置了，清理公共脚本
+  list_saved_domains || true
+  if ((${#ALL_CONF_FILES[@]} == 0)); then
+    rm -f "$CONFIG_DIR/Enable.sh" "$CONFIG_DIR/Disable.sh" "$CONFIG_FILE"
+    rmdir "$DOMAINS_DIR" 2>/dev/null || true
+    rmdir "$CONFIG_DIR" 2>/dev/null || true
+  fi
+  printf '已删除 %s 的启停任务。\n' "$name"
+}
+
+modify_task() {
+  need_cmd crontab
+  list_saved_domains || true
+  if ((${#ALL_CONF_FILES[@]} == 0)); then
+    printf '没有已保存的域名数据，请先创建任务。\n'
+    return
+  fi
+  printf '\n已有域名数据：\n'
+  print_domain_list
+  choose_domain_by_index
+  local name
+  name="$(awk -F= '/^DOMAIN_NAME=/{sub(/^[^=]*=/,""); gsub(/^\047|\047$/,"",$0); print; exit}' "$SELECTED_CONFIG")"
+  printf '\n修改 %s 的启停时间：\n' "$name"
+  local on_hour off_hour
+  on_hour="$(read_hour '输入开启小时（0-23）> ')"
+  while true; do
+    off_hour="$(read_hour '输入关闭小时（0-23）> ')"
+    [[ "$on_hour" != "$off_hour" ]] && break
+    printf '开启和关闭时间不能相同，请重新输入关闭时间。\n'
+  done
+  local config
+  config="$SELECTED_CONFIG"
+  local config_name
+  config_name="${config##*/}"
+  # 移除该域名的旧 cron 行，再按新时间写入
+  local current
+  current="$(crontab -l 2>/dev/null || true)"
+  {
+    printf '%s\n' "$current" | awk -v tag="$CRON_TAG" -v conf="$config_name" 'index($0,tag)==0 || index($0,conf)==0'
+    printf '0 * * * * TZ=Asia/Shanghai %s/Enable.sh %s %s >> %s/%s.log 2>&1 %s\n' "$CONFIG_DIR" "$config" "$on_hour" "$CONFIG_DIR" "$config_name" "$CRON_TAG"
+    printf '0 * * * * TZ=Asia/Shanghai %s/Disable.sh %s %s >> %s/%s.log 2>&1 %s\n' "$CONFIG_DIR" "$config" "$off_hour" "$CONFIG_DIR" "$config_name" "$CRON_TAG"
+  } | crontab -
+  printf '\n已修改 %s：每天北京时间 %02d:00 开启、%02d:00 关闭。\n' "$name" "$on_hour" "$off_hour"
+}
+
+list_tasks() {
+  list_saved_domains || true
+  if ((${#ALL_CONF_FILES[@]} == 0)); then
+    printf '当前没有任何启停任务。\n'
+    return
+  fi
+  local current name on_line off_line on_h off_h f
+  current="$(crontab -l 2>/dev/null || true)"
+  printf '\n当前已配置的启停任务：\n'
+  for f in "${ALL_CONF_FILES[@]}"; do
+    name="$(awk -F= '/^DOMAIN_NAME=/{sub(/^[^=]*=/,""); gsub(/^\047|\047$/,"",$0); print; exit}' "$f")"
+    on_line="$(printf '%s\n' "$current" | grep -F "$f" | grep -F 'Enable.sh' || true)"
+    off_line="$(printf '%s\n' "$current" | grep -F "$f" | grep -F 'Disable.sh' || true)"
+    on_h="$(printf '%s' "$on_line" | awk '{print $(NF-2)}')"
+    off_h="$(printf '%s' "$off_line" | awk '{print $(NF-2)}')"
+    printf '  %s：每天北京时间 %s:00 开启、%s:00 关闭（配置：%s）\n' \
+      "$name" "${on_h:-?}" "${off_h:-?}" "$f"
+  done
 }
 
 main() {
-  printf '\n阿里 DNS 分流启停\n1、创建启停任务\n2、删除任务\n'
   local choice
-  choice="$(read_input '请选择> ')"
-  case "$choice" in
-    1) create_task ;;
-    2) delete_task ;;
-    *) die '请选择 1 或 2。' ;;
-  esac
+  while true; do
+    printf '\n========== 阿里 DNS 分流启停管理 ==========\n1、创建启停任务\n2、删除任务\n3、修改任务时间\n4、查看任务\n0、退出\n'
+    choice="$(read_input '请选择> ')"
+    case "$choice" in
+      1) create_task ;;
+      2) delete_task ;;
+      3) modify_task ;;
+      4) list_tasks ;;
+      0) printf '再见。\n'; return 0 ;;
+      *) printf '无效选项，请输入 0-4。\n' >&2 ;;
+    esac
+  done
 }
 main "$@"
