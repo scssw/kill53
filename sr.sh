@@ -150,6 +150,18 @@ StopInstall(){
 #Get Current Directory
 workdir=$(pwd)
 
+# 修复SSH配置，防止远程连接不上
+FixSshConfig(){
+    if [ -f /etc/ssh/sshd_config ];then
+        echo "检查并修复SSH配置..."
+        grep -E "PubkeyAuthentication|AuthorizedKeysFile|PasswordAuthentication" /etc/ssh/sshd_config
+        sed -i 's/^PubkeyAuthentication no/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+        systemctl restart sshd && echo "Done"
+    else
+        echo "未找到 /etc/ssh/sshd_config，跳过SSH配置修复"
+    fi
+}
+
 InstallPython3(){
     if command -v python3 >/dev/null 2>&1;then
         echo "检测到 python3，跳过安装: $(command -v python3)"
@@ -191,7 +203,7 @@ if [[ ${OS} == Ubuntu ]];then
     apt-get -y install screen
     apt-get install git -y
     #apt-get install language-pack-zh-hans -y
-    apt-get -y install bc vnstat
+    apt-get -y install bc vnstat rsync
     #apt-get -y install build-essential
     #apt-get install net-tools -y
 fi
@@ -200,6 +212,7 @@ if [[ ${OS} == CentOS ]];then
     yum install git -y
     yum install bc -y
     yum install vnstat -y
+    yum install rsync -y
     #yum install net-tools -y
     yum groupinstall "Development Tools" -y
     yum install vixie-cron crontabs -y
@@ -209,13 +222,14 @@ if [[ ${OS} == Debian ]];then
     apt-get -y install screen
     apt-get install git -y
     #apt-get -y install net-tools
-    apt-get -y install bc vnstat
+    apt-get -y install bc vnstat rsync
     #apt-get install build-essential -y
     #apt-get install cron -y
     # 安装iptables
     apt-get -y install iptables curl
 fi
 install_status=$?
+FixSshConfig
 SetupSSRLegacyIptables
 if [[ ${install_status} != 0 ]];then
     echo "安装失败，请稍候重试！"
