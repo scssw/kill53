@@ -454,7 +454,7 @@ list_tasks() {
 main() {
   local choice
   while true; do
-    printf '\n========== 阿里 DNS 分流启停管理 ==========\n1、创建启停任务\n2、删除任务\n3、修改任务\n4、查看任务\n0、退出\n'
+    printf '\n========== 阿里 DNS 分流启停管理1.0.1 ==========\n1、创建启停任务\n2、删除任务\n3、修改任务\n4、查看任务\n0、退出\n'
     choice="$(read_input '请选择> ')"
     case "$choice" in
       1) create_task ;;
