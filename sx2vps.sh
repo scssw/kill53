@@ -584,11 +584,144 @@ def database_snapshot():
             pass
 
 
+def parse_settings(settings_raw):
+    if not settings_raw:
+        return {}
+    if isinstance(settings_raw, dict):
+        return settings_raw
+    try:
+        return json.loads(settings_raw)
+    except (ValueError, TypeError):
+        return {}
+
+
+def adopt_replica_data(db, remote_tables):
+    """Sync and adopt any new inbounds or clients created on the replica into master DB."""
+    remote_inbounds = remote_tables.get('inbounds', [])
+    remote_clients = remote_tables.get('client_traffics', [])
+
+    master_inbounds = rows(db, 'inbounds')
+    master_clients = rows(db, 'client_traffics')
+
+    master_inbounds_by_port = {r.get('port'): r for r in master_inbounds if r.get('port')}
+    master_clients_by_email = {str(r.get('email', '')): r for r in master_clients if r.get('email')}
+
+    inbound_cols = table_columns(db, 'inbounds')
+    client_cols = table_columns(db, 'client_traffics')
+    changed = False
+
+    # 1. Adopt entire new inbounds created on replica
+    for peer_inbound in remote_inbounds:
+        port = peer_inbound.get('port')
+        if not port or port in master_inbounds_by_port:
+            continue
+        new_inbound = dict(peer_inbound)
+        for c in INBOUND_COUNTERS:
+            if c in new_inbound:
+                new_inbound[c] = 0
+        insert_cols = [c for c in inbound_cols if c != 'id' and c in new_inbound]
+        marks = ','.join('?' for _ in insert_cols)
+        names = ','.join('"%s"' % c for c in insert_cols)
+        cur = db.execute('INSERT INTO "inbounds" (%s) VALUES (%s)' % (names, marks),
+                         [new_inbound.get(c) for c in insert_cols])
+        new_inbound_id = cur.lastrowid
+        new_inbound['id'] = new_inbound_id
+        master_inbounds_by_port[port] = new_inbound
+        changed = True
+        print('已从副机同步并采纳新入站线路：端口 %s' % port)
+
+    if changed:
+        master_inbounds = rows(db, 'inbounds')
+        master_inbounds_by_port = {r.get('port'): r for r in master_inbounds if r.get('port')}
+
+    # 2. Adopt new clients inside inbounds settings and client_traffics
+    for peer_inbound in remote_inbounds:
+        port = peer_inbound.get('port')
+        if not port or port not in master_inbounds_by_port:
+            continue
+
+        local_inbound = master_inbounds_by_port[port]
+        local_settings = parse_settings(local_inbound.get('settings'))
+        peer_settings = parse_settings(peer_inbound.get('settings'))
+
+        local_clients = local_settings.get('clients', [])
+        peer_clients = peer_settings.get('clients', [])
+
+        existing_keys = set()
+        for c in local_clients:
+            for k in ('email', 'id', 'password'):
+                val = str(c.get(k) or '').strip()
+                if val:
+                    existing_keys.add(val)
+
+        new_clients_to_add = []
+        for c in peer_clients:
+            c_email = str(c.get('email') or '').strip()
+            c_id = str(c.get('id') or '').strip()
+            c_pwd = str(c.get('password') or '').strip()
+            if ((c_email and c_email in existing_keys) or
+                    (c_id and c_id in existing_keys) or
+                    (c_pwd and c_pwd in existing_keys)):
+                continue
+            new_clients_to_add.append(c)
+            if c_email: existing_keys.add(c_email)
+            if c_id: existing_keys.add(c_id)
+            if c_pwd: existing_keys.add(c_pwd)
+
+        if new_clients_to_add:
+            local_clients.extend(new_clients_to_add)
+            local_settings['clients'] = local_clients
+            new_settings_str = json.dumps(local_settings, ensure_ascii=False)
+            db.execute('UPDATE "inbounds" SET "settings"=? WHERE "id"=?',
+                       [new_settings_str, local_inbound['id']])
+            local_inbound['settings'] = new_settings_str
+            changed = True
+            print('端口 %s 线路已从副机同步并采纳 %d 个新客户端' % (port, len(new_clients_to_add)))
+
+        for peer_ct in remote_clients:
+            if peer_ct.get('inbound_id') == peer_inbound.get('id'):
+                ct_email = str(peer_ct.get('email') or '').strip()
+                if ct_email and ct_email not in master_clients_by_email:
+                    new_ct = dict(peer_ct)
+                    new_ct['inbound_id'] = local_inbound['id']
+                    for ctr in CLIENT_COUNTERS:
+                        if ctr in new_ct:
+                            new_ct[ctr] = 0
+                    insert_cols = [c for c in client_cols if c != 'id' and c in new_ct]
+                    marks = ','.join('?' for _ in insert_cols)
+                    names = ','.join('"%s"' % c for c in insert_cols)
+                    db.execute('INSERT INTO "client_traffics" (%s) VALUES (%s)' % (names, marks),
+                               [new_ct.get(c) for c in insert_cols])
+                    master_clients_by_email[ct_email] = new_ct
+                    changed = True
+
+    return changed
+
+
 def push(force=False):
     peer_status()
     c = config()
     if c.get('role') != 'master':
         raise RuntimeError('当前未设为主机')
+
+    # Check replica to adopt any new clients or inbounds created on replica
+    try:
+        remote_raw = ssh(c['peer'], BIN + ' snapshot')
+        remote = json.loads(remote_raw).get('tables', {})
+        with open_db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                if adopt_replica_data(db, remote):
+                    db.commit()
+                    subprocess.run(['systemctl', 'restart', 'x-ui'], check=False)
+                else:
+                    db.rollback()
+            except Exception:
+                db.rollback()
+                raise
+    except Exception:
+        pass
+
     payload = database_snapshot()
     signature = config_signature(payload)
     signature_path = STATE / 'config.sha256'
@@ -602,15 +735,15 @@ def push(force=False):
 
 
 def config_signature(payload):
-    """Hash only settings that define inbounds/clients, not changing counters."""
+    """Hash only settings that define inbounds/clients, ignoring volatile counters and timestamps."""
     stable = {'tables': {}, 'columns': payload['columns']}
-    counters = {
+    volatile_fields = {
         'inbounds': set(INBOUND_COUNTERS) | {'last_traffic_reset_time'},
-        'client_traffics': set(CLIENT_COUNTERS),
+        'client_traffics': set(CLIENT_COUNTERS) | {'last_sub_fetch', 'updated_at', 'created_at'},
     }
     for table in TABLES:
         stable['tables'][table] = [
-            {k: v for k, v in row.items() if k not in counters[table]}
+            {k: v for k, v in row.items() if k not in volatile_fields[table]}
             for row in payload['tables'][table]
         ]
     encoded = json.dumps(stable, ensure_ascii=False, sort_keys=True,
@@ -626,21 +759,35 @@ def apply_config():
            for t in TABLES):
         raise RuntimeError('收到的配置数据格式无效')
     with open_db() as db:
-        # Refuse incompatible panel schemas rather than partially replacing data.
         for table in TABLES:
             if set(table_columns(db, table)) != set(columns[table]):
                 raise RuntimeError('主副机 %s 表结构不一致，请先统一 3xs/x-ui 版本' % table)
         db.execute('BEGIN IMMEDIATE')
         try:
-            # Lock before reading counters so traffic written during the sync
-            # cannot be lost between the read and the table replacement.
             local = {t: rows(db, t) for t in TABLES}
-            old_clients = {str(x.get('email', '')): x for x in local['client_traffics']}
-            old_inbounds = {str(x.get('tag', x.get('id', ''))): x for x in local['inbounds']}
-            # Delete dependents first, then restore parent rows before children.
+
+            local_inbounds_by_id = {r['id']: r for r in local['inbounds'] if 'id' in r}
+            old_inbounds = {r.get('port') or r.get('id'): r for r in local['inbounds']}
+
+            old_clients = {}
+            for r in local['client_traffics']:
+                email = str(r.get('email') or '').strip()
+                inbound_id = r.get('inbound_id')
+                port = ''
+                if inbound_id in local_inbounds_by_id:
+                    port = str(local_inbounds_by_id[inbound_id].get('port') or '')
+                if email and port:
+                    old_clients[f"{port}_{email}"] = r
+                if email:
+                    old_clients[email] = r
+                if 'id' in r:
+                    old_clients[f"id_{r['id']}"] = r
+
             for table in ('client_traffics', 'inbounds'):
-                cols = table_columns(db, table)
                 db.execute('DELETE FROM "%s"' % table)
+
+            incoming_inbounds_by_id = {r['id']: r for r in incoming.get('inbounds', []) if 'id' in r}
+
             for table in ('inbounds', 'client_traffics'):
                 cols = table_columns(db, table)
                 if not incoming[table]:
@@ -649,13 +796,24 @@ def apply_config():
                 names = ','.join('"%s"' % x for x in cols)
                 for row in incoming[table]:
                     item = dict(row)
-                    previous = (old_inbounds.get(str(item.get('tag', item.get('id', ''))), {})
-                                if table == 'inbounds' else
-                                old_clients.get(str(item.get('email', '')), {}))
+                    if table == 'inbounds':
+                        previous = old_inbounds.get(item.get('port') or item.get('id'), {})
+                    else:
+                        email = str(item.get('email') or '').strip()
+                        inbound_id = item.get('inbound_id')
+                        port = ''
+                        if inbound_id in incoming_inbounds_by_id:
+                            port = str(incoming_inbounds_by_id[inbound_id].get('port') or '')
+                        previous = (old_clients.get(f"{port}_{email}") or
+                                    old_clients.get(email) or
+                                    old_clients.get(f"id_{item.get('id')}") or {})
+
                     counters = INBOUND_COUNTERS if table == 'inbounds' else CLIENT_COUNTERS
                     for key in counters:
                         if key in item:
-                            item[key] = previous.get(key, 0)
+                            val = previous.get(key)
+                            item[key] = int(val) if val is not None else 0
+
                     db.execute('INSERT INTO "%s" (%s) VALUES (%s)' % (table, names, marks),
                                [item.get(k) for k in cols])
             db.commit()
@@ -663,8 +821,6 @@ def apply_config():
             db.rollback()
             raise
     print('副机已应用入站/用户配置，副机已有流量累计值保留。')
-    # x-ui keeps the active Xray runtime in memory; restart it after the DB
-    # transaction commits so new, changed, and deleted inbounds take effect.
     subprocess.run(['systemctl', 'restart', 'x-ui'], check=True)
     print('副机 x-ui 已重启，新线路配置已生效。')
 
@@ -674,10 +830,25 @@ def snapshot():
     print(json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
 
 
-def key_for(table, row):
-    if table == 'client_traffics':
-        return str(row.get('email', ''))
-    return str(row.get('tag', row.get('id', '')))
+def make_row_key(table, row, inbounds_by_id=None):
+    if table == 'inbounds':
+        port = row.get('port')
+        if port:
+            return f"port_{port}"
+        tag = str(row.get('tag') or '').strip()
+        if tag:
+            return f"tag_{tag}"
+        return f"id_{row.get('id')}"
+    elif table == 'client_traffics':
+        email = str(row.get('email') or '').strip()
+        inbound_id = row.get('inbound_id')
+        port = ''
+        if inbounds_by_id and inbound_id in inbounds_by_id:
+            port = str(inbounds_by_id[inbound_id].get('port') or '')
+        if email:
+            return f"email_{port}_{email}" if port else f"email_{email}"
+        return f"id_{inbound_id}_{row.get('id')}"
+    return str(row.get('id'))
 
 
 def merge_traffic():
@@ -696,12 +867,18 @@ def merge_traffic():
         table_info = {t: table_columns(db, t) for t in TABLES}
         db.execute('BEGIN IMMEDIATE')
         try:
+            # 1. Adopt any new clients/inbounds added on replica
+            adopted = adopt_replica_data(db, remote)
+
             master = {t: rows(db, t) for t in TABLES}
-            local_map = {t: {key_for(t, r): r for r in master[t]} for t in TABLES}
+            inbounds_by_id = {r['id']: r for r in master['inbounds'] if 'id' in r}
+            local_map = {t: {make_row_key(t, r, inbounds_by_id): r for r in master[t]} for t in TABLES}
+            peer_inbounds_by_id = {r['id']: r for r in remote.get('inbounds', []) if 'id' in r}
+
             for table in TABLES:
                 counters = INBOUND_COUNTERS if table == 'inbounds' else CLIENT_COUNTERS
                 for peer_row in remote.get(table, []):
-                    key = key_for(table, peer_row)
+                    key = make_row_key(table, peer_row, peer_inbounds_by_id)
                     if not key or key not in local_map[table]:
                         continue
                     matched += 1
@@ -713,22 +890,22 @@ def merge_traffic():
                             continue
                         current = max(0, int(peer_row.get(field) or 0))
                         previous = max(0, int(old.get(field, 0) or 0))
-                        # Add only the replica's unmerged delta to the master's
-                        # current value; never replace master usage with replica totals.
                         delta = max(0, current - previous)
                         if delta:
-                            new_value = max(0, int(local_row.get(field) or 0)) + delta
+                            current_local = max(0, int(local_row.get(field) or 0))
+                            new_value = current_local + delta
                             changed[field] = new_value
+                            local_row[field] = new_value
                         if table == 'client_traffics' and field in totals:
                             totals[field] += delta
                         old[field] = current
                     if changed:
                         assignments = ','.join('"%s"=?' % x for x in changed)
-                        db.execute('UPDATE "%s" SET %s WHERE "%s"=?' %
-                                   (table, assignments,
-                                    'email' if table == 'client_traffics' else 'tag'),
-                                   list(changed.values()) + [key])
+                        db.execute('UPDATE "%s" SET %s WHERE "id"=?' % (table, assignments),
+                                   list(changed.values()) + [local_row['id']])
             db.commit()
+            if adopted:
+                subprocess.run(['systemctl', 'restart', 'x-ui'], check=False)
         except Exception:
             db.rollback()
             raise
