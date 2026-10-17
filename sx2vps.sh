@@ -1094,7 +1094,7 @@ trap - EXIT HUP INT TERM
 printf '\n当前同步状态：\n'
 /usr/local/bin/ssr2vps status-report
 /usr/local/bin/xui2vps status-report
-printf '\n主菜单 v1.0.1：\n1、SSR 同步\n2、XUI 同步\n3、同步时间修改\n0、退出\n请选择: '
+printf '\n主菜单 v1.0.2：\n1、SSR 同步\n2、XUI 同步\n3、同步时间修改\n0、退出\n请选择: '
 IFS= read -r choice || choice=
 case "$choice" in
     1) exec /usr/local/bin/ssr2vps menu ;;
