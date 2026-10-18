@@ -502,6 +502,8 @@ def peer_status():
 def apply_peer_unbind():
     disable_units()
     CONFIG.unlink(missing_ok=True)
+    for p in (STATE / 'last_sync.json', STATE / 'config.sha256', STATE / 'ledger.json'):
+        p.unlink(missing_ok=True)
 
 
 def ssh(target, command, stdin=None):
@@ -595,107 +597,344 @@ def parse_settings(settings_raw):
         return {}
 
 
-def adopt_replica_data(db, remote_tables):
-    """Sync and adopt any new inbounds or clients created on the replica into master DB."""
-    remote_inbounds = remote_tables.get('inbounds', [])
-    remote_clients = remote_tables.get('client_traffics', [])
+def client_key(c):
+    for k in ('email', 'id', 'password'):
+        val = str(c.get(k) or '').strip()
+        if val:
+            return val
+    return ''
 
-    master_inbounds = rows(db, 'inbounds')
-    master_clients = rows(db, 'client_traffics')
 
-    master_inbounds_by_port = {r.get('port'): r for r in master_inbounds if r.get('port')}
-    master_clients_by_email = {str(r.get('email', '')): r for r in master_clients if r.get('email')}
+def extract_sync_state(tables):
+    inbounds = tables.get('inbounds', [])
+    clients = tables.get('client_traffics', [])
+    inbounds_by_id = {r['id']: r for r in inbounds if 'id' in r}
 
-    inbound_cols = table_columns(db, 'inbounds')
-    client_cols = table_columns(db, 'client_traffics')
-    changed = False
+    state = {'inbounds': {}, 'client_traffics': {}}
 
-    # 1. Adopt entire new inbounds created on replica
-    for peer_inbound in remote_inbounds:
-        port = peer_inbound.get('port')
-        if not port or port in master_inbounds_by_port:
+    for ib in inbounds:
+        port = ib.get('port')
+        if not port:
             continue
-        new_inbound = dict(peer_inbound)
-        for c in INBOUND_COUNTERS:
-            if c in new_inbound:
-                new_inbound[c] = 0
-        insert_cols = [c for c in inbound_cols if c != 'id' and c in new_inbound]
-        marks = ','.join('?' for _ in insert_cols)
-        names = ','.join('"%s"' % c for c in insert_cols)
-        cur = db.execute('INSERT INTO "inbounds" (%s) VALUES (%s)' % (names, marks),
-                         [new_inbound.get(c) for c in insert_cols])
-        new_inbound_id = cur.lastrowid
-        new_inbound['id'] = new_inbound_id
-        master_inbounds_by_port[port] = new_inbound
-        changed = True
-        print('已从副机同步并采纳新入站线路：端口 %s' % port)
+        port_str = str(port)
+        settings = parse_settings(ib.get('settings'))
+        raw_clients = settings.get('clients', [])
+        clients_dict = {}
+        for c in raw_clients:
+            ck = client_key(c)
+            if ck:
+                clients_dict[ck] = dict(c)
 
-    if changed:
-        master_inbounds = rows(db, 'inbounds')
-        master_inbounds_by_port = {r.get('port'): r for r in master_inbounds if r.get('port')}
+        state['inbounds'][port_str] = {
+            'port': port,
+            'protocol': str(ib.get('protocol') or ''),
+            'remark': str(ib.get('remark') or ''),
+            'enable': int(ib.get('enable', 1) if ib.get('enable') is not None else 1),
+            'listen': str(ib.get('listen') or ''),
+            'tag': str(ib.get('tag') or ''),
+            'stream_settings': str(ib.get('stream_settings') or ''),
+            'sniffing': str(ib.get('sniffing') or ''),
+            'clients': clients_dict
+        }
 
-    # 2. Adopt new clients inside inbounds settings and client_traffics
-    for peer_inbound in remote_inbounds:
-        port = peer_inbound.get('port')
-        if not port or port not in master_inbounds_by_port:
+    for ct in clients:
+        inbound_id = ct.get('inbound_id')
+        port = inbounds_by_id.get(inbound_id, {}).get('port')
+        email = str(ct.get('email') or '').strip()
+        if port and email:
+            key = f"{port}_{email}"
+            state['client_traffics'][key] = {
+                'email': email,
+                'port': port,
+                'total': int(ct.get('total') or 0),
+                'expiry_time': int(ct.get('expiry_time') or 0),
+                'enable': int(ct.get('enable', 1) if ct.get('enable') is not None else 1),
+                'reset': int(ct.get('reset') or 0)
+            }
+
+    return state
+
+
+def two_way_sync(master_db, remote_tables, last_sync_state):
+    m_tables = {
+        'inbounds': rows(master_db, 'inbounds'),
+        'client_traffics': rows(master_db, 'client_traffics')
+    }
+    r_tables = {
+        'inbounds': remote_tables.get('inbounds', []),
+        'client_traffics': remote_tables.get('client_traffics', [])
+    }
+
+    m_state = extract_sync_state(m_tables)
+    r_state = extract_sync_state(r_tables)
+    s_state = last_sync_state if last_sync_state else {'inbounds': {}, 'client_traffics': {}}
+
+    m_inbounds = m_state['inbounds']
+    r_inbounds = r_state['inbounds']
+    s_inbounds = s_state.get('inbounds', {})
+
+    master_changed = False
+    replica_needs_push = False
+
+    inbound_cols = table_columns(master_db, 'inbounds')
+    client_cols = table_columns(master_db, 'client_traffics')
+
+    all_ports = set(m_inbounds.keys()) | set(r_inbounds.keys()) | set(s_inbounds.keys())
+
+    for port_str in all_ports:
+        in_m = port_str in m_inbounds
+        in_r = port_str in r_inbounds
+        in_s = port_str in s_inbounds
+
+        # 1. Inbound deleted on Master
+        if in_s and in_r and not in_m:
+            replica_needs_push = True
+            print('检测到主机已删除端口 %s 线路，将同步删除副机对应线路' % port_str)
             continue
 
-        local_inbound = master_inbounds_by_port[port]
-        local_settings = parse_settings(local_inbound.get('settings'))
-        peer_settings = parse_settings(peer_inbound.get('settings'))
+        # 2. Inbound deleted on Replica
+        if in_s and in_m and not in_r:
+            m_ib_row = next((r for r in m_tables['inbounds'] if str(r.get('port')) == port_str), None)
+            if m_ib_row:
+                master_db.execute('DELETE FROM client_traffics WHERE inbound_id = ?', [m_ib_row['id']])
+                master_db.execute('DELETE FROM inbounds WHERE id = ?', [m_ib_row['id']])
+                master_changed = True
+                print('检测到副机已删除端口 %s 线路，已同步删除主机对应线路' % port_str)
+            continue
 
-        local_clients = local_settings.get('clients', [])
-        peer_clients = peer_settings.get('clients', [])
+        # 3. Inbound added on Master
+        if not in_s and in_m and not in_r:
+            replica_needs_push = True
+            print('检测到主机新建端口 %s 线路，将同步推送到副机' % port_str)
+            continue
 
-        existing_keys = set()
-        for c in local_clients:
-            for k in ('email', 'id', 'password'):
-                val = str(c.get(k) or '').strip()
-                if val:
-                    existing_keys.add(val)
+        # 4. Inbound added on Replica
+        if not in_s and in_r and not in_m:
+            r_ib_row = next((r for r in r_tables['inbounds'] if str(r.get('port')) == port_str), None)
+            if r_ib_row:
+                new_ib = dict(r_ib_row)
+                for c in INBOUND_COUNTERS:
+                    if c in new_ib:
+                        new_ib[c] = 0
+                insert_cols = [c for c in inbound_cols if c != 'id' and c in new_ib]
+                marks = ','.join('?' for _ in insert_cols)
+                names = ','.join('"%s"' % c for c in insert_cols)
+                cur = master_db.execute('INSERT INTO inbounds (%s) VALUES (%s)' % (names, marks),
+                                        [new_ib.get(c) for c in insert_cols])
+                new_inbound_id = cur.lastrowid
+                for r_ct in r_tables['client_traffics']:
+                    if r_ct.get('inbound_id') == r_ib_row.get('id'):
+                        new_ct = dict(r_ct)
+                        new_ct['inbound_id'] = new_inbound_id
+                        for c in CLIENT_COUNTERS:
+                            if c in new_ct:
+                                new_ct[c] = 0
+                        ct_insert_cols = [c for c in client_cols if c != 'id' and c in new_ct]
+                        ct_marks = ','.join('?' for _ in ct_insert_cols)
+                        ct_names = ','.join('"%s"' % c for c in ct_insert_cols)
+                        master_db.execute('INSERT INTO client_traffics (%s) VALUES (%s)' % (ct_names, ct_marks),
+                                          [new_ct.get(c) for c in ct_insert_cols])
+                master_changed = True
+                print('已从副机采纳新建线路：端口 %s' % port_str)
+            continue
 
-        new_clients_to_add = []
-        for c in peer_clients:
-            c_email = str(c.get('email') or '').strip()
-            c_id = str(c.get('id') or '').strip()
-            c_pwd = str(c.get('password') or '').strip()
-            if ((c_email and c_email in existing_keys) or
-                    (c_id and c_id in existing_keys) or
-                    (c_pwd and c_pwd in existing_keys)):
+        # 5. Inbound exists on both Master and Replica
+        if in_m and in_r:
+            m_curr_ib = next((r for r in rows(master_db, 'inbounds') if str(r.get('port')) == port_str), None)
+            r_curr_ib = next((r for r in r_tables['inbounds'] if str(r.get('port')) == port_str), None)
+            if not m_curr_ib or not r_curr_ib:
                 continue
-            new_clients_to_add.append(c)
-            if c_email: existing_keys.add(c_email)
-            if c_id: existing_keys.add(c_id)
-            if c_pwd: existing_keys.add(c_pwd)
 
-        if new_clients_to_add:
-            local_clients.extend(new_clients_to_add)
-            local_settings['clients'] = local_clients
-            new_settings_str = json.dumps(local_settings, ensure_ascii=False)
-            db.execute('UPDATE "inbounds" SET "settings"=? WHERE "id"=?',
-                       [new_settings_str, local_inbound['id']])
-            local_inbound['settings'] = new_settings_str
-            changed = True
-            print('端口 %s 线路已从副机同步并采纳 %d 个新客户端' % (port, len(new_clients_to_add)))
+            m_settings = parse_settings(m_curr_ib.get('settings'))
+            r_settings = parse_settings(r_curr_ib.get('settings'))
 
-        for peer_ct in remote_clients:
-            if peer_ct.get('inbound_id') == peer_inbound.get('id'):
-                ct_email = str(peer_ct.get('email') or '').strip()
-                if ct_email and ct_email not in master_clients_by_email:
-                    new_ct = dict(peer_ct)
-                    new_ct['inbound_id'] = local_inbound['id']
-                    for ctr in CLIENT_COUNTERS:
-                        if ctr in new_ct:
-                            new_ct[ctr] = 0
-                    insert_cols = [c for c in client_cols if c != 'id' and c in new_ct]
-                    marks = ','.join('?' for _ in insert_cols)
-                    names = ','.join('"%s"' % c for c in insert_cols)
-                    db.execute('INSERT INTO "client_traffics" (%s) VALUES (%s)' % (names, marks),
-                               [new_ct.get(c) for c in insert_cols])
-                    master_clients_by_email[ct_email] = new_ct
-                    changed = True
+            m_clist = m_settings.get('clients', [])
+            r_clist = r_settings.get('clients', [])
 
-    return changed
+            m_cmap = {client_key(c): dict(c) for c in m_clist if client_key(c)}
+            r_cmap = {client_key(c): dict(c) for c in r_clist if client_key(c)}
+            s_cmap = s_inbounds.get(port_str, {}).get('clients', {})
+
+            all_ckeys = set(m_cmap.keys()) | set(r_cmap.keys()) | set(s_cmap.keys())
+            m_settings_changed = False
+
+            r_ct_by_email = {str(ct.get('email') or '').strip(): ct for ct in r_tables['client_traffics'] if ct.get('inbound_id') == r_curr_ib['id']}
+
+            for ckey in all_ckeys:
+                cin_m = ckey in m_cmap
+                cin_r = ckey in r_cmap
+                cin_s = ckey in s_cmap
+
+                # Case 5.1: Deleted on Master
+                if cin_s and cin_r and not cin_m:
+                    replica_needs_push = True
+                    print('端口 %s 线路：检测到主机已删除客户端 %s，将同步删除副机对应客户端' % (port_str, ckey))
+                    continue
+
+                # Case 5.2: Deleted on Replica
+                if cin_s and cin_m and not cin_r:
+                    if ckey in m_cmap:
+                        del m_cmap[ckey]
+                        m_settings_changed = True
+                    master_db.execute('DELETE FROM client_traffics WHERE inbound_id = ? AND email = ?',
+                                      [m_curr_ib['id'], ckey])
+                    master_changed = True
+                    print('端口 %s 线路：检测到副机已删除客户端 %s，已同步删除主机对应客户端' % (port_str, ckey))
+                    continue
+
+                # Case 5.3: Added on Master
+                if not cin_s and cin_m and not cin_r:
+                    replica_needs_push = True
+                    print('端口 %s 线路：检测到主机新增客户端 %s，将同步推送到副机' % (port_str, ckey))
+                    continue
+
+                # Case 5.4: Added on Replica
+                if not cin_s and cin_r and not cin_m:
+                    m_cmap[ckey] = r_cmap[ckey]
+                    m_settings_changed = True
+                    r_ct = r_ct_by_email.get(ckey)
+                    if r_ct:
+                        new_ct = dict(r_ct)
+                        new_ct['inbound_id'] = m_curr_ib['id']
+                        for c in CLIENT_COUNTERS:
+                            if c in new_ct:
+                                new_ct[c] = 0
+                        ct_insert_cols = [c for c in client_cols if c != 'id' and c in new_ct]
+                        ct_marks = ','.join('?' for _ in ct_insert_cols)
+                        ct_names = ','.join('"%s"' % c for c in ct_insert_cols)
+                        master_db.execute('INSERT INTO client_traffics (%s) VALUES (%s)' % (ct_names, ct_marks),
+                                          [new_ct.get(c) for c in ct_insert_cols])
+                    else:
+                        c_item = r_cmap[ckey]
+                        new_ct = {
+                            'inbound_id': m_curr_ib['id'],
+                            'enable': int(c_item.get('enable', 1) if c_item.get('enable') is not None else 1),
+                            'email': c_item.get('email', ckey),
+                            'up': 0, 'down': 0,
+                            'expiry_time': int(c_item.get('expiryTime', 0) or 0),
+                            'total': int(c_item.get('totalGB', 0) or 0) * 1024**3,
+                            'reset': int(c_item.get('reset', 0) or 0)
+                        }
+                        ct_insert_cols = [c for c in client_cols if c != 'id' and c in new_ct]
+                        ct_marks = ','.join('?' for _ in ct_insert_cols)
+                        ct_names = ','.join('"%s"' % c for c in ct_insert_cols)
+                        master_db.execute('INSERT INTO client_traffics (%s) VALUES (%s)' % (ct_names, ct_marks),
+                                          [new_ct.get(c) for c in ct_insert_cols])
+                    master_changed = True
+                    print('端口 %s 线路：已从副机采纳新增客户端 %s' % (port_str, ckey))
+                    continue
+
+                # Case 5.5: Modified
+                if cin_m and cin_r:
+                    m_client = m_cmap[ckey]
+                    r_client = r_cmap[ckey]
+                    s_client = s_cmap.get(ckey, {})
+
+                    if r_client != s_client and m_client == s_client:
+                        m_cmap[ckey] = r_client
+                        m_settings_changed = True
+                        r_ct = r_ct_by_email.get(ckey, {})
+                        if r_ct:
+                            master_db.execute(
+                                'UPDATE client_traffics SET enable=?, expiry_time=?, total=?, reset=? WHERE inbound_id=? AND email=?',
+                                [r_ct.get('enable', 1), r_ct.get('expiry_time', 0), r_ct.get('total', 0),
+                                 r_ct.get('reset', 0), m_curr_ib['id'], ckey]
+                            )
+                        master_changed = True
+                        print('端口 %s 线路：检测到副机修改了客户端 %s 设置，已同步更新主机' % (port_str, ckey))
+                    elif m_client != s_client and r_client == s_client:
+                        replica_needs_push = True
+                        print('端口 %s 线路：检测到主机修改了客户端 %s 设置，将同步更新副机' % (port_str, ckey))
+                    elif m_client != s_client and r_client != s_client and m_client != r_client:
+                        replica_needs_push = True
+
+            if m_settings_changed:
+                m_settings['clients'] = list(m_cmap.values())
+                new_settings_str = json.dumps(m_settings, ensure_ascii=False)
+                master_db.execute('UPDATE inbounds SET settings = ? WHERE id = ?',
+                                  [new_settings_str, m_curr_ib['id']])
+                master_changed = True
+
+            m_ib_state = m_inbounds.get(port_str, {})
+            r_ib_state = r_inbounds.get(port_str, {})
+            s_ib_state = s_inbounds.get(port_str, {})
+
+            m_ib_conf = {k: v for k, v in m_ib_state.items() if k != 'clients'}
+            r_ib_conf = {k: v for k, v in r_ib_state.items() if k != 'clients'}
+            s_ib_conf = {k: v for k, v in s_ib_state.items() if k != 'clients'}
+
+            if r_ib_conf != s_ib_conf and m_ib_conf == s_ib_conf:
+                upd_cols = [c for c in ('remark', 'enable', 'listen', 'tag', 'stream_settings', 'sniffing')
+                            if c in inbound_cols and c in r_curr_ib]
+                assignments = ','.join('"%s"=?' % c for c in upd_cols)
+                master_db.execute('UPDATE inbounds SET %s WHERE id = ?' % assignments,
+                                  [r_curr_ib.get(c) for c in upd_cols] + [m_curr_ib['id']])
+                master_changed = True
+                print('端口 %s 线路：检测到副机修改了入站配置，已同步更新主机' % port_str)
+            elif m_ib_conf != s_ib_conf and r_ib_conf == s_ib_conf:
+                replica_needs_push = True
+
+    return master_changed, replica_needs_push
+
+
+def sync_and_push(force=False, remote_tables=None):
+    peer_status()
+    c = config()
+    if c.get('role') != 'master':
+        raise RuntimeError('当前未设为主机')
+
+    if remote_tables is None:
+        try:
+            remote_raw = ssh(c['peer'], BIN + ' snapshot')
+            remote_tables = json.loads(remote_raw).get('tables', {})
+        except Exception as e:
+            if force:
+                raise
+            return False, {}
+
+    last_sync_path = STATE / 'last_sync.json'
+    try:
+        last_sync_state = json.loads(last_sync_path.read_text())
+    except (FileNotFoundError, ValueError):
+        last_sync_state = None
+
+    master_changed = False
+    replica_needs_push = False
+
+    with open_db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            master_changed, replica_needs_push = two_way_sync(db, remote_tables, last_sync_state)
+            if master_changed:
+                db.commit()
+                subprocess.run(['systemctl', 'restart', 'x-ui'], check=False)
+            else:
+                db.rollback()
+        except Exception:
+            db.rollback()
+            raise
+
+    payload = database_snapshot()
+    signature = config_signature(payload)
+    signature_path = STATE / 'config.sha256'
+
+    sig_changed = True
+    if signature_path.exists():
+        try:
+            if signature_path.read_text().strip() == signature:
+                sig_changed = False
+        except OSError:
+            pass
+
+    if force or master_changed or replica_needs_push or sig_changed:
+        raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode()
+        ssh(c['peer'], BIN + ' apply-config', raw)
+        atomic_write(signature_path, (signature + '\n').encode())
+        print('x-ui 入站/用户配置已同步到副机；副机本地流量计数已保留。')
+
+    new_sync_state = extract_sync_state(payload['tables'])
+    atomic_write(last_sync_path, (json.dumps(new_sync_state, ensure_ascii=False, indent=2) + '\n').encode())
+    return True, remote_tables
 
 
 def push(force=False):
@@ -703,35 +942,7 @@ def push(force=False):
     c = config()
     if c.get('role') != 'master':
         raise RuntimeError('当前未设为主机')
-
-    # Check replica to adopt any new clients or inbounds created on replica
-    try:
-        remote_raw = ssh(c['peer'], BIN + ' snapshot')
-        remote = json.loads(remote_raw).get('tables', {})
-        with open_db() as db:
-            db.execute('BEGIN IMMEDIATE')
-            try:
-                if adopt_replica_data(db, remote):
-                    db.commit()
-                    subprocess.run(['systemctl', 'restart', 'x-ui'], check=False)
-                else:
-                    db.rollback()
-            except Exception:
-                db.rollback()
-                raise
-    except Exception:
-        pass
-
-    payload = database_snapshot()
-    signature = config_signature(payload)
-    signature_path = STATE / 'config.sha256'
-    if not force and signature_path.exists() and signature_path.read_text().strip() == signature:
-        print('x-ui 入站/用户配置没有变化，跳过推送。')
-        return
-    raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode()
-    ssh(c['peer'], BIN + ' apply-config', raw)
-    atomic_write(signature_path, (signature + '\n').encode())
-    print('x-ui 入站/用户配置已同步到副机；副机本地流量计数已保留。')
+    sync_and_push(force=force)
 
 
 def config_signature(payload):
@@ -851,67 +1062,114 @@ def make_row_key(table, row, inbounds_by_id=None):
     return str(row.get('id'))
 
 
-def merge_traffic():
-    c = config()
-    if c.get('role') != 'master':
-        raise RuntimeError('当前未设为主机')
-    remote = json.loads(ssh(c['peer'], BIN + ' snapshot'))['tables']
+def merge_traffic_counters(db, remote):
     ledger_path = STATE / 'ledger.json'
     try:
         ledger = json.loads(ledger_path.read_text())
     except FileNotFoundError:
         ledger = {}
+
     totals = {'up': 0, 'down': 0, 'all_time': 0}
     matched = 0
-    with open_db() as db:
-        table_info = {t: table_columns(db, t) for t in TABLES}
-        db.execute('BEGIN IMMEDIATE')
-        try:
-            # 1. Adopt any new clients/inbounds added on replica
-            adopted = adopt_replica_data(db, remote)
+    table_info = {t: table_columns(db, t) for t in TABLES}
 
-            master = {t: rows(db, t) for t in TABLES}
-            inbounds_by_id = {r['id']: r for r in master['inbounds'] if 'id' in r}
-            local_map = {t: {make_row_key(t, r, inbounds_by_id): r for r in master[t]} for t in TABLES}
-            peer_inbounds_by_id = {r['id']: r for r in remote.get('inbounds', []) if 'id' in r}
+    master = {t: rows(db, t) for t in TABLES}
+    inbounds_by_id = {r['id']: r for r in master['inbounds'] if 'id' in r}
+    local_map = {t: {make_row_key(t, r, inbounds_by_id): r for r in master[t]} for t in TABLES}
+    peer_inbounds_by_id = {r['id']: r for r in remote.get('inbounds', []) if 'id' in r}
 
-            for table in TABLES:
-                counters = INBOUND_COUNTERS if table == 'inbounds' else CLIENT_COUNTERS
-                for peer_row in remote.get(table, []):
-                    key = make_row_key(table, peer_row, peer_inbounds_by_id)
-                    if not key or key not in local_map[table]:
-                        continue
-                    matched += 1
-                    old = ledger.setdefault(table, {}).setdefault(key, {})
-                    local_row = local_map[table][key]
-                    changed = {}
-                    for field in counters:
-                        if field not in table_info[table] or field not in peer_row:
-                            continue
-                        current = max(0, int(peer_row.get(field) or 0))
-                        previous = max(0, int(old.get(field, 0) or 0))
-                        delta = max(0, current - previous)
-                        if delta:
-                            current_local = max(0, int(local_row.get(field) or 0))
-                            new_value = current_local + delta
-                            changed[field] = new_value
-                            local_row[field] = new_value
-                        if table == 'client_traffics' and field in totals:
-                            totals[field] += delta
-                        old[field] = current
-                    if changed:
-                        assignments = ','.join('"%s"=?' % x for x in changed)
-                        db.execute('UPDATE "%s" SET %s WHERE "id"=?' % (table, assignments),
-                                   list(changed.values()) + [local_row['id']])
-            db.commit()
-            if adopted:
-                subprocess.run(['systemctl', 'restart', 'x-ui'], check=False)
-        except Exception:
-            db.rollback()
-            raise
+    for table in TABLES:
+        counters = INBOUND_COUNTERS if table == 'inbounds' else CLIENT_COUNTERS
+        valid_keys = set()
+        for peer_row in remote.get(table, []):
+            key = make_row_key(table, peer_row, peer_inbounds_by_id)
+            if not key or key not in local_map[table]:
+                continue
+            valid_keys.add(key)
+            matched += 1
+
+            table_ledger = ledger.setdefault(table, {})
+            is_new_in_ledger = (key not in table_ledger)
+            old = table_ledger.setdefault(key, {})
+
+            local_row = local_map[table][key]
+            changed = {}
+            for field in counters:
+                if field not in table_info[table] or field not in peer_row:
+                    continue
+                if field == 'last_online':
+                    peer_lo = int(peer_row.get('last_online') or 0)
+                    local_lo = int(local_row.get('last_online') or 0)
+                    if peer_lo > local_lo:
+                        changed['last_online'] = peer_lo
+                        local_row['last_online'] = peer_lo
+                    continue
+
+                current = max(0, int(peer_row.get(field) or 0))
+
+                # IF FIRST TIME ENCOUNTERED:
+                # Set baseline to current replica traffic. Delta is ZERO!
+                # Prevents replica's historical traffic from doubling/summing into master!
+                if is_new_in_ledger or field not in old:
+                    old[field] = current
+                    continue
+
+                previous = max(0, int(old.get(field, 0) or 0))
+
+                # If traffic was reset in panel on replica
+                if current < previous:
+                    old[field] = current
+                    continue
+
+                delta = max(0, current - previous)
+                if delta:
+                    current_local = max(0, int(local_row.get(field) or 0))
+                    new_value = current_local + delta
+                    changed[field] = new_value
+                    local_row[field] = new_value
+                    if table == 'client_traffics' and field in totals:
+                        totals[field] += delta
+                old[field] = current
+
+            if changed:
+                assignments = ','.join('"%s"=?' % x for x in changed)
+                db.execute('UPDATE "%s" SET %s WHERE "id"=?' % (table, assignments),
+                           list(changed.values()) + [local_row['id']])
+
+        if table in ledger:
+            stale_keys = [k for k in ledger[table] if k not in valid_keys]
+            for k in stale_keys:
+                del ledger[table][k]
+
     atomic_write(ledger_path, (json.dumps(ledger, ensure_ascii=False, separators=(',', ':')) + '\n').encode())
     print('副机流量已合并：匹配记录 %d 条，上传 +%d 字节，下载 +%d 字节。' %
           (matched, totals['up'], totals['down']))
+
+
+def merge_traffic():
+    peer_status()
+    c = config()
+    if c.get('role') != 'master':
+        raise RuntimeError('当前未设为主机')
+
+    try:
+        remote_raw = ssh(c['peer'], BIN + ' snapshot')
+        remote = json.loads(remote_raw).get('tables', {})
+    except Exception as e:
+        raise RuntimeError('无法获取副机快照：%s' % e)
+
+    # 1. Sync any config/client changes bidirectionally
+    sync_and_push(force=False, remote_tables=remote)
+
+    # 2. Merge traffic deltas with baseline protection
+    with open_db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            merge_traffic_counters(db, remote)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
 
 
 def install_units():
@@ -950,6 +1208,8 @@ def setup(role):
         data['peer_port'] = port
     save_config(data)
     install_units()
+    for p in (STATE / 'last_sync.json', STATE / 'config.sha256', STATE / 'ledger.json'):
+        p.unlink(missing_ok=True)
     push(force=True)
     try:
         ssh(peer, BIN + ' register-master-ip')
@@ -1094,7 +1354,7 @@ trap - EXIT HUP INT TERM
 printf '\n当前同步状态：\n'
 /usr/local/bin/ssr2vps status-report
 /usr/local/bin/xui2vps status-report
-printf '\n主菜单 v1.0.2：\n1、SSR 同步\n2、XUI 同步\n3、同步时间修改\n0、退出\n请选择: '
+printf '\n主菜单 v1.0.3：\n1、SSR 同步\n2、XUI 同步\n3、同步时间修改\n0、退出\n请选择: '
 IFS= read -r choice || choice=
 case "$choice" in
     1) exec /usr/local/bin/ssr2vps menu ;;
