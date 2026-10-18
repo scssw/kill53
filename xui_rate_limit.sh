@@ -117,8 +117,8 @@ def config():
         item = item.strip()
         if item.isdigit() and 1 <= int(item) <= 65535:
             port_list.append(item)
-    # 最多允许手动配置 50 个端口，彻底防爆卡死
-    values["ports"] = sorted(list(set(port_list)), key=lambda x: int(x))[:50]
+    # 允许监控最多 1000 个端口
+    values["ports"] = sorted(list(set(port_list)), key=lambda x: int(x))[:1000]
     values["auto_discover"] = values.get("AUTO_DISCOVER", "1") == "1"
     values["auto_enabled"] = values.get("AUTO_ENABLED", "1") == "1"
 
@@ -216,8 +216,8 @@ def discover_ports():
         if is_proxy and 1 <= port <= 65535:
             found.add(str(port))
 
-    # 最多保留 50 个活跃端口，避免极端情况下的性能瓶颈
-    return sorted(list(found), key=lambda x: int(x))[:50]
+    # 支持检测并管理最多 1000 个活跃代理端口，完全覆盖大端口范围
+    return sorted(list(found), key=lambda x: int(x))[:1000]
 
 
 def all_counters(dev):
@@ -281,6 +281,38 @@ def set_rate(dev, port, index, down, up):
             subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def set_rates_bulk(dev, rules):
+    commands = []
+    for port, index, down, up in rules:
+        pref_v4 = 42000 + index
+        pref_v6 = 52000 + index
+        burst_down = get_burst(down)
+        burst_up = get_burst(up)
+
+        for direction, rate, burst, field in (
+            ("egress", down, burst_down, "src_port"),
+            ("ingress", up, burst_up, "dst_port"),
+        ):
+            for protocol, handle in (("tcp", 1), ("udp", 2)):
+                commands.append(f"filter replace dev {dev} {direction} protocol ip pref {pref_v4} handle {handle} flower ip_proto {protocol} {field} {port} action police rate {rate}mbit burst {burst} drop")
+
+        for direction, rate, burst, field in (
+            ("egress", down, burst_down, "src_port"),
+            ("ingress", up, burst_up, "dst_port"),
+        ):
+            for protocol, handle in (("tcp", 1), ("udp", 2)):
+                commands.append(f"filter replace dev {dev} {direction} protocol ipv6 pref {pref_v6} handle {handle} flower ip_proto {protocol} {field} {port} action police rate {rate}mbit burst {burst} drop")
+
+    if commands:
+        subprocess.run(
+            ["tc", "-batch", "-"],
+            input="\n".join(commands) + "\n",
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
 def remove_prefs(dev, indexes):
     commands = []
     for index in indexes:
@@ -305,12 +337,13 @@ def reconcile(cfg, state, ports):
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # 如果网络接口和监控端口没有任何变动，直接返回，绝不重复刷新造成系统负担
-    if state.get("version") == 5 and old_ports == ports and old_iface == cfg["IFACE"]:
+    if state.get("version") == 6 and old_ports == ports and old_iface == cfg["IFACE"]:
         return
 
-    # 若发现新增或删除了端口，安全同步规则
+    # 若发现新增或删除了端口，安全批量同步规则
     remove_prefs(old_iface, range(max(len(old_ports), len(ports))))
 
+    rules = []
     for index, port in enumerate(ports):
         active = state.get("active", {}).get(port)
         if active and (active.get("until", 0) > int(time.time()) or active.get("reason") == "schedule"):
@@ -319,11 +352,13 @@ def reconcile(cfg, state, ports):
         else:
             down = cfg["base_down"]
             up = cfg["base_up"]
-        set_rate(cfg["IFACE"], port, index, down, up)
+        rules.append((port, index, down, up))
+
+    set_rates_bulk(cfg["IFACE"], rules)
 
     state["ports"] = ports
     state["iface"] = cfg["IFACE"]
-    state["version"] = 5
+    state["version"] = 6
     state["last"] = {port: state.get("last", {}).get(port, 0) for port in ports}
     state["samples"] = {port: state.get("samples", {}).get(port, []) for port in ports}
     state["active"] = {port: act for port, act in state.get("active", {}).items() if port in ports}
