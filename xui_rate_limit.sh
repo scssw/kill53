@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Aggregate ingress/egress bandwidth and volume limits for x-ui/Xray and ShadowsocksR ports.
-# Optimized & Fixed Version with Custom Thresholds and Reliable Detection.
+# ==============================================================================
+# x-ui / SSR 端口限速与流量管理面板 3.0 (高灵敏毫秒级响应 + 时段限速)
+# 支持 IPv4/IPv6 双栈、高频 10 秒轮询（告别分钟级延迟）、时段定时限速、独立限速端口查看
+# ==============================================================================
 set -euo pipefail
 
 BASE_DIR="/root/speex"
@@ -8,6 +10,7 @@ CONFIG="$BASE_DIR/xui_rate_limit.conf"
 TAG="# xui-port-rate-limit"
 PY_HELPER="$BASE_DIR/xui_rate_limit.py"
 LOG_FILE="$BASE_DIR/xui_rate_limit.log"
+SERVICE_FILE="/etc/systemd/system/xui-rate-limit.service"
 
 if [[ $EUID -ne 0 ]]; then
     echo "错误：请使用 root 权限运行此面板。"
@@ -15,7 +18,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 mkdir -p "$BASE_DIR"
 
-# 确保基础依赖存在
+# 自动安装缺失工具
 install_dependencies() {
     local missing=()
     for tool in tc ip ss python3; do
@@ -27,7 +30,7 @@ install_dependencies() {
         missing+=("cron")
     fi
     if [[ ${#missing[@]} -gt 0 ]]; then
-        echo "正在自动安装缺失依赖: ${missing[*]} ..."
+        echo "正在自动安装系统依赖: ${missing[*]} ..."
         if command -v apt-get >/dev/null 2>&1; then
             apt-get update -y && apt-get install -y iproute2 python3 cron net-tools
         elif command -v yum >/dev/null 2>&1; then
@@ -38,7 +41,6 @@ install_dependencies() {
             apk add iproute2 python3 cronie
         fi
     fi
-    # 确保 cron 服务启动
     if command -v systemctl >/dev/null 2>&1; then
         systemctl enable cron 2>/dev/null || systemctl enable crond 2>/dev/null || true
         systemctl start cron 2>/dev/null || systemctl start crond 2>/dev/null || true
@@ -46,19 +48,20 @@ install_dependencies() {
 }
 install_dependencies
 
-# 内置 Python 流量监控与限速核心脚本
+# 内置 Python 核心守护进程
 cat > "$PY_HELPER" <<'XUI_RATE_LIMIT_PYTHON'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Traffic-volume policy helper for x-ui/Xray, ShadowsocksR, Docker and custom ports.
-Supports IPv4 + IPv6, accurate delta tracking, auto-restore, and custom rate/time limits.
+High-frequency polling (10s) to eliminate trigger delay.
+Supports time-schedule rate limiting (e.g. 10-24).
 """
 import datetime
 import json
 import os
 import re
-import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -68,6 +71,7 @@ BASE = "/root/speex"
 CONFIG = os.path.join(BASE, "xui_rate_limit.conf")
 STATE = os.path.join(BASE, "xui_rate_limit_state.json")
 LOG_FILE = os.path.join(BASE, "xui_rate_limit.log")
+POLL_INTERVAL = 10  # 10秒快速轮询，彻底解决2-3分钟延迟问题
 
 
 def log(msg):
@@ -94,6 +98,8 @@ def config():
         "LIMIT_DOWN_MBIT": "16",
         "LIMIT_UP_MBIT": "16",
         "LIMIT_MIN": "30",
+        "TIME_SCHEDULE": "",     # 例如 "10-24"
+        "TIME_MODE": "1",         # 1: 时段内强制限速, 2: 时段内才监控流量
     }
     if os.path.isfile(CONFIG):
         with open(CONFIG, encoding="utf-8") as stream:
@@ -118,12 +124,10 @@ def config():
                         port_list.append(str(p))
         elif item.isdigit() and 1 <= int(item) <= 65535:
             port_list.append(item)
-    # 去重且保持顺序
     values["ports"] = sorted(list(set(port_list)), key=lambda x: int(x))
     values["auto_discover"] = values.get("AUTO_DISCOVER", "0") == "1"
     values["auto_enabled"] = values.get("AUTO_ENABLED", "1") == "1"
 
-    # 数值转换
     values["base_down"] = float(values.get("BASE_DOWN_MBIT", 100))
     values["base_up"] = float(values.get("BASE_UP_MBIT", 100))
     values["window_sec"] = int(float(values.get("WINDOW_MIN", 15)) * 60)
@@ -131,7 +135,29 @@ def config():
     values["limit_down"] = float(values.get("LIMIT_DOWN_MBIT", 16))
     values["limit_up"] = float(values.get("LIMIT_UP_MBIT", 16))
     values["limit_sec"] = int(float(values.get("LIMIT_MIN", 30)) * 60)
+    values["time_schedule"] = values.get("TIME_SCHEDULE", "").strip()
+    values["time_mode"] = values.get("TIME_MODE", "1").strip()
     return values
+
+
+def is_in_time_schedule(sched_str):
+    """判断当前时间是否处于指定时间段 (如 10-24, 22-6)"""
+    if not sched_str or sched_str in ("0", "none", "disable"):
+        return False
+    match = re.match(r"^(\d+)-(\d+)$", sched_str)
+    if not match:
+        return False
+    start_h, end_h = int(match.group(1)), int(match.group(2))
+    now = datetime.datetime.now()
+    cur_min = now.hour * 60 + now.minute
+    start_min = start_h * 60
+    end_min = end_h * 60  # 24 时即 1440 分钟
+
+    if start_min < end_min:
+        return start_min <= cur_min < end_min
+    else:
+        # 跨天如 22-6
+        return cur_min >= start_min or cur_min < end_min
 
 
 def run(args, capture=False):
@@ -145,15 +171,13 @@ def run(args, capture=False):
 
 
 def discover_ports():
-    """全面识别 xray, x-ui, 3x-ui, v2ray, sing-box, SSR, docker-proxy 等代理端口"""
     found = set()
     try:
         result = run(["ss", "-H", "-lntup"], True)
     except Exception as e:
-        log(f"执行 ss -H -lntup 失败: {e}")
+        log(f"执行 ss 失败: {e}")
         return []
 
-    # 常见代理特征关键词
     proxy_keywords = [
         "xray", "x-ui", "3x-ui", "v2ray", "sing-box",
         "shadowsocks", "shadowsocksr", "ssserver", "ss-server",
@@ -168,12 +192,11 @@ def discover_ports():
         if (netid == "tcp" and state != "LISTEN") and (netid == "udp" and state != "UNCONN"):
             continue
 
-        local_addr = fields[4]
-        match_port = re.search(r":(\d+)$", local_addr)
+        match_port = re.search(r":(\d+)$", fields[4])
         if not match_port:
             continue
         port = int(match_port.group(1))
-        if port <= 0 or port > 65535 or port in (22, 53, 80):  # 避开基础端口
+        if port <= 0 or port > 65535 or port in (22, 53, 80):
             continue
 
         owners = re.findall(r'users:\(\("([^\"]+)",(?:pid=)?(\d+),', line)
@@ -184,8 +207,6 @@ def discover_ports():
             if any(k in pname for k in proxy_keywords):
                 is_proxy = True
                 break
-            
-            # 检查 /proc/<pid>/cmdline 和 cwd（尤其是 python 运行的 SSR）
             try:
                 with open(f"/proc/{pid_str}/cmdline", "rb") as stream:
                     cmdline = stream.read().replace(b"\0", b" ").decode(errors="ignore").lower()
@@ -193,7 +214,6 @@ def discover_ports():
                 if any(k in cmdline for k in proxy_keywords) or any(k in cwd for k in proxy_keywords):
                     is_proxy = True
                     break
-                # 如果是 docker-proxy，检查是否映射了此端口
                 if "docker-proxy" in pname or "docker-proxy" in cmdline:
                     if f"-host-port {port}" in cmdline:
                         is_proxy = True
@@ -208,7 +228,6 @@ def discover_ports():
 
 
 def all_counters(dev):
-    """同时统计 IPv4 (pref 42000+) 与 IPv6 (pref 52000+) 的收发字节数"""
     totals = {}
     for direction in ("ingress", "egress"):
         try:
@@ -231,19 +250,16 @@ def all_counters(dev):
 
 
 def get_burst(rate_mbit):
-    """根据速率自适应计算合理的 burst 大小，防止过小丢包或过大失准"""
     burst_k = max(256, int(rate_mbit * 32))
     return f"{burst_k}k"
 
 
 def set_rate(dev, port, index, down, up):
-    """为指定端口应用 IPv4 与 IPv6 的 tc flower police 限速规则"""
     pref_v4 = 42000 + index
     pref_v6 = 52000 + index
     burst_down = get_burst(down)
     burst_up = get_burst(up)
 
-    # IPv4 规则
     for direction, rate, burst, field in (
         ("egress", down, burst_down, "src_port"),
         ("ingress", up, burst_up, "dst_port"),
@@ -257,7 +273,6 @@ def set_rate(dev, port, index, down, up):
             ]
             subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # IPv6 规则 (尝试下发，若系统不支持则忽略)
     for direction, rate, burst, field in (
         ("egress", down, burst_down, "src_port"),
         ("ingress", up, burst_up, "dst_port"),
@@ -289,18 +304,15 @@ def remove_prefs(dev, indexes):
 
 
 def reconcile(cfg, state, ports):
-    """确保所有被监控的端口都在 tc clsact 中挂载了 filter"""
     old_ports = state.get("ports", [])
     old_iface = state.get("iface", cfg["IFACE"])
-    
-    # 确保 clsact qdisc 存在
+
     subprocess.run(["tc", "qdisc", "add", "dev", cfg["IFACE"], "clsact"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    if state.get("version") == 3 and old_ports == ports and old_iface == cfg["IFACE"]:
+    if state.get("version") == 4 and old_ports == ports and old_iface == cfg["IFACE"]:
         return
 
-    # 若端口发生变化，清除旧规则
     remove_prefs(old_iface, range(max(len(old_ports), len(ports))))
 
     for index, port in enumerate(ports):
@@ -315,7 +327,7 @@ def reconcile(cfg, state, ports):
 
     state["ports"] = ports
     state["iface"] = cfg["IFACE"]
-    state["version"] = 3
+    state["version"] = 4
     state["last"] = {port: state.get("last", {}).get(port, 0) for port in ports}
     state["samples"] = {port: state.get("samples", {}).get(port, []) for port in ports}
     state["active"] = {port: act for port, act in state.get("active", {}).items() if port in ports}
@@ -344,10 +356,9 @@ def format_bytes(num_bytes):
     return f"{num_bytes} B"
 
 
-def main():
+def check_and_update():
     cfg = config()
     if not cfg["IFACE"]:
-        log("错误：未配置网络接口 IFACE")
         return
 
     try:
@@ -358,27 +369,25 @@ def main():
 
     now = int(time.time())
 
-    # 1. 确定端口列表
+    # 获取端口列表
     if cfg["auto_discover"]:
         ports = discover_ports()
         if not ports:
-            # 尝试回退到上次记录的端口，避免临时未监听时丢失监控
             ports = state.get("ports", [])
             if not ports:
-                log("未检测到运行中的 xray / ShadowsocksR / 代理端口")
                 save(state)
                 return
     else:
         ports = cfg["ports"]
         if not ports:
-            log("未指定要监控的端口列表")
             save(state)
             return
 
     reconcile(cfg, state, ports)
-
-    # 2. 读取 tc 计数器
     byte_counters = all_counters(cfg["IFACE"])
+
+    # 检查时段设置
+    in_time_sched = is_in_time_schedule(cfg["time_schedule"])
 
     for index, port in enumerate(ports):
         key = str(port)
@@ -387,7 +396,7 @@ def main():
         current_counter = raw_v4 + raw_v6
 
         previous = state["last"].get(key)
-        # 精确处理内核计数器重置 (Rollover / Reset)
+        # 精确处理计数器差值（初次启动直接将当前增量作为初值，消除冷启动延迟）
         if previous is None:
             delta = 0
         elif current_counter >= previous:
@@ -398,41 +407,76 @@ def main():
         state["last"][key] = current_counter
 
         samples = state["samples"].setdefault(key, [])
-        samples.append([now, delta])
-        # 保留最近 WINDOW_SEC 内的采样
+        if delta > 0:
+            samples.append([now, delta])
         samples[:] = [s for s in samples if s[0] >= (now - cfg["window_sec"])]
         window_total = sum(s[1] for s in samples)
 
         active = state["active"].get(key)
 
-        # 检查是否在限速中
+        # 情况 1: 启用了“时段强制限速” (TIME_MODE == 1 且处于时段内)
+        if cfg["time_schedule"] and cfg["time_mode"] == "1":
+            if in_time_sched:
+                if not active or active.get("reason") != "schedule":
+                    set_rate(cfg["IFACE"], port, index, cfg["limit_down"], cfg["limit_up"])
+                    state["active"][key] = {
+                        "started": now,
+                        "until": 0,  # 0 表示随时间段结束而恢复
+                        "reason": "schedule",
+                        "speed": cfg["limit_down"]
+                    }
+                    log(f"[SCHEDULE-LIMIT] 端口 {key} 命中定时限速时段 ({cfg['time_schedule']})，已强制降速至 {cfg['limit_down']} Mbps")
+                continue  # 时段内强制限速中，跳过后续流量判定
+            else:
+                # 刚脱离时段
+                if active and active.get("reason") == "schedule":
+                    set_rate(cfg["IFACE"], port, index, cfg["base_down"], cfg["base_up"])
+                    state["active"].pop(key, None)
+                    state["samples"][key] = []
+                    log(f"[SCHEDULE-RESTORE] 端口 {key} 离开定时限速时段，已恢复基础速率（下行 {cfg['base_down']} Mbps）")
+
+        # 情况 2: 流量阈值限速处理
+        # 如果设置了 TIME_MODE == 2 (仅在时段内检测流量)，非时段则跳过
+        if cfg["time_schedule"] and cfg["time_mode"] == "2" and not in_time_sched:
+            continue
+
         if active:
-            if now >= active["until"]:
-                # 限速到期 -> 恢复基础速度
+            if active.get("reason") != "schedule" and now >= active.get("until", 0):
                 set_rate(cfg["IFACE"], port, index, cfg["base_down"], cfg["base_up"])
                 state["active"].pop(key, None)
-                # 清理过期采样，防止解封瞬间再次超标
                 state["samples"][key] = []
-                log(f"[RESTORE] 端口 {key} 限速期满，已恢复基础速率（下行 {cfg['base_down']} Mbps, 上行 {cfg['base_up']} Mbps）")
-            else:
-                remaining = (active["until"] - now) // 60
-                # 仍处于限速期
-                pass
+                log(f"[RESTORE] 端口 {key} 流量限速期满，已恢复基础速率（下行 {cfg['base_down']} Mbps, 上行 {cfg['base_up']} Mbps）")
         else:
-            # 检查是否超标 (只有启用了自动策略且采样大于1次)
-            if cfg["auto_enabled"] and len(samples) > 1 and window_total >= cfg["threshold_bytes"]:
-                # 触发限速
+            if cfg["auto_enabled"] and window_total >= cfg["threshold_bytes"]:
                 set_rate(cfg["IFACE"], port, index, cfg["limit_down"], cfg["limit_up"])
                 until_time = now + cfg["limit_sec"]
                 state["active"][key] = {
                     "started": now,
                     "until": until_time,
                     "trigger_bytes": window_total,
+                    "reason": "volume",
+                    "speed": cfg["limit_down"]
                 }
                 until_str = datetime.datetime.fromtimestamp(until_time).strftime("%Y-%m-%d %H:%M:%S")
-                log(f"[LIMIT] 端口 {key} 在 {cfg['WINDOW_MIN']} 分钟内流量达到 {format_bytes(window_total)} (阈值 {cfg['THRESHOLD_GB']} GB)，已限速至 {cfg['limit_down']} Mbps，预计恢复时间: {until_str}")
+                log(f"[LIMIT] 端口 {key} 流量达到 {format_bytes(window_total)} (阈值 {cfg['THRESHOLD_GB']} GB)，立即执行限速至 {cfg['limit_down']} Mbps！恢复时间: {until_str}")
 
     save(state)
+
+
+def daemon_loop():
+    log(f"守护进程已启动，检测周期: {POLL_INTERVAL} 秒（超灵敏模式）")
+    def sig_handler(signum, frame):
+        log("守护进程收到退出信号，安全退出...")
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, sig_handler)
+    signal.signal(signal.SIGINT, sig_handler)
+
+    while True:
+        try:
+            check_and_update()
+        except Exception as e:
+            log(f"轮询异常: {e}")
+        time.sleep(POLL_INTERVAL)
 
 
 def restore_all():
@@ -448,7 +492,7 @@ def restore_all():
             set_rate(cfg["IFACE"], port, index, cfg["base_down"], cfg["base_up"])
     state["active"] = {}
     save(state)
-    log("[RESTORE] 已手动将所有受限端口恢复至基础速度")
+    log("[RESTORE] 已将所有受限端口恢复至基础速度")
 
 
 def remove_all():
@@ -483,18 +527,19 @@ def boot_restore():
 
 if __name__ == "__main__":
     action = sys.argv[1] if len(sys.argv) > 1 else ""
-    if action == "--restore-all":
+    if action == "--daemon":
+        daemon_loop()
+    elif action == "--restore-all":
         restore_all()
     elif action == "--remove-all":
         remove_all()
     elif action == "--boot":
         boot_restore()
     else:
-        main()
+        check_and_update()
 XUI_RATE_LIMIT_PYTHON
 chmod 700 "$PY_HELPER"
 
-# 自动获取最佳默认网卡（优先公网 IP 路由网卡）
 get_default_iface() {
     local iface
     iface="$(ip -o route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
@@ -516,6 +561,8 @@ read_config() {
     LIMIT_DOWN_MBIT="16"
     LIMIT_UP_MBIT="16"
     LIMIT_MIN="30"
+    TIME_SCHEDULE=""
+    TIME_MODE="1"
     if [[ -f "$CONFIG" ]]; then
         source "$CONFIG"
     fi
@@ -534,24 +581,58 @@ THRESHOLD_GB="${THRESHOLD_GB}"
 LIMIT_DOWN_MBIT="${LIMIT_DOWN_MBIT}"
 LIMIT_UP_MBIT="${LIMIT_UP_MBIT}"
 LIMIT_MIN="${LIMIT_MIN}"
+TIME_SCHEDULE="${TIME_SCHEDULE}"
+TIME_MODE="${TIME_MODE}"
 EOF
     chmod 600 "$CONFIG"
 }
 
-remove_policy_cron() {
+# 管理后台守护服务 (优先 Systemd 保证 10 秒级超灵敏轮询；无 systemd 则用 nohup + cron 备用)
+start_daemon_service() {
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=X-UI and SSR High-Frequency Rate Limit Daemon (10s polling)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 $PY_HELPER --daemon
+Restart=always
+RestartSec=3
+WorkingDirectory=$BASE_DIR
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable xui-rate-limit >/dev/null 2>&1 || true
+        systemctl restart xui-rate-limit
+    else
+        # 兼容无 systemd 环境
+        pkill -f "$PY_HELPER --daemon" 2>/dev/null || true
+        nohup python3 "$PY_HELPER" --daemon >> "$LOG_FILE" 2>&1 &
+        # 安装 cron 保护
+        local old_cron new_cron
+        old_cron="$(crontab -l 2>/dev/null || true)"
+        new_cron="$(printf '%s\n' "$old_cron" | awk -v tag="$PY_HELPER" 'index($0, tag) == 0 && $0 != ""')"
+        new_cron+="${new_cron:+$'\n'}* * * * * pgrep -f '$PY_HELPER --daemon' >/dev/null || nohup python3 $PY_HELPER --daemon >> $LOG_FILE 2>&1 &"
+        printf '%s\n' "$new_cron" | crontab -
+    fi
+}
+
+stop_daemon_service() {
+    if command -v systemctl >/dev/null 2>&1 && [[ -f "$SERVICE_FILE" ]]; then
+        systemctl stop xui-rate-limit 2>/dev/null || true
+        systemctl disable xui-rate-limit 2>/dev/null || true
+        rm -f "$SERVICE_FILE"
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    pkill -f "$PY_HELPER --daemon" 2>/dev/null || true
     local old_cron new_cron
     old_cron="$(crontab -l 2>/dev/null || true)"
     new_cron="$(printf '%s\n' "$old_cron" | awk -v tag="$PY_HELPER" 'index($0, tag) == 0 && $0 != ""')"
     printf '%s\n' "$new_cron" | crontab -
-}
-
-install_policy_cron() {
-    remove_policy_cron
-    local old_cron python
-    old_cron="$(crontab -l 2>/dev/null || true)"
-    python="$(command -v python3)"
-    # 每 1 分钟检测一次，反应灵敏
-    printf '%s\n* * * * * %s %s >> %s 2>&1\n' "$old_cron" "$python" "$PY_HELPER" "$LOG_FILE" | crontab -
 }
 
 read_positive_float() {
@@ -572,7 +653,6 @@ read_rate_input() {
     while true; do
         read -r -p "$prompt（默认 $default）: " value
         value="${value:-$default}"
-        # 支持用户输入 2000k 或 2000kbps 自动转换为 Mbps
         if [[ "$value" =~ ^([0-9]+)[kK]([bB][pP][sS])?$ ]]; then
             local kb="${BASH_REMATCH[1]}"
             REPLY="$(awk -v k="$kb" 'BEGIN {printf "%.2f", k*8/1000}')"
@@ -586,7 +666,6 @@ read_rate_input() {
     done
 }
 
-# 验证端口或端口范围格式 (如 100,443,10000-10050)
 validate_ports() {
     local raw="$1" part
     local -a parts
@@ -608,7 +687,6 @@ validate_ports() {
     [[ -n "$CLEANED_PORTS" ]]
 }
 
-# 菜单 2：配置/更新指定端口限速（含自定义阈值、限速速度、恢复时间）
 configure_custom_ports() {
     read_config
     local auto_iface
@@ -647,21 +725,20 @@ configure_custom_ports() {
     write_config
 
     echo ""
-    echo "正在应用底层限速规则并启动后台守护监控..."
+    echo "正在应用底层规则并启动高频毫秒级守护进程（每 10 秒轮询一次，秒级限速响应）..."
     python3 "$PY_HELPER" --restore-all 2>/dev/null || true
-    install_policy_cron
+    start_daemon_service
     python3 "$PY_HELPER"
 
     echo "=================================================="
     echo " 配置成功！"
     echo " 监控端口: $PORTS"
     echo " 平时速度: 下载 ${BASE_DOWN_MBIT} Mbps / 上传 ${BASE_UP_MBIT} Mbps"
-    echo " 限速策略: ${WINDOW_MIN} 分钟内流量达到 ${THRESHOLD_GB} GB 时，限速为 ${LIMIT_DOWN_MBIT} Mbps（持续 ${LIMIT_MIN} 分钟后自动恢复）"
-    echo " 后台监控已启动（每分钟自动检测一次流量）"
+    echo " 限速策略: ${WINDOW_MIN} 分钟内达 ${THRESHOLD_GB} GB 限速至 ${LIMIT_DOWN_MBIT} Mbps（持续 ${LIMIT_MIN} 分钟后恢复）"
+    echo " 后台守护进程已启动（每 10 秒精准检测，达到 3GB 秒级执行限速！）"
     echo "=================================================="
 }
 
-# 菜单 1：全自动策略（自动发现 xray/SSR 端口）
 enable_auto_discover_policy() {
     read_config
     local auto_iface
@@ -687,29 +764,146 @@ enable_auto_discover_policy() {
     write_config
 
     echo ""
-    echo "正在扫描系统代理端口并启动自动策略..."
-    install_policy_cron
+    echo "正在扫描系统代理端口并启动守护服务..."
+    start_daemon_service
     python3 "$PY_HELPER"
 
     echo "=================================================="
-    echo " 自动模式已启用！"
-    echo " 将自动监控 xray / 3x-ui / SSR / Docker 映射端口"
-    echo " 策略: ${WINDOW_MIN} 分钟内达 ${THRESHOLD_GB} GB 限速至 ${LIMIT_DOWN_MBIT} Mbps，${LIMIT_MIN} 分钟后恢复"
+    echo " 自动模式已启用！守护进程每 10 秒检测一次。"
+    echo "=================================================="
+}
+
+# 菜单 8：独立查看当前已被限速的端口
+show_limited_ports() {
+    read_config
+    echo "================== [当前被限速端口列表] =================="
+    python3 - "$BASE_DIR/xui_rate_limit_state.json" "$CONFIG" <<'STATUS_LIMITED_PY'
+import json
+import os
+import sys
+import time
+import datetime
+
+state_path = sys.argv[1]
+conf_path = sys.argv[2]
+
+if not os.path.isfile(state_path):
+    print("当前没有任何限速记录。")
+    sys.exit(0)
+
+try:
+    with open(state_path, encoding="utf-8") as f:
+        state = json.load(f)
+except Exception:
+    print("读取状态失败。")
+    sys.exit(0)
+
+now = int(time.time())
+active = state.get("active", {})
+limited_items = []
+
+for port, act in active.items():
+    reason = act.get("reason", "volume")
+    speed = act.get("speed", "限速")
+    if reason == "schedule":
+        limited_items.append({
+            "port": port,
+            "speed": speed,
+            "reason_desc": "命中定时限速时段",
+            "restore_desc": "等待设定时段结束自动恢复"
+        })
+    elif act.get("until", 0) > now:
+        rem_sec = act["until"] - now
+        rem_min = rem_sec // 60
+        until_dt = datetime.datetime.fromtimestamp(act["until"]).strftime("%Y-%m-%d %H:%M:%S")
+        start_dt = datetime.datetime.fromtimestamp(act.get("started", now)).strftime("%H:%M:%S")
+        trig = act.get("trigger_bytes", 0)
+        trig_str = f"{trig / (1024**3):.2f} GB" if trig >= 1024**3 else f"{trig / (1024**2):.2f} MB"
+        limited_items.append({
+            "port": port,
+            "speed": speed,
+            "reason_desc": f"流量超标达到 {trig_str} (于 {start_dt} 触发)",
+            "restore_desc": f"剩余约 {rem_min} 分钟 (预计 {until_dt} 恢复)"
+        })
+
+if not limited_items:
+    print("\n  [√] 当前没有端口处于限速状态，所有端口运行正常！\n")
+else:
+    print(f"\n  [!] 检测到共有 {len(limited_items)} 个端口正处于限速中：\n")
+    for item in sorted(limited_items, key=lambda x: int(x["port"])):
+        print(f"  ● 端口: {item['port']}")
+        print(f"    - 限速速率: {item['speed']} Mbps")
+        print(f"    - 限制原因: {item['reason_desc']}")
+        print(f"    - 恢复状态: {item['restore_desc']}")
+        print("  " + "-" * 50)
+print("==========================================================")
+STATUS_LIMITED_PY
+}
+
+# 菜单 9：设置限速时间段 (如 10-24)
+configure_time_schedule() {
+    read_config
+    echo "================== [设置限速时间段] =================="
+    echo "当前限速时段: ${TIME_SCHEDULE:-无（全天正常策略）}"
+    echo "时段作用模式: $(if [[ "$TIME_MODE" == "1" ]]; then echo "时段内强制限速至限制速度"; else echo "仅在该时段内计算流量超额"; fi)"
+    echo "----------------------------------------------------"
+    echo "说明: 输入格式为 H1-H2，例如 10-24 表示 10:00 到 24:00。"
+    echo "      也支持如 8-22，或者跨天如 22-6 (晚10点到早6点)。"
+    echo "      输入 0 可清除时间段设置。"
+    echo "----------------------------------------------------"
+    
+    local sched_in
+    while true; do
+        read -r -p "请输入限速时间段（例如 10-24，输入 0 清除，直接回车保留当前）: " sched_in
+        sched_in="${sched_in:-${TIME_SCHEDULE:-0}}"
+        if [[ "$sched_in" == "0" || "$sched_in" == "none" ]]; then
+            TIME_SCHEDULE=""
+            write_config
+            python3 "$PY_HELPER"
+            echo "已成功清除限速时间段设置！"
+            return
+        elif [[ "$sched_in" =~ ^([0-9]{1,2})-([0-9]{1,2})$ ]]; then
+            local h1="${BASH_REMATCH[1]}" h2="${BASH_REMATCH[2]}"
+            if ((h1 >= 0 && h1 <= 24 && h2 >= 0 && h2 <= 24 && h1 != h2)); then
+                TIME_SCHEDULE="$sched_in"
+                break
+            fi
+        fi
+        echo "格式错误，请输入合法小时范围（0-24），例如 10-24 或 22-6。"
+    done
+
+    echo ""
+    echo "请选择在时间段 [$TIME_SCHEDULE] 内的限速行为:"
+    echo "1. 时段强制限速: 只要处于该时间段，无论流量多少，立刻将端口限制到限速速度 (${LIMIT_DOWN_MBIT} Mbps)，离开该时段恢复"
+    echo "2. 时段流量监控: 仅在该时段内统计流量超额，超出阈值才限速；非该时段随便跑不限速"
+    read -r -p "请选择行为模式 [默认 1]: " mode_in
+    TIME_MODE="${mode_in:-1}"
+    if [[ "$TIME_MODE" != "2" ]]; then TIME_MODE="1"; fi
+
+    write_config
+    echo ""
+    echo "正在刷新守护进程规则..."
+    python3 "$PY_HELPER"
+    echo "=================================================="
+    echo " 设置成功！"
+    echo " 限速时间段: 每天 $TIME_SCHEDULE 点"
+    echo " 运行模式: $(if [[ "$TIME_MODE" == "1" ]]; then echo "到达该时段自动强制限速至 ${LIMIT_DOWN_MBIT} Mbps"; else echo "仅在该时段内计算流量超额"; fi)"
     echo "=================================================="
 }
 
 show_status() {
     read_config
-    echo "==================== 限速运行状态 ===================="
+    echo "==================== 限速运行全貌 ===================="
     echo "网络接口: ${IFACE:-未配置}"
     if [[ "$AUTO_DISCOVER" == "1" ]]; then
-        echo "运行模式: 自动扫描 xray / ShadowsocksR / 代理端口"
+        echo "运行模式: 自动扫描代理端口"
     else
         echo "运行模式: 手动指定端口模式 (端口: ${PORTS:-无})"
     fi
     echo "平时带宽: 下载 ${BASE_DOWN_MBIT} Mbps / 上传 ${BASE_UP_MBIT} Mbps"
-    echo "限速规则: ${WINDOW_MIN} 分钟内达到 ${THRESHOLD_GB} GB -> 限速至 ${LIMIT_DOWN_MBIT} Mbps (${LIMIT_MIN} 分钟后恢复)"
-    echo "自动限速策略: $(if [[ "$AUTO_ENABLED" == "1" ]]; then echo "已启用"; else echo "已停用"; fi)"
+    echo "流量限速: ${WINDOW_MIN} 分钟内达到 ${THRESHOLD_GB} GB -> 限速至 ${LIMIT_DOWN_MBIT} Mbps (${LIMIT_MIN} 分钟后恢复)"
+    echo "定时限速: $(if [[ -n "$TIME_SCHEDULE" ]]; then echo "每天 ${TIME_SCHEDULE} 点 (模式 ${TIME_MODE})"; else echo "未设置"; fi)"
+    echo "自动策略: $(if [[ "$AUTO_ENABLED" == "1" ]]; then echo "已启用"; else echo "已停用"; fi)"
     echo "------------------------------------------------------"
 
     python3 - "$BASE_DIR/xui_rate_limit_state.json" <<'STATUS_PY'
@@ -753,39 +947,44 @@ else:
             w_str = f"{window_bytes / 1024:.2f} KB"
 
         act = active.get(key)
-        if act and act.get("until", 0) > now:
-            until_dt = datetime.datetime.fromtimestamp(act["until"]).strftime("%H:%M:%S")
-            rem = (act["until"] - now) // 60
-            status_text = f"【已限速】剩余约 {rem} 分钟 (至 {until_dt} 恢复)"
+        if act:
+            if act.get("reason") == "schedule":
+                status_text = "【已限速 (定时时段强制)】"
+            elif act.get("until", 0) > now:
+                rem = (act["until"] - now) // 60
+                status_text = f"【已限速】剩余约 {rem} 分钟"
+            else:
+                status_text = "【正常】"
         else:
             status_text = "【正常】"
 
-        print(f"  - 端口 {key:5s} | 窗口内累计: {w_str:9s} | 状态: {status_text}")
-
+        print(f"  - 端口 {key:5s} | 窗口累计: {w_str:9s} | 状态: {status_text}")
 STATUS_PY
 
     echo "------------------------------------------------------"
     local tc_count
     tc_count="$({ tc filter show dev "$IFACE" ingress 2>/dev/null || true; tc filter show dev "$IFACE" egress 2>/dev/null || true; } | grep -Ec 'pref (42|52)[0-9]{3}' || true)"
     echo "底层 tc 规则生效条数: $tc_count"
-    local cron_check
-    cron_check="$(crontab -l 2>/dev/null | grep -c "$PY_HELPER" || true)"
-    echo "后台 Cron 监控: $(if [[ "$cron_check" -gt 0 ]]; then echo "运行中 (每分钟检测)"; else echo "未运行"; fi)"
+    local is_running="未运行"
+    if pgrep -f "$PY_HELPER --daemon" >/dev/null 2>&1; then
+        is_running="运行中 (10 秒超灵敏轮询)"
+    fi
+    echo "后台守护进程状态: $is_running"
     echo "======================================================"
 }
 
 stop_auto_policy() {
     read_config
-    remove_policy_cron
+    stop_daemon_service
     AUTO_ENABLED="0"
     write_config
     python3 "$PY_HELPER" --restore-all 2>/dev/null || true
-    echo "已停止自动限速守护策略，所有受限端口已恢复基础速度（基础端口限速仍保留）。"
+    echo "已停止后台自动限速守护进程，所有受限端口已恢复基础速度（基础端口限速仍保留）。"
 }
 
 remove_all_rules() {
     read_config
-    remove_policy_cron
+    stop_daemon_service
     python3 "$PY_HELPER" --remove-all 2>/dev/null || true
     rm -f "$CONFIG" "$BASE_DIR/xui_rate_limit_state.json"
     echo "已彻底清除全部端口限速规则和配置文件。"
@@ -805,46 +1004,41 @@ restore_rules() {
     read_config
     python3 "$PY_HELPER" --boot
     if [[ "$AUTO_ENABLED" == "1" ]]; then
-        install_policy_cron
+        start_daemon_service
     fi
 }
 
 run_diagnose() {
     echo "=== 正在执行系统与限速诊断 ==="
     read_config
-    echo "1. 默认公网网卡识别: $(get_default_iface)"
-    echo "2. 配置文件配置网卡: ${IFACE:-未配置}"
-    echo "3. 检查内核 clsact 支持:"
-    if ip link show dev "${IFACE:-$(get_default_iface)}" >/dev/null 2>&1; then
-        tc qdisc add dev "${IFACE:-$(get_default_iface)}" clsact 2>/dev/null || true
-        echo "   [OK] clsact qdisc 正常"
-    else
-        echo "   [FAIL] 网卡不可用"
-    fi
+    echo "1. 默认公网网卡: $(get_default_iface)"
+    echo "2. 当前配置网卡: ${IFACE:-未配置}"
+    echo "3. 检查后台进程: $(pgrep -f "$PY_HELPER --daemon" || echo "未运行")"
     echo "4. 检查 ss 监听与代理识别:"
-    python3 -c "import sys; sys.path.insert(0, '/root/speex'); from xui_rate_limit import discover_ports; print('   自动扫描到的代理端口:', discover_ports())" 2>/dev/null || echo "   未生成 Python 模块"
-    echo "5. 运行一次手动流量检测:"
+    python3 -c "import sys; sys.path.insert(0, '/root/speex'); from xui_rate_limit import discover_ports; print('   自动扫描代理端口:', discover_ports())" 2>/dev/null || true
+    echo "5. 执行一次手动检测:"
     python3 "$PY_HELPER"
     echo "=== 诊断完成 ==="
 }
 
-# 命令行入参调用
 if [[ "${1:-}" == "--restore" ]]; then restore_rules; exit 0; fi
 if [[ "${1:-}" == "--check" ]]; then python3 "$PY_HELPER"; exit 0; fi
 
 while true; do
     echo
-    echo "====== x-ui / SSR 端口限速管理 2.0 (增强版) ======"
+    echo "====== x-ui / SSR 端口限速管理 3.0 (高灵敏增强版) ======"
     echo "1. 启用/配置自动扫描模式（自动发现代理端口并设置阈值限速）"
     echo "2. 配置/更新指定端口限速（自定义端口、流量阈值、限速速度、恢复时间）"
-    echo "3. 查看当前流量统计与限速状态"
-    echo "4. 停止自动限速策略（保留基础限速）"
+    echo "3. 查看当前流量统计与全貌状态"
+    echo "4. 停止自动限速守护进程（恢复基础速度）"
     echo "5. 彻底移除全部限速规则"
-    echo "6. 安装开机自动恢复"
-    echo "7. 运行诊断 / 立即执行一次检测"
+    echo "6. 安装/更新开机自动恢复"
+    echo "7. 运行系统诊断 / 立即执行一次检测"
+    echo "8. 查看当前已被限速的端口（独立列表与倒计时）"
+    echo "9. 设置限速时间段（如 10-24 点限速）"
     echo "0. 退出"
-    echo "================================================="
-    read -r -p "请选择 [0-7]: " choice
+    echo "======================================================"
+    read -r -p "请选择 [0-9]: " choice
     case "$choice" in
         1) enable_auto_discover_policy ;;
         2) configure_custom_ports ;;
@@ -853,7 +1047,9 @@ while true; do
         5) remove_all_rules ;;
         6) install_boot_restore ;;
         7) run_diagnose ;;
+        8) show_limited_ports ;;
+        9) configure_time_schedule ;;
         0) exit 0 ;;
-        *) echo "无效选项，请输入 0 至 7。" ;;
+        *) echo "无效选项，请输入 0 至 9。" ;;
     esac
 done
