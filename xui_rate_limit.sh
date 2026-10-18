@@ -96,7 +96,7 @@ def config():
         "BASE_DOWN_MBIT": "100",
         "BASE_UP_MBIT": "100",
         "WINDOW_MIN": "15",
-        "THRESHOLD_GB": "3",
+        "THRESHOLD_MB": "1000",
         "LIMIT_DOWN_MBIT": "16",
         "LIMIT_UP_MBIT": "16",
         "LIMIT_MIN": "30",
@@ -125,7 +125,9 @@ def config():
     values["base_down"] = float(values.get("BASE_DOWN_MBIT", 100))
     values["base_up"] = float(values.get("BASE_UP_MBIT", 100))
     values["window_sec"] = int(float(values.get("WINDOW_MIN", 15)) * 60)
-    values["threshold_bytes"] = int(float(values.get("THRESHOLD_GB", 3)) * 1024 * 1024 * 1024)
+    thresh_mb = float(values.get("THRESHOLD_MB", float(values.get("THRESHOLD_GB", 1)) * 1024))
+    values["threshold_mb"] = thresh_mb
+    values["threshold_bytes"] = int(thresh_mb * 1024 * 1024)
     values["limit_down"] = float(values.get("LIMIT_DOWN_MBIT", 16))
     values["limit_up"] = float(values.get("LIMIT_UP_MBIT", 16))
     values["limit_sec"] = int(float(values.get("LIMIT_MIN", 30)) * 60)
@@ -448,7 +450,8 @@ def check_and_update():
                     "speed": cfg["limit_down"]
                 }
                 until_str = datetime.datetime.fromtimestamp(until_time).strftime("%Y-%m-%d %H:%M:%S")
-                log(f"[LIMIT] 端口 {key} 流量达 {format_bytes(window_total)} (阈值 {cfg['THRESHOLD_GB']} GB)，立即执行限速至 {cfg['limit_down']} Mbps！恢复时间: {until_str}")
+                thresh_display = f"{cfg.get('threshold_mb', 1000):.0f}" if float(cfg.get('threshold_mb', 1000)).is_integer() else f"{cfg.get('threshold_mb', 1000):.1f}"
+                log(f"[LIMIT] 端口 {key} 流量达 {format_bytes(window_total)} (阈值 {thresh_display} MB)，立即执行限速至 {cfg['limit_down']} Mbps！恢复时间: {until_str}")
 
     save(state)
 
@@ -550,7 +553,7 @@ read_config() {
     BASE_DOWN_MBIT="100"
     BASE_UP_MBIT="100"
     WINDOW_MIN="15"
-    THRESHOLD_GB="3"
+    THRESHOLD_MB="1000"
     LIMIT_DOWN_MBIT="16"
     LIMIT_UP_MBIT="16"
     LIMIT_MIN="30"
@@ -558,6 +561,9 @@ read_config() {
     TIME_MODE="1"
     if [[ -f "$CONFIG" ]]; then
         source "$CONFIG"
+        if [[ -z "${THRESHOLD_MB:-}" && -n "${THRESHOLD_GB:-}" ]]; then
+            THRESHOLD_MB="$(awk -v g="$THRESHOLD_GB" 'BEGIN {printf "%.0f", g*1024}')"
+        fi
     fi
 }
 
@@ -570,7 +576,7 @@ AUTO_ENABLED="${AUTO_ENABLED}"
 BASE_DOWN_MBIT="${BASE_DOWN_MBIT}"
 BASE_UP_MBIT="${BASE_UP_MBIT}"
 WINDOW_MIN="${WINDOW_MIN}"
-THRESHOLD_GB="${THRESHOLD_GB}"
+THRESHOLD_MB="${THRESHOLD_MB}"
 LIMIT_DOWN_MBIT="${LIMIT_DOWN_MBIT}"
 LIMIT_UP_MBIT="${LIMIT_UP_MBIT}"
 LIMIT_MIN="${LIMIT_MIN}"
@@ -678,7 +684,7 @@ enable_auto_discover_policy() {
     echo ""
     echo ">> 步骤 2: 设置流量超额限速策略"
     read_positive_float "流量统计时间窗口" "${WINDOW_MIN:-15}" " 分钟"; WINDOW_MIN="$REPLY"
-    read_positive_float "触发限速的流量阈值" "${THRESHOLD_GB:-3}" " GB"; THRESHOLD_GB="$REPLY"
+    read_positive_float "触发限速的流量阈值" "${THRESHOLD_MB:-1000}" " MB"; THRESHOLD_MB="$REPLY"
     read_rate_input "超额后限制的速度（Mbps，或输入如 2000k）" "${LIMIT_DOWN_MBIT:-16}"; LIMIT_DOWN_MBIT="$REPLY"; LIMIT_UP_MBIT="$REPLY"
     read_positive_float "限速持续时间（达到后自动恢复基础速度）" "${LIMIT_MIN:-30}" " 分钟"; LIMIT_MIN="$REPLY"
 
@@ -697,7 +703,7 @@ enable_auto_discover_policy() {
     echo "=================================================="
     echo " 智能自动模式已成功开启！"
     echo " 自动追踪: xray / x-ui / SSR / 现有与后续新建端口"
-    echo " 限速策略: ${WINDOW_MIN} 分钟内达 ${THRESHOLD_GB} GB 限速至 ${LIMIT_DOWN_MBIT} Mbps (${LIMIT_MIN} 分钟后恢复)"
+    echo " 限速策略: ${WINDOW_MIN} 分钟内达 ${THRESHOLD_MB} MB 限速至 ${LIMIT_DOWN_MBIT} Mbps (${LIMIT_MIN} 分钟后恢复)"
     echo " 守护进程每 10 秒灵敏轮询，秒级限速响应，负载低至 0.00%！"
     echo "=================================================="
 }
@@ -749,7 +755,7 @@ configure_custom_ports() {
     read_positive_float "每个端口平时下载上限" "${BASE_DOWN_MBIT:-100}" " Mbps"; BASE_DOWN_MBIT="$REPLY"
     read_positive_float "每个端口平时上传上限" "${BASE_UP_MBIT:-100}" " Mbps"; BASE_UP_MBIT="$REPLY"
     read_positive_float "流量统计时间窗口" "${WINDOW_MIN:-15}" " 分钟"; WINDOW_MIN="$REPLY"
-    read_positive_float "触发限速的流量阈值" "${THRESHOLD_GB:-3}" " GB"; THRESHOLD_GB="$REPLY"
+    read_positive_float "触发限速的流量阈值" "${THRESHOLD_MB:-1000}" " MB"; THRESHOLD_MB="$REPLY"
     read_rate_input "超额后限制的速度（Mbps，或输入如 2000k）" "${LIMIT_DOWN_MBIT:-16}"; LIMIT_DOWN_MBIT="$REPLY"; LIMIT_UP_MBIT="$REPLY"
     read_positive_float "限速持续时间" "${LIMIT_MIN:-30}" " 分钟"; LIMIT_MIN="$REPLY"
 
@@ -767,7 +773,7 @@ configure_custom_ports() {
     echo "=================================================="
     echo " 手动端口限速配置成功！"
     echo " 监控端口: $PORTS"
-    echo " 限速策略: ${WINDOW_MIN} 分钟内达 ${THRESHOLD_GB} GB 限速至 ${LIMIT_DOWN_MBIT} Mbps"
+    echo " 限速策略: ${WINDOW_MIN} 分钟内达 ${THRESHOLD_MB} MB 限速至 ${LIMIT_DOWN_MBIT} Mbps"
     echo "=================================================="
 }
 
@@ -893,7 +899,7 @@ show_status() {
         echo "运行模式: 手动指定端口模式 (端口: ${PORTS:-无})"
     fi
     echo "平时带宽: 下载 ${BASE_DOWN_MBIT} Mbps / 上传 ${BASE_UP_MBIT} Mbps"
-    echo "流量限速: ${WINDOW_MIN} 分钟内达 ${THRESHOLD_GB} GB -> 限速至 ${LIMIT_DOWN_MBIT} Mbps (${LIMIT_MIN} 分钟后恢复)"
+    echo "流量限速: ${WINDOW_MIN} 分钟内达 ${THRESHOLD_MB} MB -> 限速至 ${LIMIT_DOWN_MBIT} Mbps (${LIMIT_MIN} 分钟后恢复)"
     echo "定时限速: $(if [[ -n "$TIME_SCHEDULE" ]]; then echo "每天 ${TIME_SCHEDULE} 点 (模式 ${TIME_MODE})"; else echo "未设置"; fi)"
     echo "自动策略: $(if [[ "$AUTO_ENABLED" == "1" ]]; then echo "已启用"; else echo "已停用"; fi)"
     echo "------------------------------------------------------"
