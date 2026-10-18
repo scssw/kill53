@@ -434,6 +434,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 CONFIG = Path('/etc/xui2vps.conf')
@@ -1141,9 +1142,145 @@ def merge_traffic_counters(db, remote):
             for k in stale_keys:
                 del ledger[table][k]
 
+    # 自动校准入站线路流量（防止端口流量虚高膨胀）并解除被误禁用的客户端
+    repair_database(db)
+
     atomic_write(ledger_path, (json.dumps(ledger, ensure_ascii=False, separators=(',', ':')) + '\n').encode())
     print('副机流量已合并：匹配记录 %d 条，上传 +%d 字节，下载 +%d 字节。' %
           (matched, totals['up'], totals['down']))
+
+
+def repair_database(db):
+    """
+    1. 校准入站端口流量为其实际客户端流量之和（彻底解决端口流量膨胀至几TB的Bug）。
+    2. 解除被误禁用的客户端状态（针对流量未超配额且未到期、但因先前流量翻倍被锁死的情况）。
+    """
+    now_ms = int(time.time() * 1000)
+    inbounds = [dict(r) for r in db.execute('SELECT * FROM inbounds')]
+    clients = [dict(r) for r in db.execute('SELECT * FROM client_traffics')]
+
+    inbound_traffic_map = {}
+    for c in clients:
+        ib_id = c.get('inbound_id')
+        if ib_id not in inbound_traffic_map:
+            inbound_traffic_map[ib_id] = {'up': 0, 'down': 0, 'all_time': 0, 'count': 0}
+        inbound_traffic_map[ib_id]['up'] += max(0, int(c.get('up') or 0))
+        inbound_traffic_map[ib_id]['down'] += max(0, int(c.get('down') or 0))
+        inbound_traffic_map[ib_id]['all_time'] += max(0, int(c.get('all_time') or 0))
+        inbound_traffic_map[ib_id]['count'] += 1
+
+    healed_inbounds = 0
+    healed_clients = 0
+    inbound_cols = table_columns(db, 'inbounds')
+
+    # 1. 校准 inbounds 端口流量
+    for ib in inbounds:
+        ib_id = ib['id']
+        port = ib.get('port')
+        if ib_id in inbound_traffic_map and inbound_traffic_map[ib_id]['count'] > 0:
+            calc_up = inbound_traffic_map[ib_id]['up']
+            calc_down = inbound_traffic_map[ib_id]['down']
+            calc_all = inbound_traffic_map[ib_id]['all_time']
+            curr_up = max(0, int(ib.get('up') or 0))
+            curr_down = max(0, int(ib.get('down') or 0))
+
+            # 当入站端口统计流量大于客户端总和时，自动将其校准为客户端实际总和
+            if (curr_up + curr_down) > (calc_up + calc_down):
+                upd_fields = ['"up"=?', '"down"=?']
+                upd_vals = [calc_up, calc_down]
+                if 'all_time' in inbound_cols:
+                    upd_fields.append('"all_time"=?')
+                    upd_vals.append(calc_all or (calc_up + calc_down))
+                db.execute('UPDATE inbounds SET %s WHERE id = ?' % ','.join(upd_fields),
+                           upd_vals + [ib_id])
+                healed_inbounds += 1
+                print('[修复] 端口 %s 线路流量从 %.2f GB 校准为客户端实际总和 %.2f GB' %
+                      (port, (curr_up + curr_down) / (1024**3), (calc_up + calc_down) / (1024**3)))
+
+        # 检查入站线路是否因先前虚高超标而被误禁用
+        total_limit = max(0, int(ib.get('total') or 0))
+        exp_time = max(0, int(ib.get('expiry_time') or 0))
+        calc_tot = inbound_traffic_map.get(ib_id, {}).get('up', 0) + inbound_traffic_map.get(ib_id, {}).get('down', 0)
+        is_valid = (total_limit == 0 or calc_tot < total_limit) and (exp_time == 0 or exp_time > now_ms)
+        if is_valid and not ib.get('enable'):
+            db.execute('UPDATE inbounds SET enable = 1 WHERE id = ?', [ib_id])
+            healed_inbounds += 1
+            print('[修复] 端口 %s 线路已解除误禁用并重新启用' % port)
+
+    # 2. 修复客户端误禁用状态
+    for ib in inbounds:
+        ib_id = ib['id']
+        port = ib.get('port')
+        settings = parse_settings(ib.get('settings'))
+        c_list = settings.get('clients', [])
+        settings_changed = False
+
+        ib_clients = [c for c in clients if c.get('inbound_id') == ib_id]
+        ib_clients_by_email = {str(c.get('email') or '').strip(): c for c in ib_clients}
+
+        for c_dict in c_list:
+            email = str(c_dict.get('email') or '').strip()
+            if not email or email not in ib_clients_by_email:
+                continue
+            ct = ib_clients_by_email[email]
+            c_up = max(0, int(ct.get('up') or 0))
+            c_down = max(0, int(ct.get('down') or 0))
+            c_tot_used = c_up + c_down
+            c_limit = max(0, int(ct.get('total') or 0))
+            c_exp = max(0, int(ct.get('expiry_time') or 0))
+
+            is_under_quota = (c_limit == 0 or c_tot_used < c_limit)
+            is_not_expired = (c_exp == 0 or c_exp > now_ms)
+
+            # 仅当流量未超标、未过期，但 client_traffics.enable 却被置为 0 时进行自愈恢复
+            if is_under_quota and is_not_expired:
+                if not ct.get('enable'):
+                    db.execute('UPDATE client_traffics SET enable = 1 WHERE id = ?', [ct['id']])
+                    healed_clients += 1
+                    print('[修复] 客户端 %s 流量未超标(%.2fG / %.2fG)且未到期，已解除误禁用(enable=1)' %
+                          (email, c_tot_used / (1024**3), c_limit / (1024**3)))
+
+                if not c_dict.get('enable', True):
+                    c_dict['enable'] = True
+                    settings_changed = True
+
+        if settings_changed:
+            db.execute('UPDATE inbounds SET settings = ? WHERE id = ?',
+                       [json.dumps(settings, ensure_ascii=False), ib_id])
+
+    return healed_inbounds, healed_clients
+
+
+def repair_cmd():
+    print('正在检查并修复 x-ui 数据库异常数据...')
+    repaired_local = False
+    with open_db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            h_ib, h_ct = repair_database(db)
+            if h_ib > 0 or h_ct > 0:
+                db.commit()
+                repaired_local = True
+                print('已修复 %d 条端口线路流量及 %d 个被误禁用的客户端。' % (h_ib, h_ct))
+            else:
+                db.rollback()
+                print('未发现异常数据，本地数据库状态正常。')
+        except Exception:
+            db.rollback()
+            raise
+
+    if repaired_local:
+        subprocess.run(['systemctl', 'restart', 'x-ui'], check=False)
+        print('本地 x-ui 已重启，修复已生效。')
+
+    c = config()
+    if c.get('role') == 'master' and c.get('peer'):
+        print('正在将修复后的状态推送到副机并重启副机 x-ui...')
+        try:
+            push(force=True)
+            print('副机已同步更新并修复完毕。')
+        except Exception as e:
+            print('副机同步失败：%s' % e, file=sys.stderr)
 
 
 def merge_traffic():
@@ -1311,12 +1448,14 @@ def menu():
     print('2、设为副机')
     print('3、取消绑定系统')
     print('4、一键同步副机流量到主机')
+    print('5、一键修复异常数据（校准端口流量、解除误禁用客户端）')
     print('0、退出')
     choice = input('请选择: ').strip()
     if choice == '1': setup('master')
     elif choice == '2': setup('replica')
     elif choice == '3': unbind()
     elif choice == '4': merge_traffic()
+    elif choice == '5': repair_cmd()
     elif choice == '0': return
     else: print('无效选项')
 
@@ -1330,12 +1469,13 @@ def main():
         elif cmd == 'apply-config': apply_config()
         elif cmd == 'snapshot': snapshot()
         elif cmd == 'merge-traffic': merge_traffic()
+        elif cmd == 'repair': repair_cmd()
         elif cmd == 'status': print(config().get('role', 'unbound'))
         elif cmd == 'status-report': status_report()
         elif cmd == 'set-interval': set_interval()
         elif cmd == 'register-master-ip': register_master_ip()
         elif cmd == 'unbind-peer': apply_peer_unbind()
-        else: raise RuntimeError('用法: xui2vps [menu|push|apply-config|snapshot|merge-traffic]')
+        else: raise RuntimeError('用法: xui2vps [menu|push|apply-config|snapshot|merge-traffic|repair]')
     except (OSError, ValueError, KeyError, sqlite3.Error,
             subprocess.CalledProcessError, RuntimeError) as e:
         print('错误: ' + str(e), file=sys.stderr)
@@ -1354,7 +1494,7 @@ trap - EXIT HUP INT TERM
 printf '\n当前同步状态：\n'
 /usr/local/bin/ssr2vps status-report
 /usr/local/bin/xui2vps status-report
-printf '\n主菜单 v1.0.4：\n1、SSR 同步\n2、XUI 同步\n3、同步时间修改\n0、退出\n请选择: '
+printf '\n主菜单 v1.0.5：\n1、SSR 同步\n2、XUI 同步\n3、同步时间修改\n0、退出\n请选择: '
 IFS= read -r choice || choice=
 case "$choice" in
     1) exec /usr/local/bin/ssr2vps menu ;;
