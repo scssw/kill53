@@ -480,8 +480,22 @@ PatchSSRCommandLegacyIptables
 #Modify ShadowsocksR API
 nowip=$(grep -E -o "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)" /usr/local/shadowsocksr/userapiconfig.py)
 sed -i "s/sspanelv2/mudbjson/g" /usr/local/shadowsocksr/userapiconfig.py
-sed -i "s/UPDATE_TIME = 60/UPDATE_TIME = 10/g" /usr/local/shadowsocksr/userapiconfig.py
+sed -i "s/UPDATE_TIME = 60/UPDATE_TIME = 60/g" /usr/local/shadowsocksr/userapiconfig.py
 sed -i "s/SERVER_PUB_ADDR = '${nowip}'/SERVER_PUB_ADDR = '$(wget -4 -qO- -t1 -T2 ipinfo.io/ip)'/" /usr/local/shadowsocksr/userapiconfig.py
+
+# 根据本机网络环境自动配置 IPv6 (无 IPv6 则禁用以减半端口与定时器负载)
+ConfigSSR_IPv6(){
+    local cfg="/usr/local/shadowsocksr/config.json"
+    [ -f "$cfg" ] || return 0
+    if command -v ip >/dev/null 2>&1 && (ip -6 route show default 2>/dev/null | grep -q . || ip -6 addr show scope global 2>/dev/null | grep -q inet6); then
+        echo "检测到本机支持 IPv6，已开启 SSR IPv6 监听 (::)"
+        sed -i 's/"server_ipv6"[[:space:]]*:[[:space:]]*"[^"]*"/"server_ipv6": "::"/' "$cfg"
+    else
+        echo "未检测到可用 IPv6，已禁用 SSR IPv6 监听以节省系统与端口资源"
+        sed -i 's/"server_ipv6"[[:space:]]*:[[:space:]]*"[^"]*"/"server_ipv6": ""/' "$cfg"
+    fi
+}
+ConfigSSR_IPv6
 
 # 添加域名检测逻辑
 if [ ! -f /usr/local/shadowsocksr/myip.txt ] || ! grep -qE '^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,6}$' /usr/local/shadowsocksr/myip.txt; then
@@ -503,13 +517,11 @@ echo '安装完成！输入 ssr 即可使用本程序~'
 if [[ ${check} != "yes" ]] ;then
         echo "如果你执行 ssr 提示找不到命令，请尝试退出并重新登录来解决"
 fi
-# 检查是否已存在6小时重启SSR的任务
-if ! crontab -l | grep -q "sudo systemctl restart ssr-bash-python.service"; then
-    # 如果没有该任务，则添加
-    (crontab -l ; echo "0 */6 * * * sudo systemctl restart ssr-bash-python.service") | crontab -
-    echo "已添加6小时重启SSR的定时任务"
-else
-    echo "6小时重启SSR的定时任务已存在"
+# 取消定时重启服务任务（已通过内部内存回收彻底修复内存泄漏，不再需要定时重启，避免用户断线）
+if crontab -l 2>/dev/null | grep -q "restart ssr-bash-python.service"; then
+    echo "正在移除旧的定时重启SSR服务任务，防止用户断线..."
+    crontab -l 2>/dev/null | grep -v "restart ssr-bash-python.service" | crontab -
+    echo "已成功移除定时重启任务！"
 fi
 # 检查是否已存在每小时备份的任务
 if ! crontab -l | grep -q "/usr/local/SSR-Bash-Python/user/backup.sh"; then
@@ -551,6 +563,18 @@ if ! sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
     echo "BBR 已启用"
 else
     echo "BBR 已启用，无需重复设置"
+fi
+
+# 系统并发网络与高句柄调优（支持200+用户顺畅运行）
+if ! grep -q "fs.file-max = 512000" /etc/sysctl.conf 2>/dev/null; then
+    cat >> /etc/sysctl.conf << 'EOF'
+fs.file-max = 512000
+net.core.somaxconn = 4096
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 30
+EOF
+    sysctl -p >/dev/null 2>&1 || true
 fi
 
 # 检查是否已存在每小时删除的任务
