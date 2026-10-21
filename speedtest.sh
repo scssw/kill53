@@ -332,7 +332,7 @@ test_http_node() {
         local lat_str
         lat_str=$(awk -v t="$lat" 'BEGIN{printf "%.2f ms", t*1000}')
         printf " ${YELLOW}%s${PLAIN}   ${BLUE}%-17s${PLAIN} ${CYAN}%-19s${PLAIN} ${GREEN}%-11s${PLAIN} %-10s\n" \
-            "$padded_name" "HTTP 直连" "$dl_str" "$lat_str" "0.0%" | tee -a "$LOG_FILE"
+            "$padded_name" "[下行专测]" "$dl_str" "$lat_str" "0.0%" | tee -a "$LOG_FILE"
     else
         printf " ${YELLOW}%s${PLAIN}   ${RED}%-17s${PLAIN} ${RED}%-19s${PLAIN} ${RED}%-11s${PLAIN} %-10s\n" \
             "$padded_name" "Fail / Timeout" "Fail / Timeout" "-" "-" | tee -a "$LOG_FILE"
@@ -347,10 +347,10 @@ run_hybrid_node() {
 
     local success=0
 
-    # 1. 尝试 Ookla Speedtest (对香港/国内部分存活节点有效)
+    # 1. 尝试 Ookla Speedtest (对香港/国内部分存活节点有效，时长放宽到 40s 以确保测出上传)
     if [ -n "$ookla_id" ] && [ -x "$SPEEDTEST_BIN" ]; then
         local raw_out
-        raw_out=$(timeout 20 "$SPEEDTEST_BIN" --progress=no --accept-license --accept-gdpr -u Mbps -s "$ookla_id" 2>&1)
+        raw_out=$(timeout 40 "$SPEEDTEST_BIN" --progress=no --accept-license --accept-gdpr -u Mbps -s "$ookla_id" 2>&1)
         if ! echo "$raw_out" | grep -qi -E "No servers defined|NoServersException|Limit reached|Too many requests"; then
             local res_line
             res_line=$(parse_speedtest_output "$raw_out")
@@ -428,24 +428,23 @@ main() {
 
     # B. 中国大陆代表性三网节点与回国骨干专线
     if [ "$mode" != "nearest" ]; then
-        # 电信 (China Telecom)
+        # 1. 回国骨干全双工节点 (同时测 Upload 与 Download)
+        run_hybrid_node "32155" "移动·香港 (CMHK 5G)" "https://mirrors.tencent.com/debian/ls-lR.gz"
+        run_hybrid_node "1536"  "电信/联通·香港 (STC)" "https://mirrors.aliyun.com/debian/ls-lR.gz"
+
+        # 2. 大陆核心骨干直连 (高精度下行与网络延迟专测)
         run_hybrid_node "5396"  "电信·杭州 (Aliyun)" "https://mirrors.aliyun.com/debian/ls-lR.gz"
         run_hybrid_node "36663" "电信·上海 (Huawei)" "https://repo.huaweicloud.com/debian/ls-lR.gz"
 
-        # 联通 (China Unicom)
         run_hybrid_node "24447" "联通·北京 (Tencent)" "https://mirrors.tencent.com/debian/ls-lR.gz"
         run_hybrid_node "43752" "联通·广州 (Tencent)" "https://mirrors.cloud.tencent.com/debian/ls-lR.gz"
 
-        # 移动 (China Mobile)
-        run_hybrid_node "32155" "移动·香港 (CMHK 5G)" "https://mirrors.tencent.com/debian/ls-lR.gz"
         run_hybrid_node "16204" "移动·四川 (USTC/CM)" "https://mirrors.ustc.edu.cn/debian/ls-lR.gz"
-
-        # 教育网 / 跨网 BGP (CERNET)
         run_hybrid_node "30852" "教育·北京 (清华大学)" "https://mirrors.tuna.tsinghua.edu.cn/debian/ls-lR.gz"
 
-        # 全球节点（仅在 full 模式开启）
+        # 3. 亚太/海外扩展节点（仅在 full 模式开启）
         if [ "$mode" = "full" ]; then
-            run_hybrid_node "1536"  "香港 (Hong Kong STC)" ""
+            run_hybrid_node "17265" "远传电信 (台湾)" ""
             run_hybrid_node "56935" "日本东京 (Tokyo)" ""
             run_hybrid_node "40508" "新加坡 (Singapore)" ""
             run_hybrid_node "18229" "美国洛杉矶 (LA)" ""
@@ -453,6 +452,12 @@ main() {
     fi
 
     print_table_footer
+
+    log_echo " * 测速指标方向说明:"
+    log_echo "   - Upload Speed   : VPS 发往国内(上行/回国)带宽 (代理翻墙、看视频、建站响应速度的核心指标)"
+    log_echo "   - Download Speed : 国内发往 VPS(下行)带宽 (从国内拉取数据到 VPS 的下载速率)"
+    log_echo "   - 带具体数值的为全双工测速(测出上下行)，[下行专测] 为镜像源高精度直连拉取"
+    log_echo " ----------------------------------------------------------------------------------"
 
     local finish_time
     finish_time=$(date "+%Y-%m-%d %H:%M:%S")
