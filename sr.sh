@@ -203,7 +203,7 @@ if [[ ${OS} == Ubuntu ]];then
     apt-get -y install screen
     apt-get install git -y
     #apt-get install language-pack-zh-hans -y
-    apt-get -y install bc vnstat rsync
+    apt-get -y install bc vnstat rsync libjemalloc2
     #apt-get -y install build-essential
     #apt-get install net-tools -y
 fi
@@ -212,7 +212,7 @@ if [[ ${OS} == CentOS ]];then
     yum install git -y
     yum install bc -y
     yum install vnstat -y
-    yum install rsync -y
+    yum install rsync jemalloc -y
     #yum install net-tools -y
     yum groupinstall "Development Tools" -y
     yum install vixie-cron crontabs -y
@@ -222,7 +222,7 @@ if [[ ${OS} == Debian ]];then
     apt-get -y install screen
     apt-get install git -y
     #apt-get -y install net-tools
-    apt-get -y install bc vnstat rsync
+    apt-get -y install bc vnstat rsync libjemalloc2
     #apt-get install build-essential -y
     #apt-get install cron -y
     # 安装iptables
@@ -485,15 +485,18 @@ sed -i "s/SERVER_PUB_ADDR = '${nowip}'/SERVER_PUB_ADDR = '$(wget -4 -qO- -t1 -T2
 
 # 根据本机网络环境自动配置 IPv6 (无 IPv6 则禁用以减半端口与定时器负载)
 ConfigSSR_IPv6(){
-    local cfg="/usr/local/shadowsocksr/config.json"
-    [ -f "$cfg" ] || return 0
-    if command -v ip >/dev/null 2>&1 && (ip -6 route show default 2>/dev/null | grep -q . || ip -6 addr show scope global 2>/dev/null | grep -q inet6); then
-        echo "检测到本机支持 IPv6，已开启 SSR IPv6 监听 (::)"
-        sed -i 's/"server_ipv6"[[:space:]]*:[[:space:]]*"[^"]*"/"server_ipv6": "::"/' "$cfg"
-    else
-        echo "未检测到可用 IPv6，已禁用 SSR IPv6 监听以节省系统与端口资源"
-        sed -i 's/"server_ipv6"[[:space:]]*:[[:space:]]*"[^"]*"/"server_ipv6": ""/' "$cfg"
-    fi
+    for cfg in "/usr/local/shadowsocksr/config.json" "/usr/local/shadowsocksr/user-config.json"; do
+        [ -f "$cfg" ] || continue
+        if command -v ip >/dev/null 2>&1 && (ip -6 route show default 2>/dev/null | grep -q . || ip -6 addr show scope global 2>/dev/null | grep -q inet6); then
+            echo "检测到本机支持 IPv6，已开启 SSR IPv6 监听与解析 (::)"
+            sed -i 's/"server_ipv6"[[:space:]]*:[[:space:]]*"[^"]*"/"server_ipv6": "::"/' "$cfg"
+            sed -i 's/"dns_ipv6"[[:space:]]*:[[:space:]]*[a-zA-Z]*/"dns_ipv6": true/' "$cfg"
+        else
+            echo "未检测到可用 IPv6，已禁用 SSR IPv6 监听与解析以节省系统与端口资源"
+            sed -i 's/"server_ipv6"[[:space:]]*:[[:space:]]*"[^"]*"/"server_ipv6": ""/' "$cfg"
+            sed -i 's/"dns_ipv6"[[:space:]]*:[[:space:]]*[a-zA-Z]*/"dns_ipv6": false/' "$cfg"
+        fi
+    done
 }
 ConfigSSR_IPv6
 
