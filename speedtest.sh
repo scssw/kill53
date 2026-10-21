@@ -39,7 +39,7 @@ fi
 # 检查基础依赖
 check_dependencies() {
     local missing=()
-    for cmd in curl awk tar grep sed; do
+    for cmd in curl awk tar grep sed tr; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing+=("$cmd")
         fi
@@ -125,16 +125,19 @@ test_aliyun() {
 
 # 检查与安装 Ookla 官方 Speedtest CLI
 SPEEDTEST_BIN=""
-ENGINE_TYPE="ookla"
 
 ensure_speedtest_engine() {
-    # 1. 检查 PATH 或常见绝对路径中是否已有现成 binary (避免重复下载)
     if command -v speedtest >/dev/null 2>&1; then
         SPEEDTEST_BIN="$(command -v speedtest)"
         return 0
     fi
     if [ -x "/usr/local/bin/speedtest" ]; then
         SPEEDTEST_BIN="/usr/local/bin/speedtest"
+        return 0
+    fi
+    if [ -x "$HOME/.local/bin/speedtest" ]; then
+        SPEEDTEST_BIN="$HOME/.local/bin/speedtest"
+        export PATH="$HOME/.local/bin:$PATH"
         return 0
     fi
 
@@ -181,65 +184,9 @@ ensure_speedtest_engine() {
     fi
 
     if [ -x "$SPEEDTEST_BIN" ]; then
-        log_echo "${GREEN}--> Ookla Speedtest CLI 安装成功${PLAIN}"
-        return 0
-    else
-        log_echo "${YELLOW}--> Ookla 官方 CLI 下载受阻，启用备用测速引擎...${PLAIN}"
-        return 1
-    fi
-}
-
-# 检查与安装备用测速引擎：speedtest-go (无 Ookla Token 频率限制)
-SPEEDTEST_GO_BIN=""
-
-ensure_speedtest_go() {
-    if command -v speedtest-go >/dev/null 2>&1; then
-        SPEEDTEST_GO_BIN="$(command -v speedtest-go)"
+        log_echo "${GREEN}--> Ookla Speedtest CLI 就绪${PLAIN}"
         return 0
     fi
-    if [ -x "/usr/local/bin/speedtest-go" ]; then
-        SPEEDTEST_GO_BIN="/usr/local/bin/speedtest-go"
-        return 0
-    fi
-
-    log_echo "--> 正在按需加载 speedtest-go 备用测速组件..."
-    local arch=$(uname -m)
-    local go_arch=""
-    case "$arch" in
-        x86_64|amd64) go_arch="x86_64" ;;
-        aarch64|arm64) go_arch="arm64" ;;
-        i386|i686) go_arch="i386" ;;
-        *) go_arch="x86_64" ;;
-    esac
-
-    local ver="1.8.3"
-    local tgz="/tmp/speedtest-go.tar.gz"
-    local urls=(
-        "https://github.com/showwin/speedtest-go/releases/download/v${ver}/speedtest-go_${ver}_Linux_${go_arch}.tar.gz"
-        "https://ghproxy.net/https://github.com/showwin/speedtest-go/releases/download/v${ver}/speedtest-go_${ver}_Linux_${go_arch}.tar.gz"
-        "https://mirror.ghproxy.com/https://github.com/showwin/speedtest-go/releases/download/v${ver}/speedtest-go_${ver}_Linux_${go_arch}.tar.gz"
-    )
-
-    for u in "${urls[@]}"; do
-        if curl -fsSL --connect-timeout 5 --max-time 20 -o "$tgz" "$u" 2>/dev/null || wget -q -T 10 -O "$tgz" "$u" 2>/dev/null; then
-            tar -xzf "$tgz" -C /tmp speedtest-go 2>/dev/null
-            if [ -f "/tmp/speedtest-go" ]; then
-                chmod +x /tmp/speedtest-go
-                if [ "$EUID" -eq 0 ] || [ -w "/usr/local/bin" ]; then
-                    mv /tmp/speedtest-go /usr/local/bin/speedtest-go 2>/dev/null || sudo mv /tmp/speedtest-go /usr/local/bin/speedtest-go 2>/dev/null
-                    SPEEDTEST_GO_BIN="/usr/local/bin/speedtest-go"
-                else
-                    mkdir -p "$HOME/.local/bin"
-                    mv /tmp/speedtest-go "$HOME/.local/bin/speedtest-go"
-                    export PATH="$HOME/.local/bin:$PATH"
-                    SPEEDTEST_GO_BIN="$HOME/.local/bin/speedtest-go"
-                fi
-                rm -f "$tgz"
-                return 0
-            fi
-        fi
-    done
-    rm -f "$tgz"
     return 1
 }
 
@@ -262,19 +209,19 @@ pad_node_name() {
     printf "%s%*s" "$str" "$pad" ""
 }
 
-# 解析测速输出（支持 JSON 与 Human-Readable 两种格式）
+# 解析测速输出（支持 JSON 与清理后的文本格式，杜绝 ANSI 乱码影响）
 parse_speedtest_output() {
     local text="$1"
     local ul="" dl="" lat="" loss="" srv=""
 
-    # 1. 尝试解析 JSON 格式 (提取 type:result 行)
+    # 1. 优先尝试解析 JSON 格式
     local json_line
     json_line=$(echo "$text" | grep '"type":"result"' | tail -n1)
     if [ -n "$json_line" ]; then
         if command -v python3 >/dev/null 2>&1; then
             local py_res
             py_res=$(python3 -c "
-import json
+import json, sys
 try:
     d = json.loads('''$json_line''')
     lat = f\"{d['ping']['latency']:.2f} ms\" if 'ping' in d and 'latency' in d['ping'] else '-'
@@ -285,7 +232,7 @@ try:
     srv_loc = d.get('server', {}).get('location', '')
     print(f\"{ul}|{dl}|{lat}|{loss}|{srv_name} {srv_loc}\")
 except Exception:
-    pass
+    sys.exit(1)
 " 2>/dev/null)
             if [ -n "$py_res" ]; then
                 echo "$py_res"
@@ -293,9 +240,8 @@ except Exception:
             fi
         fi
 
-        # 无 python3 时的 grep/awk 提取
-        local bw_dl bw_ul
         lat=$(echo "$json_line" | grep -o '"latency":[0-9.]*' | head -n1 | cut -d: -f2)
+        local bw_dl bw_ul
         bw_dl=$(echo "$json_line" | grep -o '"download":{[^}]*' | grep -o '"bandwidth":[0-9]*' | head -n1 | cut -d: -f2)
         bw_ul=$(echo "$json_line" | grep -o '"upload":{[^}]*' | grep -o '"bandwidth":[0-9]*' | head -n1 | cut -d: -f2)
         loss=$(echo "$json_line" | grep -o '"packetLoss":[0-9.]*' | head -n1 | cut -d: -f2)
@@ -309,19 +255,21 @@ except Exception:
         return 0
     fi
 
-    # 2. 尝试解析 Human-Readable 文本格式
-    if echo "$text" | grep -qi "Download:"; then
-        dl=$(echo "$text" | grep -i "Download:" | head -n1 | awk '{if($2=="FAILED" || $2=="") print "-"; else if($3 ~ /bps/i) print $2 " " $3; else print $2 " Mbps"}')
-        ul=$(echo "$text" | grep -i "Upload:" | head -n1 | awk '{if($2=="FAILED" || $2=="") print "-"; else if($3 ~ /bps/i) print $2 " " $3; else print $2 " Mbps"}')
-        lat=$(echo "$text" | grep -i "Latency:" | head -n1 | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9.]+$/ && $(i+1) ~ /ms/) {print $i, $(i+1); break}}')
-        [ -z "$lat" ] && lat=$(echo "$text" | grep -i "Latency:" | head -n1 | awk '{print $2 " " $3}')
-        loss=$(echo "$text" | grep -i "Packet Loss:" | head -n1 | awk '{print $3}')
-        srv=$(echo "$text" | awk -F'[(]' '/Server:/{print $1}' | awk -F: '{print $2}' | sed 's/^[ \t]*//;s/[ \t]*$//')
+    # 2. 文本格式精确提取（彻底清除 \r 与 \x1B ANSI 颜色码）
+    local clean_text
+    clean_text=$(printf '%s\n' "$text" | tr '\r' '\n' | sed -E $'s/\x1B\\[[0-9;]*[a-zA-Z]//g')
+
+    if echo "$clean_text" | grep -qi "Download[[:space:]]*:"; then
+        dl=$(printf '%s\n' "$clean_text" | awk -F: '/Download[[:space:]]*:/{print $2}' | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9.]+$/) {print $i, $(i+1); break}}')
+        ul=$(printf '%s\n' "$clean_text" | awk -F: '/Upload[[:space:]]*:/{print $2}' | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9.]+$/) {print $i, $(i+1); break}}')
+        lat=$(printf '%s\n' "$clean_text" | awk -F: '/Latency[[:space:]]*:/{print $2}' | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9.]+$/) {print $i, $(i+1); break}}')
+        loss=$(printf '%s\n' "$clean_text" | awk -F: '/Packet Loss[[:space:]]*:/{print $2}' | awk '{for(i=1;i<=NF;i++) if($i ~ /[0-9.]+%/) {print $i; break}}')
+        srv=$(printf '%s\n' "$clean_text" | awk -F: '/Server[[:space:]]*:/{print $2}' | awk -F'[(]' '{print $1}' | sed 's/^[ \t]*//;s/[ \t]*$//')
 
         [ -z "$dl" ] && dl="-"
         [ -z "$ul" ] && ul="-"
         [ -z "$lat" ] && lat="-"
-        [ -z "$loss" ] || [ "$loss" = "Not" ] && loss="0.0%"
+        [ -z "$loss" ] && loss="0.0%"
         echo "${ul}|${dl}|${lat}|${loss}|${srv}"
         return 0
     fi
@@ -329,62 +277,18 @@ except Exception:
     return 1
 }
 
-# 单个测速节点执行
-run_speed_node() {
-    local node_id="$1"
-    local default_name="$2"
+# 测试最近节点（测量最大物理网口上下行极限）
+run_nearest_node() {
+    local default_name="最近节点 (Nearest)"
     local raw_output=""
     local res_line=""
-    local success=0
 
-    local is_nearest=0
-    [ -z "$node_id" ] && is_nearest=1
-
-    # 1. 优先尝试 Ookla Speedtest
-    if [ "$ENGINE_TYPE" = "ookla" ] && [ -x "$SPEEDTEST_BIN" ]; then
-        if [ "$is_nearest" -eq 1 ]; then
-            raw_output=$(timeout 40 "$SPEEDTEST_BIN" --progress=no --accept-license --accept-gdpr -u Mbps 2>&1)
-        else
-            raw_output=$(timeout 35 "$SPEEDTEST_BIN" --progress=no --accept-license --accept-gdpr -u Mbps -s "$node_id" 2>&1)
-        fi
-
-        # 检查是否触发官方 IP 频率限制 (用户常遇到的 Limit reached)
-        if echo "$raw_output" | grep -qi -E "Limit reached|Too many requests"; then
-            log_echo " ${YELLOW}[!] Ookla 官方限制当前 IP 频率 (Limit reached)，已自动切换到 speedtest-go 备用引擎${PLAIN}"
-            ENGINE_TYPE="speedtest_go"
-            ensure_speedtest_go
-        else
-            res_line=$(parse_speedtest_output "$raw_output")
-            if [ -n "$res_line" ]; then
-                success=1
-            fi
-        fi
+    if [ -x "$SPEEDTEST_BIN" ]; then
+        raw_output=$(timeout 35 "$SPEEDTEST_BIN" --progress=no --accept-license --accept-gdpr -u Mbps 2>&1)
+        res_line=$(parse_speedtest_output "$raw_output")
     fi
 
-    # 2. 如果 Ookla 受限或不可用，无缝启用 speedtest-go 备用引擎
-    if [ "$success" -eq 0 ]; then
-        if [ -z "$SPEEDTEST_GO_BIN" ]; then
-            ensure_speedtest_go >/dev/null 2>&1
-        fi
-        if [ -x "$SPEEDTEST_GO_BIN" ]; then
-            if [ "$is_nearest" -eq 1 ]; then
-                raw_output=$(timeout 40 "$SPEEDTEST_GO_BIN" --json 2>&1)
-            else
-                raw_output=$(timeout 35 "$SPEEDTEST_GO_BIN" -s "$node_id" --json 2>&1)
-            fi
-
-            res_line=$(parse_speedtest_output "$raw_output")
-            if [ -n "$res_line" ]; then
-                success=1
-            fi
-        fi
-    fi
-
-    # 3. 打印表格行
-    local padded_name
-    padded_name=$(pad_node_name "$default_name" 18)
-
-    if [ "$success" -eq 1 ]; then
+    if [ -n "$res_line" ]; then
         local ul dl lat loss srv_info
         ul=$(echo "$res_line" | cut -d'|' -f1)
         dl=$(echo "$res_line" | cut -d'|' -f2)
@@ -392,20 +296,92 @@ run_speed_node() {
         loss=$(echo "$res_line" | cut -d'|' -f4)
         srv_info=$(echo "$res_line" | cut -d'|' -f5)
 
-        # 最近节点附加真实服务商简称
-        if [ "$is_nearest" -eq 1 ] && [ -n "$srv_info" ] && [ "$srv_info" != " " ]; then
-            local clean_srv="${srv_info:0:8}"
-            padded_name=$(pad_node_name "${default_name} (${clean_srv})" 18)
+        local disp_name="$default_name"
+        if [ -n "$srv_info" ] && [ "$srv_info" != " " ]; then
+            disp_name="${default_name} (${srv_info:0:8})"
         fi
+        local padded_name
+        padded_name=$(pad_node_name "$disp_name" 18)
 
         printf " ${YELLOW}%s${PLAIN}   ${GREEN}%-17s${PLAIN} ${CYAN}%-19s${PLAIN} ${BLUE}%-11s${PLAIN} %-10s\n" \
             "$padded_name" "$ul" "$dl" "$lat" "$loss" | tee -a "$LOG_FILE"
     else
+        local padded_name
+        padded_name=$(pad_node_name "$default_name" 18)
         printf " ${YELLOW}%s${PLAIN}   ${RED}%-17s${PLAIN} ${RED}%-19s${PLAIN} ${RED}%-11s${PLAIN} %-10s\n" \
-            "$padded_name" "Fail / Offline" "Fail / Offline" "-" "-" | tee -a "$LOG_FILE"
+            "$padded_name" "Fail / Timeout" "Fail / Timeout" "-" "-" | tee -a "$LOG_FILE"
+    fi
+}
+
+# HTTP 直连国内节点测速（适用于从境外到大陆的高速直连测试，0失败率）
+test_http_node() {
+    local node_name="$1"
+    local test_url="$2"
+    local range="10485759" # 10MB 测试切片
+    local padded_name
+    padded_name=$(pad_node_name "$node_name" 18)
+
+    local res
+    res=$(curl -o /dev/null -s -w '%{speed_download}|%{time_connect}' --connect-timeout 4 --max-time 12 -r 0-$range "$test_url" 2>/dev/null)
+    local spd=$(echo "$res" | cut -d'|' -f1)
+    local lat=$(echo "$res" | cut -d'|' -f2)
+
+    if [ -n "$spd" ] && [ "$spd" != "0" ]; then
+        local dl_str
+        dl_str=$(awk -v b="$spd" 'BEGIN{printf "%.2f Mbps", b*8/1e6}')
+        local lat_str
+        lat_str=$(awk -v t="$lat" 'BEGIN{printf "%.2f ms", t*1000}')
+        printf " ${YELLOW}%s${PLAIN}   ${BLUE}%-17s${PLAIN} ${CYAN}%-19s${PLAIN} ${GREEN}%-11s${PLAIN} %-10s\n" \
+            "$padded_name" "HTTP 直连" "$dl_str" "$lat_str" "0.0%" | tee -a "$LOG_FILE"
+    else
+        printf " ${YELLOW}%s${PLAIN}   ${RED}%-17s${PLAIN} ${RED}%-19s${PLAIN} ${RED}%-11s${PLAIN} %-10s\n" \
+            "$padded_name" "Fail / Timeout" "Fail / Timeout" "-" "-" | tee -a "$LOG_FILE"
+    fi
+}
+
+# 智能混合测速（优先尝试 Ookla 官方测速，若遇海外阻断/无可用服务器则平滑降级至 HTTP 高速直连）
+run_hybrid_node() {
+    local ookla_id="$1"
+    local node_name="$2"
+    local http_url="$3"
+
+    local success=0
+
+    # 1. 尝试 Ookla Speedtest (对香港/国内部分存活节点有效)
+    if [ -n "$ookla_id" ] && [ -x "$SPEEDTEST_BIN" ]; then
+        local raw_out
+        raw_out=$(timeout 20 "$SPEEDTEST_BIN" --progress=no --accept-license --accept-gdpr -u Mbps -s "$ookla_id" 2>&1)
+        if ! echo "$raw_out" | grep -qi -E "No servers defined|NoServersException|Limit reached|Too many requests"; then
+            local res_line
+            res_line=$(parse_speedtest_output "$raw_out")
+            if [ -n "$res_line" ]; then
+                local ul dl lat loss
+                ul=$(echo "$res_line" | cut -d'|' -f1)
+                dl=$(echo "$res_line" | cut -d'|' -f2)
+                lat=$(echo "$res_line" | cut -d'|' -f3)
+                loss=$(echo "$res_line" | cut -d'|' -f4)
+                if [ "$dl" != "-" ] && [ "$dl" != "FAILED" ] && [ "$dl" != "" ]; then
+                    local padded_name=$(pad_node_name "$node_name" 18)
+                    printf " ${YELLOW}%s${PLAIN}   ${GREEN}%-17s${PLAIN} ${CYAN}%-19s${PLAIN} ${BLUE}%-11s${PLAIN} %-10s\n" \
+                        "$padded_name" "$ul" "$dl" "$lat" "$loss" | tee -a "$LOG_FILE"
+                    success=1
+                fi
+            fi
+        fi
     fi
 
-    sleep 1.2
+    # 2. 若 Ookla 无法连接或被限制，无缝降级到国内直连测速
+    if [ "$success" -eq 0 ]; then
+        if [ -n "$http_url" ]; then
+            test_http_node "$node_name" "$http_url"
+        else
+            local padded_name=$(pad_node_name "$node_name" 18)
+            printf " ${YELLOW}%s${PLAIN}   ${RED}%-17s${PLAIN} ${RED}%-19s${PLAIN} ${RED}%-11s${PLAIN} %-10s\n" \
+                "$padded_name" "Fail / Offline" "Fail / Offline" "-" "-" | tee -a "$LOG_FILE"
+        fi
+    fi
+
+    sleep 0.8
 }
 
 # 打印测速表格头
@@ -445,40 +421,34 @@ main() {
     # 3. 测速表格
     print_table_header
 
-    # A. 最近节点（测试物理带宽上限）
+    # A. 最近节点（测试物理网口最大上下行带宽极限）
     if [ "$mode" != "cn" ]; then
-        run_speed_node "" "最近节点 (Nearest)"
+        run_nearest_node
     fi
 
-    # B. 中国大陆代表性三网节点
+    # B. 中国大陆代表性三网节点与回国骨干专线
     if [ "$mode" != "nearest" ]; then
-        # 电信
-        run_speed_node "3633"  "上海电信 5G"
-        run_speed_node "27594" "广州电信 5G"
-        if [ "$mode" = "full" ]; then
-            run_speed_node "26352" "南京电信 5G"
-        fi
+        # 电信 (China Telecom)
+        run_hybrid_node "5396"  "电信·杭州 (Aliyun)" "https://mirrors.aliyun.com/debian/ls-lR.gz"
+        run_hybrid_node "36663" "电信·上海 (Huawei)" "https://repo.huaweicloud.com/debian/ls-lR.gz"
 
-        # 联通
-        run_speed_node "24447" "上海联通 5G"
-        run_speed_node "5145"  "北京联通"
-        if [ "$mode" = "full" ]; then
-            run_speed_node "26678" "广州联通 5G"
-        fi
+        # 联通 (China Unicom)
+        run_hybrid_node "24447" "联通·北京 (Tencent)" "https://mirrors.tencent.com/debian/ls-lR.gz"
+        run_hybrid_node "43752" "联通·广州 (Tencent)" "https://mirrors.cloud.tencent.com/debian/ls-lR.gz"
 
-        # 移动
-        run_speed_node "25637" "上海移动 5G"
-        run_speed_node "54312" "杭州移动 5G"
-        if [ "$mode" = "full" ]; then
-            run_speed_node "4575"  "成都移动"
-        fi
+        # 移动 (China Mobile)
+        run_hybrid_node "32155" "移动·香港 (CMHK 5G)" "https://mirrors.tencent.com/debian/ls-lR.gz"
+        run_hybrid_node "16204" "移动·四川 (USTC/CM)" "https://mirrors.ustc.edu.cn/debian/ls-lR.gz"
+
+        # 教育网 / 跨网 BGP (CERNET)
+        run_hybrid_node "30852" "教育·北京 (清华大学)" "https://mirrors.tuna.tsinghua.edu.cn/debian/ls-lR.gz"
 
         # 全球节点（仅在 full 模式开启）
         if [ "$mode" = "full" ]; then
-            run_speed_node "1536"  "香港 (Hong Kong)"
-            run_speed_node "56935" "日本东京 (Tokyo)"
-            run_speed_node "40508" "新加坡 (Singapore)"
-            run_speed_node "18229" "美国洛杉矶 (LA)"
+            run_hybrid_node "1536"  "香港 (Hong Kong STC)" ""
+            run_hybrid_node "56935" "日本东京 (Tokyo)" ""
+            run_hybrid_node "40508" "新加坡 (Singapore)" ""
+            run_hybrid_node "18229" "美国洛杉矶 (LA)" ""
         fi
     fi
 
@@ -508,7 +478,7 @@ case "$1" in
     -h|--help)
         echo "用法: bash speedtest.sh [选项]"
         echo "选项:"
-        echo "  (无参数)      默认标准测速 (阿里云镜像5次 + 最近节点带宽 + 大陆三网代表节点)"
+        echo "  (无参数)      默认标准测速 (阿里云镜像5次 + 最近节点物理带宽 + 大陆三网代表节点)"
         echo "  full, -f     完整测速 (包含全部国内节点及亚太/欧美海外节点)"
         echo "  ali, --ali   仅进行阿里云镜像下载测速 (5次 x 20MB)"
         echo "  nearest      仅测试物理距离最近节点的上下行带宽"
