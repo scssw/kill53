@@ -11,6 +11,7 @@ CONFIG_PATH="/etc/${APP_NAME}.conf"
 LOG_PATH="/var/log/${APP_NAME}.log"
 CRON_MARKER="# ${APP_NAME}_daily_job"
 CRON_TZ_MARKER="# ${APP_NAME}_timezone"
+CRON_PAUSE_MARKER="# ${APP_NAME}_daily_job_paused"
 DEFAULT_SSR_FILE="/usr/local/shadowsocksr/mudb.json"
 DEFAULT_TIMELIMIT_FILE="/usr/local/SSR-Bash-Python/timelimit.db"
 ROOT_SSH_DIR="/root/.ssh"
@@ -271,6 +272,8 @@ check_cron_status() {
     local cron_line
     cron_line="$(crontab -l 2>/dev/null | grep -F "$CRON_MARKER" | head -n 1)"
     echo "运行中 (${cron_line%% $CRON_MARKER*})"
+  elif crontab -l 2>/dev/null | grep -Fq "$CRON_PAUSE_MARKER" || [ "${CRON_PAUSED:-0}" = "1" ]; then
+    echo "已暂停 (可按 8 恢复启动)"
   else
     echo "未设置"
   fi
@@ -346,6 +349,7 @@ write_config() {
     printf 'TIMELIMIT_FILE=%q\n' "${TIMELIMIT_FILE:-$DEFAULT_TIMELIMIT_FILE}"
     printf 'TRANSFER_ENABLED=%q\n' "$transfer_enabled"
     printf 'TRANSFER_MODE=%q\n' "${TRANSFER_MODE:-ssr}"
+    printf 'CRON_PAUSED=%q\n' "${CRON_PAUSED:-0}"
   } > "$CONFIG_PATH"
   chmod 600 "$CONFIG_PATH"
 }
@@ -359,7 +363,7 @@ install_cron() {
   oh="${out%:*}"; om="${out#*:}"; bh="${back%:*}"; bm="${back#*:}"
   oh="$((10#$oh))"; om="$((10#$om))"; bh="$((10#$bh))"; bm="$((10#$bm))"
   tmp="$(mktemp)"
-  crontab -l 2>/dev/null | grep -vF "$CRON_MARKER" | grep -vF "$CRON_TZ_MARKER" | grep -v '^CRON_TZ=Asia/Shanghai$' > "$tmp" || true
+  crontab -l 2>/dev/null | grep -vF "$CRON_MARKER" | grep -vF "$CRON_TZ_MARKER" | grep -vF "$CRON_PAUSE_MARKER" | grep -v '^CRON_TZ=Asia/Shanghai$' > "$tmp" || true
   printf 'CRON_TZ=Asia/Shanghai\n%s\n' "$CRON_TZ_MARKER" >> "$tmp"
   printf '%d %d * * * %s --out >> %s 2>&1 %s\n' "$om" "$oh" "$INSTALL_PATH" "$LOG_PATH" "$CRON_MARKER" >> "$tmp"
   printf '%d %d * * * %s --back >> %s 2>&1 %s\n' "$bm" "$bh" "$INSTALL_PATH" "$LOG_PATH" "$CRON_MARKER" >> "$tmp"
@@ -407,7 +411,7 @@ setup_ssh_login() {
 remove_cron() {
   local tmp
   tmp="$(mktemp)"
-  crontab -l 2>/dev/null | grep -vF "$CRON_MARKER" | grep -vF "$CRON_TZ_MARKER" | grep -v '^CRON_TZ=Asia/Shanghai$' > "$tmp" || true
+  crontab -l 2>/dev/null | grep -vF "$CRON_MARKER" | grep -vF "$CRON_TZ_MARKER" | grep -vF "$CRON_PAUSE_MARKER" | grep -v '^CRON_TZ=Asia/Shanghai$' > "$tmp" || true
   crontab "$tmp"
   rm -f "$tmp"
 }
@@ -432,6 +436,7 @@ load_config() {
   TRANSFER_MODE="${TRANSFER_MODE:-ssr}"
   DOMAINS="${DOMAINS:-${DOMAIN:-}}"
   if [ -z "${DOMAIN:-}" ]; then DOMAIN="${DOMAINS%% *}"; fi
+  CRON_PAUSED="${CRON_PAUSED:-0}"
 }
 
 load_config_silent() {
@@ -451,6 +456,7 @@ load_config_silent() {
     TRANSFER_MODE="${TRANSFER_MODE:-ssr}"
     DOMAINS="${DOMAINS:-${DOMAIN:-}}"
     if [ -z "${DOMAIN:-}" ]; then DOMAIN="${DOMAINS%% *}"; fi
+    CRON_PAUSED="${CRON_PAUSED:-0}"
   fi
 }
 
@@ -831,6 +837,7 @@ setup_switch() {
   TIMELIMIT_FILE="$DEFAULT_TIMELIMIT_FILE"
 
   install_self
+  CRON_PAUSED="0"
   write_config "1"
   install_cron "$SWITCH_TIME" "$RETURN_TIME"
 
@@ -857,6 +864,7 @@ change_time() {
   read -r SWITCH_TIME RETURN_TIME <<< "$(prompt_schedule_times)"
 
   install_self
+  CRON_PAUSED="0"
   write_config "${TRANSFER_ENABLED:-1}"
   install_cron "$SWITCH_TIME" "$RETURN_TIME"
 
@@ -874,6 +882,7 @@ change_transfer_mode() {
   fi
   prompt_transfer_mode
   install_self
+  CRON_PAUSED="0"
   write_config "1"
   install_cron "$SWITCH_TIME" "$RETURN_TIME"
   echo "数据转移类型已修改为：${TRANSFER_MODE}。"
@@ -926,8 +935,73 @@ disable_transfer() {
 cancel_all() {
   need_root
   remove_cron
+  CRON_PAUSED="0"
   rm -f "$CONFIG_PATH"
   echo "已取消所有设置：cron 定时任务已删除，配置文件已删除。"
+}
+
+pause_transfer() {
+  need_root
+  require_cmd crontab
+  load_config_silent
+
+  if [ ! -f "$CONFIG_PATH" ]; then
+    echo "未找到配置文件，尚未配置定时转移。"
+    return 1
+  fi
+
+  if ! crontab -l 2>/dev/null | grep -Fq "$CRON_MARKER"; then
+    if crontab -l 2>/dev/null | grep -Fq "$CRON_PAUSE_MARKER" || [ "${CRON_PAUSED:-0}" = "1" ]; then
+      echo "当前定时转移任务已经是暂停状态。"
+      return 0
+    fi
+    echo "当前没有运行中的定时转移任务。"
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  crontab -l 2>/dev/null | grep -vF "$CRON_MARKER" | grep -vF "$CRON_TZ_MARKER" | grep -vF "$CRON_PAUSE_MARKER" | grep -v '^CRON_TZ=Asia/Shanghai$' > "$tmp" || true
+  printf '# CRON_PAUSED %s\n' "$CRON_PAUSE_MARKER" >> "$tmp"
+  crontab "$tmp"
+  rm -f "$tmp"
+
+  CRON_PAUSED="1"
+  write_config "${TRANSFER_ENABLED:-1}"
+
+  echo "=========================================="
+  echo "定时转移任务已暂停！"
+  echo "所有配置信息均已完整保留在 ${CONFIG_PATH}。"
+  echo "随时可以通过菜单【8、启动定时转移】一键恢复运行。"
+  echo "=========================================="
+}
+
+resume_transfer() {
+  need_root
+  require_cmd crontab
+  load_config_silent
+
+  if [ ! -f "$CONFIG_PATH" ] || [ -z "${SWITCH_TIME:-}" ] || [ -z "${RETURN_TIME:-}" ]; then
+    echo "未找到完整配置，请先通过菜单【1、设置定时切换域名和数据】完成首次配置。"
+    return 1
+  fi
+
+  if crontab -l 2>/dev/null | grep -Fq "$CRON_MARKER"; then
+    echo "定时转移任务当前已在运行中，无需重复启动。"
+    echo "当前状态：$(check_cron_status)"
+    return 0
+  fi
+
+  install_self
+  CRON_PAUSED="0"
+  write_config "${TRANSFER_ENABLED:-1}"
+  install_cron "$SWITCH_TIME" "$RETURN_TIME"
+
+  echo "=========================================="
+  echo "定时转移任务已启动！"
+  echo "每天北京时间 ${SWITCH_TIME} 传送、${RETURN_TIME} 传回。"
+  echo "当前状态：$(check_cron_status)"
+  echo "=========================================="
 }
 
 show_menu() {
@@ -960,10 +1034,12 @@ show_menu() {
   echo "4、修改定时时间"
   echo "5、修改目标 IP 及端口"
   echo "6、升级脚本设置不变"
-  echo "7、修改转移数据"
+  echo "7、暂停定时转移"
+  echo "8、启动定时转移"
+  echo "9、修改转移数据"
   echo "0、退出"
   echo
-  read -r -p "请输入选项 [0-7]：" choice
+  read -r -p "请输入选项 [0-9]：" choice
 
   case "$choice" in
     1) setup_switch ;;
@@ -972,7 +1048,9 @@ show_menu() {
     4) change_time ;;
     5) change_target_ip ;;
     6) upgrade_script_only ;;
-    7) change_transfer_mode ;;
+    7) pause_transfer ;;
+    8) resume_transfer ;;
+    9) change_transfer_mode ;;
     0) exit 0 ;;
     *) echo "无效选项。" && exit 1 ;;
   esac
@@ -985,6 +1063,12 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
       ;;
     --back)
       run_job back
+      ;;
+    --pause)
+      pause_transfer
+      ;;
+    --resume|--start)
+      resume_transfer
       ;;
     *)
       show_menu
