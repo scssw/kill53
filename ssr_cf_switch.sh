@@ -653,17 +653,41 @@ prompt_schedule_times() {
   done
 }
 
+detect_local_public_ip() {
+  local detected
+  detected=$(curl -s4 -m 3 https://api.ipify.org 2>/dev/null || curl -s4 -m 3 https://ip.sb 2>/dev/null || curl -s4 -m 3 https://ifconfig.me 2>/dev/null || true)
+  if [ -n "$detected" ] && valid_ipv4 "$detected"; then
+    printf '%s\n' "$detected"
+  fi
+}
+
 prompt_local_ip() {
+  local default_ip="${LOCAL_IP:-}"
+  if [ -z "$default_ip" ]; then
+    default_ip="$(detect_local_public_ip || true)"
+  fi
+  local default_port="${LOCAL_SSH_PORT:-22}"
   local ip_input port_input
+
   while true; do
-    read -r -p "请输入 A 机公网 IPv4（传回时域名将指向此地址）${LOCAL_IP:+ [当前: $LOCAL_IP]}：" ip_input
-    ip_input="${ip_input:-${LOCAL_IP:-}}"
-    if valid_ipv4 "$ip_input"; then LOCAL_IP="$ip_input"; break; fi
-    echo "A 机 IP 格式不正确。"
+    local ip_prompt="请输入 A/本机公网 IPv4（传回时域名将指向此地址）"
+    if [ -n "$default_ip" ]; then
+      ip_prompt+=" [当前: ${default_ip}] (直接回车保持不变)"
+    fi
+    ip_prompt+="："
+
+    read -r -p "$ip_prompt" ip_input
+    ip_input="${ip_input:-$default_ip}"
+    if [ -n "$ip_input" ] && valid_ipv4 "$ip_input"; then
+      LOCAL_IP="$ip_input"
+      break
+    fi
+    echo "A/本机 IP 格式不正确，请输入有效的 IPv4 地址。"
   done
+
   while true; do
-    read -r -p "请输入 A 机 SSH 端口（B 机回传数据到此端口） [当前: ${LOCAL_SSH_PORT:-22}]：" port_input
-    port_input="${port_input:-${LOCAL_SSH_PORT:-22}}"
+    read -r -p "请输入 A/本机 SSH 端口（B 机传回数据到此端口） [当前: ${default_port}] (直接回车保持不变)：" port_input
+    port_input="${port_input:-$default_port}"
     if [[ "$port_input" =~ ^[0-9]+$ ]] && [ "$port_input" -ge 1 ] && [ "$port_input" -le 65535 ]; then
       LOCAL_SSH_PORT="$port_input"
       return 0
@@ -939,6 +963,28 @@ change_target_ip() {
   fi
 }
 
+change_local_ip() {
+  need_root
+  load_config_silent
+
+  if [ ! -f "$CONFIG_PATH" ]; then
+    echo "未找到配置文件，请先使用菜单 1 进行首次配置。"
+    return 1
+  fi
+
+  echo "当前 A/本机地址：${LOCAL_IP:-未设置} (SSH 端口: ${LOCAL_SSH_PORT:-22})"
+  prompt_local_ip
+
+  install_self
+  write_config "${TRANSFER_ENABLED:-1}"
+
+  echo "=========================================="
+  echo "A/本机信息已修改为：${LOCAL_IP} (SSH 端口: ${LOCAL_SSH_PORT})"
+  echo "后续定时任务传回时会将 ${DOMAINS:-$DOMAIN} 的 A 记录指向 ${LOCAL_IP}。"
+  echo "注意：B 机传回数据时会连接 A 机的 ${LOCAL_SSH_PORT} 端口，请确保防火墙已放行对应端口。"
+  echo "=========================================="
+}
+
 upgrade_script_only() {
   need_root
   install_self
@@ -1044,7 +1090,7 @@ show_menu() {
     echo "  • 目标地址: ${TARGET_IP} (SSH 端口: ${TARGET_PORT:-22})"
     echo "  • 传送时间: 每天 ${SWITCH_TIME:-未设置}（北京时间）"
     echo "  • 传回时间: 每天 ${RETURN_TIME:-未设置}（北京时间）"
-    echo "  • A 机地址: ${LOCAL_IP:-未设置}"
+    echo "  • A 机地址: ${LOCAL_IP:-未设置} (SSH 端口: ${LOCAL_SSH_PORT:-22})"
     if [ "${CF_AUTH_TYPE:-token}" = "global_key" ]; then
       echo "  • 认证方式: Global API Key (${CF_EMAIL})"
     else
@@ -1065,9 +1111,10 @@ show_menu() {
   echo "7、暂停定时转移"
   echo "8、启动定时转移"
   echo "9、修改转移数据"
+  echo "10、修改 A/本机 IP 及端口"
   echo "0、退出"
   echo
-  read -r -p "请输入选项 [0-9]：" choice
+  read -r -p "请输入选项 [0-10]：" choice
 
   case "$choice" in
     1) setup_switch ;;
@@ -1079,6 +1126,7 @@ show_menu() {
     7) pause_transfer ;;
     8) resume_transfer ;;
     9) change_transfer_mode ;;
+    10) change_local_ip ;;
     0) exit 0 ;;
     *) echo "无效选项。" && exit 1 ;;
   esac
@@ -1097,6 +1145,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
       ;;
     --resume|--start)
       resume_transfer
+      ;;
+    --local-ip)
+      change_local_ip
       ;;
     *)
       show_menu
