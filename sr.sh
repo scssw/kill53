@@ -334,16 +334,7 @@ if [ -e /usr/local/bin/ssr ];then
         echo "卸载完成!!"
         exit 0
     fi
-    if [ -z "$yn" ]; then
-        echo -e "\033[33m检测到服务器已安装 ShadowsocksR 与 SSR-Bash-Python\033[0m"
-        read -t 15 -p "是否更新到最新版本？[Y/n] (默认 15 秒后自动更新): " yn
-        [ -z "$yn" ] && yn="y"
-        echo ""
-    fi
-    if [[ $yn == [nN] ]]; then
-        echo "已取消更新。"
-        exit 0
-    fi
+    echo -e "\033[32m检测到服务器已安装 ShadowsocksR 与 SSR-Bash-Python，正在自动更新部署最新版本...\033[0m"
 
     echo "开始更新"
     echo "正在备份用户数据..."
