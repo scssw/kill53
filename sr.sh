@@ -470,10 +470,13 @@ fi
 PatchSSRCommandLegacyIptables
 
 #Modify ShadowsocksR API
-nowip=$(grep -E -o "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)" /usr/local/shadowsocksr/userapiconfig.py)
-sed -i "s/sspanelv2/mudbjson/g" /usr/local/shadowsocksr/userapiconfig.py
-sed -i "s/UPDATE_TIME = 60/UPDATE_TIME = 60/g" /usr/local/shadowsocksr/userapiconfig.py
-sed -i "s/SERVER_PUB_ADDR = '${nowip}'/SERVER_PUB_ADDR = '$(wget -4 -qO- -t1 -T2 ipinfo.io/ip)'/" /usr/local/shadowsocksr/userapiconfig.py
+if [ ! -f /usr/local/shadowsocksr/userapiconfig.py ] && [ -f /usr/local/shadowsocksr/apiconfig.py ]; then
+    cp -f /usr/local/shadowsocksr/apiconfig.py /usr/local/shadowsocksr/userapiconfig.py
+fi
+nowip=$(grep -E -o "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/null || echo "127.0.0.1")
+sed -i "s/sspanelv2/mudbjson/g" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/null || true
+sed -i "s/UPDATE_TIME = 60/UPDATE_TIME = 60/g" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/null || true
+sed -i "s/SERVER_PUB_ADDR = '${nowip}'/SERVER_PUB_ADDR = '$(wget -4 -qO- -t1 -T2 ipinfo.io/ip)'/" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/null || true
 
 # 根据本机网络环境自动配置 IPv6 (无 IPv6 则禁用以减半端口与定时器负载)
 ConfigSSR_IPv6(){
