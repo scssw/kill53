@@ -600,3 +600,10 @@ echo "已添加或更新为每6分钟执行删除任务"
 # 设置为北京时间
 timedatectl set-timezone Asia/Shanghai
 echo "系统时区已设置为北京时间"
+
+# 重启 SSR 服务使更新的代码立即生效
+if [ -f /usr/local/shadowsocksr/logrun.sh ]; then
+    echo "正在重启 ShadowsocksR 服务以加载最新优化代码..."
+    bash /usr/local/shadowsocksr/logrun.sh
+    echo "ShadowsocksR 服务已成功重启并生效！"
+fi
