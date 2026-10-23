@@ -339,7 +339,7 @@ if [ -e /usr/local/bin/ssr ];then
     echo "开始更新"
     echo "正在备份用户数据..."
     [ -f /usr/local/shadowsocksr/mudb.json ] && cp -f /usr/local/shadowsocksr/mudb.json /usr/local/mudb.json.bak
-    [ -f /usr/local/shadowsocksr/user-config.json ] && cp -f /usr/local/shadowsocksr/user-config.json /usr/local/user-config.json.bak
+    rm -f /usr/local/shadowsocksr/user-config.json /usr/local/user-config.json.bak
 
     sleep 1s
     echo "正在清理老版本"
@@ -360,7 +360,7 @@ if [ -e /usr/local/bin/ssr ];then
         git checkout manyuser
     fi
     [ -f /usr/local/mudb.json.bak ] && cp -f /usr/local/mudb.json.bak /usr/local/shadowsocksr/mudb.json
-    [ -f /usr/local/user-config.json.bak ] && cp -f /usr/local/user-config.json.bak /usr/local/shadowsocksr/user-config.json
+    rm -f /usr/local/shadowsocksr/user-config.json /usr/local/user-config.json.bak
 fi
 if [[ -d /usr/local/SSR-Bash-Python ]];then
     echo "开始部署 SSR-Bash-Python"
@@ -474,13 +474,14 @@ if [ ! -f /usr/local/shadowsocksr/userapiconfig.py ] && [ -f /usr/local/shadowso
     cp -f /usr/local/shadowsocksr/apiconfig.py /usr/local/shadowsocksr/userapiconfig.py
 fi
 nowip=$(grep -E -o "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/null || echo "127.0.0.1")
+sed -i "s/API_INTERFACE[[:space:]]*=.*/API_INTERFACE = 'mudbjson'/" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/null || true
 sed -i "s/sspanelv2/mudbjson/g" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/null || true
 sed -i "s/UPDATE_TIME = 60/UPDATE_TIME = 60/g" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/null || true
 sed -i "s/SERVER_PUB_ADDR = '${nowip}'/SERVER_PUB_ADDR = '$(wget -4 -qO- -t1 -T2 ipinfo.io/ip)'/" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/null || true
 
 # 根据本机网络环境自动配置 IPv6 (无 IPv6 则禁用以减半端口与定时器负载)
 ConfigSSR_IPv6(){
-    for cfg in "/usr/local/shadowsocksr/config.json" "/usr/local/shadowsocksr/user-config.json"; do
+    for cfg in "/usr/local/shadowsocksr/config.json"; do
         [ -f "$cfg" ] || continue
         # 自动修复 fast_open 与 verbose 之间的逗号语法
         sed -i 's/"fast_open"[[:space:]]*:[[:space:]]*false[[:space:]]*$/"fast_open": false,/' "$cfg" 2>/dev/null || true
