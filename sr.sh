@@ -334,61 +334,62 @@ if [ -e /usr/local/bin/ssr ];then
         echo "卸载完成!!"
         exit 0
     fi
-    if [[ ! $yn == n ]];then
-        if [[ ! -e /usr/local/SSR-Bash-Python/version.txt ]];then
-            yn="y"
-        fi
+    if [ -z "$yn" ]; then
+        echo -e "\033[33m检测到服务器已安装 ShadowsocksR 与 SSR-Bash-Python\033[0m"
+        read -t 15 -p "是否更新到最新版本？[Y/n] (默认 15 秒后自动更新): " yn
+        [ -z "$yn" ] && yn="y"
+        echo ""
     fi
-    if [[ ${yn} == [yY] ]];then
-        mv /usr/local/shadowsocksr/mudb.json /usr/local/mudb.json
-        rm -rf /usr/local/shadowsocksr
-        cd /usr/local
-        git clone https://github.com/scssw/shadowsocksr
-        if [[ $1 == develop ]];then
-            cd ./shadowsocksr
-            git checkout stack/dev
-            rm -f ./mudb.json
-            mv ../mudb.json ./mudb.json
-        else
-            rm -f ./shadowsocksr/mudb.json
-            mv /usr/local/mudb.json /usr/local/shadowsocksr/mudb.json
-        fi
+    if [[ $yn == [nN] ]]; then
+        echo "已取消更新。"
+        exit 0
     fi
+
     echo "开始更新"
+    echo "正在备份用户数据..."
+    [ -f /usr/local/shadowsocksr/mudb.json ] && cp -f /usr/local/shadowsocksr/mudb.json /usr/local/mudb.json.bak
+    [ -f /usr/local/shadowsocksr/user-config.json ] && cp -f /usr/local/shadowsocksr/user-config.json /usr/local/user-config.json.bak
+
     sleep 1s
     echo "正在清理老版本"
     rm -f /usr/local/bin/ssr
     rm -f /usr/local/bin/s
     sleep 1s
-    echo "开始部署"
-    cd /usr/local/shadowsocksr
-    git pull
-    git checkout manyuser
-    if [[ $1 == "develop" ]];then
-        git checkout stack/dev
+    echo "开始部署 ShadowsocksR"
+    if [ -d /usr/local/shadowsocksr/.git ]; then
+        cd /usr/local/shadowsocksr
+        git checkout manyuser 2>/dev/null || true
+        git fetch origin manyuser
+        git reset --hard origin/manyuser
+    else
+        rm -rf /usr/local/shadowsocksr
+        cd /usr/local
+        git clone https://github.com/scssw/shadowsocksr
+        cd /usr/local/shadowsocksr
+        git checkout manyuser
     fi
+    [ -f /usr/local/mudb.json.bak ] && cp -f /usr/local/mudb.json.bak /usr/local/shadowsocksr/mudb.json
+    [ -f /usr/local/user-config.json.bak ] && cp -f /usr/local/user-config.json.bak /usr/local/shadowsocksr/user-config.json
 fi
 if [[ -d /usr/local/SSR-Bash-Python ]];then
-    if [[ $yn == [yY] ]];then
+    echo "开始部署 SSR-Bash-Python"
+    cd /usr/local/SSR-Bash-Python
+    [ -f timelimit.db ] && cp -f timelimit.db /usr/local/timelimit.db.bak
+    if [ -d /usr/local/SSR-Bash-Python/.git ]; then
+        git checkout master 2>/dev/null || true
+        git fetch origin master
+        git reset --hard origin/master
+    else
         rm -rf /usr/local/SSR-Bash-Python
         cd /usr/local
         git clone https://github.com/scssw/SSR-Bash-Python.git
     fi
-    cd /usr/local/SSR-Bash-Python
-    git checkout master
-    git pull
-    if [[ $1 == "develop" ]];then
-        git checkout develop
-        git pull
-    fi
+    [ -f /usr/local/timelimit.db.bak ] && cp -f /usr/local/timelimit.db.bak /usr/local/SSR-Bash-Python/timelimit.db
 else
     cd /usr/local
     git clone https://github.com/scssw/SSR-Bash-Python.git
     cd SSR-Bash-Python
     git checkout master
-    if [[ $1 == "develop" ]];then
-        git checkout develop
-    fi
     cd ..
     bashinstall="no"
 fi
