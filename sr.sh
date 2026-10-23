@@ -487,6 +487,12 @@ sed -i "s/SERVER_PUB_ADDR = '${nowip}'/SERVER_PUB_ADDR = '$(wget -4 -qO- -t1 -T2
 ConfigSSR_IPv6(){
     for cfg in "/usr/local/shadowsocksr/config.json" "/usr/local/shadowsocksr/user-config.json"; do
         [ -f "$cfg" ] || continue
+        # 设置静音模式 (verbose: -1) 只记录 WARN/ERROR，消除海量正常连接与探测的磁盘 I/O 损耗
+        if grep -q '"verbose"' "$cfg"; then
+            sed -i 's/"verbose"[[:space:]]*:[[:space:]]*[0-9-]*/"verbose": -1/' "$cfg"
+        else
+            sed -i '/"fast_open"/a\    "verbose": -1,' "$cfg"
+        fi
         if command -v ip >/dev/null 2>&1 && (ip -6 route show default 2>/dev/null | grep -q . || ip -6 addr show scope global 2>/dev/null | grep -q inet6); then
             echo "检测到本机支持 IPv6，已开启 SSR IPv6 监听与解析 (::)"
             sed -i 's/"server_ipv6"[[:space:]]*:[[:space:]]*"[^"]*"/"server_ipv6": "::"/' "$cfg"
