@@ -1,21 +1,40 @@
 #!/usr/bin/env bash
 # 强制使用 UTF-8 环境
 export LANG=en_US.UTF-8
-set -euo pipefail
 
 DEFAULT_PORT="12345"
 CLASH_CMD_PATH="${CLASH_INSTALL_PATH:-/usr/local/bin/clash}"
 RELAY_SCRIPT_PATH="${RELAY_SCRIPT_PATH:-/usr/local/bin/ssr_clash_relay.py}"
 SERVICE_PATH="${SERVICE_PATH:-/etc/systemd/system/ssr-clash-relay.service}"
 ENV_PATH="${ENV_PATH:-/etc/default/ssr-clash-relay}"
+CADDY_SERVICE_PATH="/etc/systemd/system/caddy.service"
+CADDY_CONFIG_DIR="/etc/caddy"
+CADDYFILE="/etc/caddy/Caddyfile"
+CRON_RENEW_FILE="/etc/cron.d/caddy-renew"
+
+PORT="${DEFAULT_PORT}"
+DOMAIN=""
+SSL_ENABLED="false"
+
+# 载入已有配置 (如果存在)
+if [[ -f "${ENV_PATH}" ]]; then
+  # shellcheck source=/dev/null
+  source "${ENV_PATH}" 2>/dev/null || true
+fi
 
 print_info() { printf "\e[1;32m[INFO]\e[0m %s\n" "$*"; }
 print_err() { printf "\e[1;31m[ERROR]\e[0m %s\n" "$*" >&2; }
 
+get_host_ip() {
+  local ip
+  ip=$(curl -s --max-time 2 api.ipify.org 2>/dev/null || curl -s --max-time 2 https://ip.sb 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')
+  echo "${ip:-127.0.0.1}"
+}
+
 start_relay_service() {
   if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
     systemctl daemon-reload
-    systemctl enable --now ssr-clash-relay.service
+    systemctl enable ssr-clash-relay.service >/dev/null 2>&1 || true
     systemctl restart ssr-clash-relay.service
   else
     pkill -f "${RELAY_SCRIPT_PATH}" || true
@@ -23,16 +42,24 @@ start_relay_service() {
   fi
 }
 
-# 1. 刷新环境：清理旧进程和残留文件
 cleanup_old_version() {
   print_info "正在清理旧版本进程及缓存..."
   if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
     systemctl stop ssr-clash-relay.service >/dev/null 2>&1 || true
   fi
-  pkill -f ssr_clash_relay.py || true
-  pkill -f "${RELAY_SCRIPT_PATH}" || true
-  rm -f /tmp/ssr_clash_relay.pid
-  rm -f /tmp/ssr_clash.log
+  pkill -f ssr_clash_relay.py >/dev/null 2>&1 || true
+  pkill -f "${RELAY_SCRIPT_PATH}" >/dev/null 2>&1 || true
+  rm -f /tmp/ssr_clash_relay.pid /tmp/ssr_clash.log
+}
+
+save_env_config() {
+  mkdir -p "$(dirname "${ENV_PATH}")"
+  cat > "${ENV_PATH}" <<EOF
+PORT=${PORT}
+DOMAIN=${DOMAIN}
+RELAY_SCRIPT=${RELAY_SCRIPT_PATH}
+SSL_ENABLED=${SSL_ENABLED:-false}
+EOF
 }
 
 install_relay_script() {
@@ -192,10 +219,7 @@ PY
 
 install_systemd_service() {
   mkdir -p "$(dirname "${ENV_PATH}")" "$(dirname "${SERVICE_PATH}")"
-  cat > "${ENV_PATH}" <<EOF
-PORT=${PORT}
-RELAY_SCRIPT=${RELAY_SCRIPT_PATH}
-EOF
+  save_env_config
 
   cat > "${SERVICE_PATH}" <<'SERVICE'
 [Unit]
@@ -224,6 +248,7 @@ export LANG=en_US.UTF-8
 PORT="__RELAY_PORT__"
 RELAY_SCRIPT="__RELAY_SCRIPT_PATH__"
 BIND_DOMAIN="__BIND_DOMAIN__"
+SSL_ENABLED="__SSL_ENABLED__"
 
 print_input_help() {
   echo "请逐行输入 SSR 地址，支持多条。" >&2
@@ -264,14 +289,18 @@ fi
 if [[ -n "${BIND_DOMAIN}" ]]; then
     ADDR="${BIND_DOMAIN}"
 else
-    ADDR=$(curl -s --max-time 2 api.ipify.org || hostname -I | awk '{print $1}')
+    ADDR=$(curl -s --max-time 2 api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
 fi
 
 ENCODED=$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$SSR_INPUT_FOR_URL")
 echo -e "\n\e[1;32m您的 Clash 订阅链接：\e[0m"
-echo "http://${ADDR}:${PORT}/sub?target=clash&url=${ENCODED}"
-if [[ -n "${BIND_DOMAIN}" ]]; then
+if [[ "${SSL_ENABLED}" == "true" && -n "${BIND_DOMAIN}" ]]; then
   echo "https://${BIND_DOMAIN}/sub?target=clash&url=${ENCODED}"
+else
+  echo "http://${ADDR}:${PORT}/sub?target=clash&url=${ENCODED}"
+  if [[ -n "${BIND_DOMAIN}" ]]; then
+    echo "https://${BIND_DOMAIN}/sub?target=clash&url=${ENCODED}"
+  fi
 fi
 SCRIPT
 
@@ -279,26 +308,317 @@ SCRIPT
   sed -i "s|__RELAY_SCRIPT_PATH__|${RELAY_SCRIPT_PATH}|g" "${CLASH_CMD_PATH}"
   sed -i "s|__RELAY_PORT__|${PORT}|g" "${CLASH_CMD_PATH}"
   sed -i "s|__BIND_DOMAIN__|${DOMAIN}|g" "${CLASH_CMD_PATH}"
+  sed -i "s|__SSL_ENABLED__|${SSL_ENABLED:-false}|g" "${CLASH_CMD_PATH}"
   chmod +x "${CLASH_CMD_PATH}"
 }
 
-# --- 执行流程 ---
-cleanup_old_version
+update_caddyfile() {
+  mkdir -p "${CADDY_CONFIG_DIR}"
+  cat > "${CADDYFILE}" <<EOF
+${DOMAIN} {
+    reverse_proxy 127.0.0.1:${PORT}
+}
+EOF
+}
 
-# 端口互动
-read -r -p "请输入中转端口 (默认 12345): " PORT
-PORT=${PORT:-12345}
+install_caddy_if_needed() {
+  if command -v caddy >/dev/null 2>&1; then
+    print_info "检测到已安装 Caddy: $(caddy version 2>/dev/null | head -n 1 || echo 'Caddy')"
+    return 0
+  fi
+  print_info "正在自动安装 Caddy..."
 
-# 域名互动
-read -r -p "请输入绑定域名 (例如 example.com，直接回车则使用IP): " DOMAIN
-DOMAIN=${DOMAIN:-""}
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq || true
+    apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl gpg || true
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' 2>/dev/null | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null || true
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' 2>/dev/null | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null 2>&1 || true
+    apt-get update -qq || true
+    if apt-get install -y -qq caddy; then
+      print_info "Caddy APT 安装成功！"
+      return 0
+    fi
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y 'dnf-command(copr)' || true
+    dnf copr enable -y @caddy/caddy || true
+    if dnf install -y caddy; then
+      print_info "Caddy DNF 安装成功！"
+      return 0
+    fi
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y yum-plugin-copr || true
+    yum copr enable -y @caddy/caddy || true
+    if yum install -y caddy; then
+      print_info "Caddy YUM 安装成功！"
+      return 0
+    fi
+  fi
 
-install_relay_script
-install_systemd_service
-install_clash_cmd
-start_relay_service
+  print_info "尝试官方预编译二进制安装 Caddy..."
+  local arch
+  arch="$(uname -m)"
+  local caddy_arch="amd64"
+  case "$arch" in
+    x86_64) caddy_arch="amd64" ;;
+    aarch64|arm64) caddy_arch="arm64" ;;
+    armv7l) caddy_arch="armv7" ;;
+    *) caddy_arch="amd64" ;;
+  esac
+  local tar_url="https://github.com/caddyserver/caddy/releases/latest/download/caddy_linux_${caddy_arch}.tar.gz"
+  mkdir -p /tmp/caddy_dl
+  if curl -sL --max-time 30 "$tar_url" -o /tmp/caddy_dl/caddy.tar.gz; then
+    tar -xzf /tmp/caddy_dl/caddy.tar.gz -C /tmp/caddy_dl
+    mv /tmp/caddy_dl/caddy /usr/local/bin/caddy
+    chmod +x /usr/local/bin/caddy
+    rm -rf /tmp/caddy_dl
+    print_info "Caddy 二进制安装成功！"
+    return 0
+  else
+    rm -rf /tmp/caddy_dl
+    print_err "Caddy 下载失败，请检查机器网络！"
+    return 1
+  fi
+}
 
-print_info "安装/刷新完成！"
-print_info "绑定地址: ${DOMAIN:-'系统自动获取IP'}"
-print_info "中转端口: ${PORT}"
-print_info "现在只需执行 'clash'，逐行粘贴一个或多个 SSR 链接，空行结束后即可生成新链接。"
+ensure_caddy_service() {
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    if ! systemctl list-unit-files caddy.service >/dev/null 2>&1 && [[ ! -f "${CADDY_SERVICE_PATH}" ]]; then
+      local caddy_bin
+      caddy_bin="$(command -v caddy)"
+      cat > "${CADDY_SERVICE_PATH}" <<SERVICE
+[Unit]
+Description=Caddy Web Server
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${caddy_bin} run --config ${CADDYFILE}
+ExecReload=${caddy_bin} reload --config ${CADDYFILE}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+configure_service() {
+  echo ""
+  print_info "=== 重新配置 SSR 转 Clash 服务 ==="
+
+  read -r -p "请输入中转端口 (当前/默认: ${PORT:-12345}): " NEW_PORT
+  PORT="${NEW_PORT:-${PORT:-12345}}"
+
+  read -r -p "请输入绑定域名 (当前: ${DOMAIN:-无}，直接回车保留当前值或使用IP): " NEW_DOMAIN
+  DOMAIN="${NEW_DOMAIN:-${DOMAIN:-""}}"
+
+  cleanup_old_version
+  install_relay_script
+  install_systemd_service
+  install_clash_cmd
+  start_relay_service
+
+  if [[ "${SSL_ENABLED:-false}" == "true" && -n "${DOMAIN}" && -f "${CADDYFILE}" ]]; then
+    update_caddyfile
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl reload caddy >/dev/null 2>&1 || systemctl restart caddy >/dev/null 2>&1 || true
+    fi
+  fi
+
+  local host_ip
+  host_ip="$(get_host_ip)"
+  print_info "配置安装完成！"
+  print_info "当前 HTTP 转换: http://${DOMAIN:-$host_ip}:${PORT}"
+  if [[ "${SSL_ENABLED:-false}" == "true" && -n "${DOMAIN}" ]]; then
+    print_info "当前 HTTPS 转换: https://${DOMAIN}"
+  fi
+  print_info "现在只需在终端执行 'clash'，粘贴 SSR 链接即可生成订阅。"
+}
+
+uninstall_all() {
+  echo ""
+  read -r -p "确定要彻底移除所有配置、服务和脚本吗？(y/N): " CONFIRM
+  if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    print_info "已取消卸载操作。"
+    return 0
+  fi
+
+  print_info "正在停止并清理服务..."
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop ssr-clash-relay.service >/dev/null 2>&1 || true
+    systemctl disable ssr-clash-relay.service >/dev/null 2>&1 || true
+    if [[ -f "${CADDYFILE}" ]]; then
+      systemctl stop caddy >/dev/null 2>&1 || true
+      systemctl disable caddy >/dev/null 2>&1 || true
+    fi
+  fi
+  pkill -f ssr_clash_relay.py >/dev/null 2>&1 || true
+  pkill -f "${RELAY_SCRIPT_PATH}" >/dev/null 2>&1 || true
+
+  rm -f "${SERVICE_PATH}"
+  rm -f "${ENV_PATH}"
+  rm -f "${RELAY_SCRIPT_PATH}"
+  rm -f "${CLASH_CMD_PATH}"
+  rm -f "${CADDYFILE}"
+  rm -f "${CRON_RENEW_FILE}"
+  rm -f /tmp/ssr_clash* /var/log/ssr-clash-relay.log
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+
+  PORT="${DEFAULT_PORT}"
+  DOMAIN=""
+  SSL_ENABLED="false"
+
+  print_info "所有配置、脚本与服务已彻底移除！"
+}
+
+setup_caddy_ssl() {
+  echo ""
+  print_info "=== 给域名申请 HTTPS 证书 (Caddy 自动申请与定时续订) ==="
+
+  local current_dom="${DOMAIN:-}"
+  local target_domain=""
+  if [[ -n "${current_dom}" ]]; then
+    read -r -p "请输入要申请证书的域名 (直接回车默认使用 [${current_dom}]): " INPUT_DOMAIN
+    target_domain="${INPUT_DOMAIN:-$current_dom}"
+  else
+    read -r -p "请输入要申请证书的域名 (例如 sub.example.com): " INPUT_DOMAIN
+    target_domain="${INPUT_DOMAIN:-}"
+  fi
+
+  if [[ -z "${target_domain}" ]]; then
+    print_err "未输入有效域名，已取消证书申请。"
+    return 1
+  fi
+  DOMAIN="${target_domain}"
+
+  local host_ip
+  host_ip="$(get_host_ip)"
+  print_info "当前本机 IP: ${host_ip}"
+  print_info "请务必确认域名 [${DOMAIN}] 已通过 A 记录解析至本机 IP [${host_ip}]，且本机 80/443 端口已在安全组/防火墙放行。"
+
+  # 安装 Caddy
+  install_caddy_if_needed || return 1
+
+  # 写入 Caddyfile
+  update_caddyfile
+
+  # 确保 service 存在
+  ensure_caddy_service
+
+  # 启动并申请证书
+  print_info "正在启动 Caddy 并向 Let's Encrypt / ZeroSSL 申请证书..."
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    systemctl daemon-reload
+    systemctl enable caddy >/dev/null 2>&1 || true
+    systemctl restart caddy
+  else
+    pkill -f "caddy run" || true
+    nohup "$(command -v caddy)" run --config "${CADDYFILE}" >/var/log/caddy.log 2>&1 &
+  fi
+
+  # 设置定时自动续订任务
+  print_info "设置定时自动续订任务..."
+  mkdir -p /etc/cron.d
+  cat > "${CRON_RENEW_FILE}" <<'CRON'
+# 每天凌晨 03:30 自动检查并重载 Caddy 证书
+30 3 * * * root systemctl reload caddy >/dev/null 2>&1 || systemctl restart caddy >/dev/null 2>&1
+CRON
+  chmod 644 "${CRON_RENEW_FILE}"
+
+  SSL_ENABLED="true"
+  save_env_config
+  install_clash_cmd
+
+  print_info "================================================="
+  print_info "HTTPS 证书申请与反向代理配置成功！"
+  print_info "已开启自动定时续订 (双重保障: Caddy内置守护 + 每日定时任务)"
+  print_info "HTTPS 转换地址: https://${DOMAIN}"
+  print_info "现在只需执行 'clash'，生成的订阅链接即为 HTTPS 地址！"
+  print_info "================================================="
+}
+
+show_panel() {
+  if [[ -f "${ENV_PATH}" ]]; then
+    source "${ENV_PATH}" 2>/dev/null || true
+  fi
+
+  local host_ip
+  host_ip="$(get_host_ip)"
+
+  local svc_status
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active ssr-clash-relay.service >/dev/null 2>&1; then
+    svc_status="\e[1;32m运行中 (Active)\e[0m"
+  elif pgrep -f "ssr_clash_relay.py" >/dev/null 2>&1; then
+    svc_status="\e[1;32m运行中 (PID)\e[0m"
+  elif [[ -f "${SERVICE_PATH}" ]] || [[ -f "${RELAY_SCRIPT_PATH}" ]]; then
+    svc_status="\e[1;31m未运行 (Stopped)\e[0m"
+  else
+    svc_status="\e[1;33m未安装 / 未配置\e[0m"
+  fi
+
+  local http_url
+  if [[ -n "${DOMAIN:-}" ]]; then
+    http_url="http://${DOMAIN}:${PORT:-12345}"
+  else
+    http_url="http://${host_ip}:${PORT:-12345}"
+  fi
+
+  local https_url="未开启 (可通过选项 3 一键开启)"
+  if [[ "${SSL_ENABLED:-false}" == "true" && -n "${DOMAIN:-}" ]]; then
+    https_url="\e[1;32mhttps://${DOMAIN}\e[0m"
+  fi
+
+  echo -e "\e[1;36m======================================================\e[0m"
+  echo -e "\e[1;37m             SSR 转 Clash 服务管理面板               \e[0m"
+  echo -e "\e[1;36m======================================================\e[0m"
+  echo -e " 服务状态 : ${svc_status}"
+  echo -e " 当前转换 : \e[1;33m${http_url}\e[0m"
+  if [[ -n "${DOMAIN:-}" ]]; then
+    echo -e " 绑定域名 : ${DOMAIN}"
+    echo -e " HTTPS转换: ${https_url}"
+  fi
+  echo -e " 本机 IP  : ${host_ip}"
+  echo -e "\e[1;36m------------------------------------------------------\e[0m"
+  echo -e "  \e[1;32m1、\e[0m重新配置 (默认，直接回车即可)"
+  echo -e "  \e[1;31m2、\e[0m移除所有配置"
+  echo -e "  \e[1;34m3、\e[0m给域名申请证书 (默认用 Caddy，回车按当前域名申请与自动续订)"
+  echo -e "  \e[1;30m0、\e[0m退出面板"
+  echo -e "\e[1;36m======================================================\e[0m"
+}
+
+main() {
+  while true; do
+    show_panel
+    read -r -p "请输入选项 [1-3, 默认 1]: " CHOICE
+    CHOICE="${CHOICE:-1}"
+    case "$CHOICE" in
+      1)
+        configure_service
+        ;;
+      2)
+        uninstall_all
+        ;;
+      3)
+        setup_caddy_ssl
+        ;;
+      0|q|Q|exit)
+        print_info "已退出管理面板。"
+        exit 0
+        ;;
+      *)
+        print_err "无效选项 [${CHOICE}]，请重新输入。"
+        ;;
+    esac
+    echo ""
+    read -r -p "按回车键返回主菜单..." _ || true
+  done
+}
+
+main "$@"
