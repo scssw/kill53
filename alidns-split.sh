@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # Create/remove cron jobs that enable and disable an Alibaba Cloud DNS record.
+# 版本：v1.0.2
 # 修复版（2026-09-30）：make_job_script 生成任务时写死 aliyun 绝对路径，
 # 不再依赖 cron 的最小 PATH（旧逻辑在 cron 下找不到 /usr/local/bin/aliyun
 # 会静默 exit 127）；小时参数兼容前导零（如 06）；任务脚本内固定 LC_ALL=C
 # 以消除 cron 日志中的 setlocale 警告。
+# 1.0.2 更新：
+# - 脚本启动与主菜单循环时直接显示当前已有任务；
+# - 菜单 4 改为“统一修改”，支持一次性统一设定所有任务的开启与关闭时间；
+# - 启停时间输入改为单次交互（例如输入 18 2 即表示 18 点开启、2 点关闭），大幅减少交互步数。
 set -euo pipefail
 
+export PATH="$PATH:/usr/local/bin:/usr/local/sbin"
 APP_NAME="alidns-split"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/alidns-split"
 CONFIG_FILE="$CONFIG_DIR/config"
@@ -75,6 +81,32 @@ read_hour() {
   done
 }
 
+read_hours_pair() {
+  local prompt="$1" input h1 h2 rest
+  while true; do
+    input="$(read_input "$prompt")"
+    input="${input//,/ }"
+    # 单独输入 0 或 q/Q 时取消并返回
+    if [[ "$input" =~ ^[[:space:]]*([0qQ])[[:space:]]*$ ]]; then
+      return 1
+    fi
+    read -r h1 h2 rest <<<"$input"
+    if [[ -n "${h1:-}" && -n "${h2:-}" && -z "${rest:-}" ]]; then
+      if check_time "$h1" && check_time "$h2"; then
+        h1="$((10#$h1))"
+        h2="$((10#$h2))"
+        if (( h1 == h2 )); then
+          printf '开启和关闭时间不能相同（均为 %d 点），请重新输入。\n' "$h1" >&2
+          continue
+        fi
+        printf '%d %d' "$h1" "$h2"
+        return 0
+      fi
+    fi
+    printf '输入格式错误！请输入开启和关闭小时（0-23，空格分隔，例如：18 2 表示 18点开启 2点关闭；输入 0 返回）。\n' >&2
+  done
+}
+
 extract_json_field() {
   local input="$1" field="$2"
   python3 -c 'import json,sys
@@ -129,9 +161,6 @@ except Exception:
 
 make_job_script() {
   local action="$1" path aliyun_bin
-  # 修复：在生成任务时就解析 aliyun 绝对路径并写死，不再依赖 cron 的最小 PATH。
-  # cron 下 PATH 常为 /usr/bin:/bin，而 aliyun 默认装在 /usr/local/bin，
-  # 旧逻辑用 command -v 查找失败会静默 exit 127，导致定时任务永远不执行。
   aliyun_bin="$(command -v aliyun)"
   [[ -n "$aliyun_bin" && -x "$aliyun_bin" ]] || die "找不到 aliyun 可执行文件，请先安装阿里云 CLI。"
   path="$CONFIG_DIR/$action.sh"
@@ -142,7 +171,6 @@ export LC_ALL=C LANG=C
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
 config_file="\${1:?用法: $action.sh 配置文件}"
 target_hour="\${2:?缺少目标小时}"
-# 修复：先去掉前导零再校验，兼容 06 / 6 / 006 等写法（旧正则会把 "06" 判为非法而 exit 2）
 target_hour="\$((10#\$target_hour))"
 [[ "\$target_hour" =~ ^([0-9]|1[0-9]|2[0-3])$ ]] || { echo "无效的小时参数: \${2}" >&2; exit 2; }
 [[ "\$(TZ=Asia/Shanghai date +%H)" == "\$(printf '%02d' "\$target_hour")" ]] || exit 0
@@ -162,7 +190,6 @@ domain_key() {
   printf '%s' "$1" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16])'
 }
 
-# 列出所有已保存的域名，返回 0 表示有数据；通过全局数组 ALL_CONF_FILES 输出
 list_saved_domains() {
   local -a files=()
   local f
@@ -177,7 +204,6 @@ list_saved_domains() {
   return 0
 }
 
-# 打印已有域名列表（带序号），供各菜单复用
 print_domain_list() {
   local f name i=1
   for f in "${ALL_CONF_FILES[@]}"; do
@@ -187,7 +213,6 @@ print_domain_list() {
   done
 }
 
-# 根据序号选择已有域名配置，成功返回 0 并设置 SELECTED_CONFIG
 choose_domain_by_index() {
   local choice
   while true; do
@@ -229,45 +254,44 @@ create_task() {
     record_id="$RECORD_ID"; domain="$DOMAIN_NAME"; ip="$RECORD_VALUE"
     printf '\n已选择 %s（RecordId: %s），直接设置启停时间即可。\n' "$domain" "$record_id"
   else
-  printf '\n请输入阿里云 AccessKey（支持直接粘贴两行：\n  accessKeyId LTAI5t...\n  accessKeySecret YHkOX...\n回车即可自动识别）：\n'
-  key_id="$(read_input 'AccessKeyId> ')"
-  # 支持粘贴 "accessKeyId LTAI5t..." 整行，自动提取 key
-  key_id="$(sed -E 's/^[[:space:]]*(accessKeyId|access_key_id|AccessKeyId)[[:space:]]+//i' <<<"$key_id")"
-  key_id="${key_id%%$'\n'*}"
-  key_id="$(sed -E 's/[[:space:]]+$//' <<<"$key_id")"
-  [[ -n "$key_id" ]] || die 'AccessKeyId 不能为空。'
-  key_secret="$(read_input 'AccessKeySecret> ')"
-  key_secret="$(sed -E 's/^[[:space:]]*(accessKeySecret|access_key_secret|AccessKeySecret)[[:space:]]+//i' <<<"$key_secret")"
-  key_secret="${key_secret%%$'\n'*}"
-  key_secret="$(sed -E 's/[[:space:]]+$//' <<<"$key_secret")"
-  [[ -n "$key_secret" ]] || die 'AccessKeySecret 不能为空。'
-  printf '\n请粘贴完整 JSON 响应（支持多行，粘贴完会自动识别结束）：\n'
-  pasted="$(read_json_block 'JSON> ')"
-  req_id="$(extract_json_field "$pasted" RequestId)"
-  [[ -n "$req_id" ]] || req_id="$(extract_json_field "$pasted" x-acs-request-id)"
-  [[ -n "$req_id" ]] || req_id="$pasted"
-  local -a records
-  mapfile -t records < <(parse_records "$pasted")
-  ((${#records[@]} > 0)) || die '没有识别到 RecordId。RequestId/x-acs-request-id 只是请求追踪编号，请粘贴包含 DNS 记录信息的完整 JSON。'
-  if ((${#records[@]} > 1)); then
-    printf '\n找到多条 DNS 记录，请选择要启停的记录：\n'
-    local i
-    for i in "${!records[@]}"; do
-      IFS=$'\t' read -r record_id domain rr type ip status line <<<"${records[$i]}"
-      printf '%d) %s  %s.%s  %s  %s  当前状态=%s  线路=%s\n' "$((i+1))" "$record_id" "$rr" "$domain" "$type" "$ip" "$status" "$line"
-    done
-    choice="$(read_input '选择记录序号> ')"
-    [[ "$choice" =~ ^[1-9][0-9]*$ ]] && ((choice <= ${#records[@]})) || die '记录序号无效。'
-    IFS=$'\t' read -r record_id domain rr type ip status line <<<"${records[$((choice-1))]}"
-  else
-    IFS=$'\t' read -r record_id domain rr type ip status line <<<"${records[0]}"
-  fi
-  printf '\n识别到：\n  RequestId: %s\n  RecordId: %s\n  域名: %s\n  主机记录: %s\n  类型: %s\n  记录值/IP: %s\n  当前状态: %s\n\n' "$req_id" "$record_id" "${domain:-（未提供）}" "${rr:-（未提供）}" "${type:-（未提供）}" "${ip:-（未提供）}" "${status:-（未提供）}"
+    printf '\n请输入阿里云 AccessKey（支持直接粘贴两行：\n  accessKeyId LTAI5t...\n  accessKeySecret YHkOX...\n回车即可自动识别）：\n'
+    key_id="$(read_input 'AccessKeyId> ')"
+    key_id="$(sed -E 's/^[[:space:]]*(accessKeyId|access_key_id|AccessKeyId)[[:space:]]+//i' <<<"$key_id")"
+    key_id="${key_id%%$'\n'*}"
+    key_id="$(sed -E 's/[[:space:]]+$//' <<<"$key_id")"
+    [[ -n "$key_id" ]] || die 'AccessKeyId 不能为空。'
+    key_secret="$(read_input 'AccessKeySecret> ')"
+    key_secret="$(sed -E 's/^[[:space:]]*(accessKeySecret|access_key_secret|AccessKeySecret)[[:space:]]+//i' <<<"$key_secret")"
+    key_secret="${key_secret%%$'\n'*}"
+    key_secret="$(sed -E 's/[[:space:]]+$//' <<<"$key_secret")"
+    [[ -n "$key_secret" ]] || die 'AccessKeySecret 不能为空。'
+    printf '\n请粘贴完整 JSON 响应（支持多行，粘贴完会自动识别结束）：\n'
+    pasted="$(read_json_block 'JSON> ')"
+    req_id="$(extract_json_field "$pasted" RequestId)"
+    [[ -n "$req_id" ]] || req_id="$(extract_json_field "$pasted" x-acs-request-id)"
+    [[ -n "$req_id" ]] || req_id="$pasted"
+    local -a records
+    mapfile -t records < <(parse_records "$pasted")
+    ((${#records[@]} > 0)) || die '没有识别到 RecordId。RequestId/x-acs-request-id 只是请求追踪编号，请粘贴包含 DNS 记录信息的完整 JSON。'
+    if ((${#records[@]} > 1)); then
+      printf '\n找到多条 DNS 记录，请选择要启停的记录：\n'
+      local i
+      for i in "${!records[@]}"; do
+        IFS=$'\t' read -r record_id domain rr type ip status line <<<"${records[$i]}"
+        printf '%d) %s  %s.%s  %s  %s  当前状态=%s  线路=%s\n' "$((i+1))" "$record_id" "$rr" "$domain" "$type" "$ip" "$status" "$line"
+      done
+      choice="$(read_input '选择记录序号> ')"
+      [[ "$choice" =~ ^[1-9][0-9]*$ ]] && ((choice <= ${#records[@]})) || die '记录序号无效。'
+      IFS=$'\t' read -r record_id domain rr type ip status line <<<"${records[$((choice-1))]}"
+    else
+      IFS=$'\t' read -r record_id domain rr type ip status line <<<"${records[0]}"
+    fi
+    printf '\n识别到：\n  RequestId: %s\n  RecordId: %s\n  域名: %s\n  主机记录: %s\n  类型: %s\n  记录值/IP: %s\n  当前状态: %s\n\n' "$req_id" "$record_id" "${domain:-（未提供）}" "${rr:-（未提供）}" "${type:-（未提供）}" "${ip:-（未提供）}" "${status:-（未提供）}"
 
-  umask 077
-  key="$(domain_key "$domain")"
-  config="$DOMAINS_DIR/$key.conf"
-  cat >"$config" <<EOF
+    umask 077
+    key="$(domain_key "$domain")"
+    config="$DOMAINS_DIR/$key.conf"
+    cat >"$config" <<EOF
 ACCESS_KEY_ID=$(printf '%q' "$key_id")
 ACCESS_KEY_SECRET=$(printf '%q' "$key_secret")
 RECORD_ID=$(printf '%q' "$record_id")
@@ -275,7 +299,7 @@ DOMAIN_NAME=$(printf '%q' "$domain")
 RECORD_VALUE=$(printf '%q' "$ip")
 REQUEST_ID=$(printf '%q' "$req_id")
 EOF
-  chmod 600 "$config"
+    chmod 600 "$config"
   fi
 
   local local_tz beijing_time
@@ -287,12 +311,13 @@ EOF
   else
     printf '本机时区与北京时间一致。\n'
   fi
-  on_hour="$(read_hour '输入开启小时（0-23）> ')"
-  while true; do
-    off_hour="$(read_hour '输入关闭小时（0-23）> ')"
-    [[ "$on_hour" != "$off_hour" ]] && break
-    printf '开启和关闭时间不能相同，请重新输入关闭时间。\n'
-  done
+
+  local hours
+  if ! hours="$(read_hours_pair '输入开启和关闭时间（例如 18 2 表示 18点开 2点关，输入 0 取消）> ')"; then
+    printf '已取消设置启停时间。\n'
+    return
+  fi
+  read -r on_hour off_hour <<<"$hours"
 
   make_job_script Enable
   make_job_script Disable
@@ -305,7 +330,6 @@ EOF
   printf '\n任务创建完成：%s 每天北京时间 %02d:00 开启、%02d:00 关闭。配置保存在 %s（权限 600），运行日志在 %s/%s.log。\n' "$domain" "$on_hour" "$off_hour" "$config" "$CONFIG_DIR" "${config##*/}"
 }
 
-# 提取公共删除逻辑，供菜单2与菜单3复用
 remove_domain_task() {
   local conf="$1"
   local name
@@ -315,7 +339,6 @@ remove_domain_task() {
   current="$(crontab -l 2>/dev/null || true)"
   printf '%s\n' "$current" | awk -v conf="$config_name" 'index($0,conf)==0' | crontab -
   rm -f "$conf"
-  # 如果没有任何域名配置了，清理公共脚本
   list_saved_domains || true
   if ((${#ALL_CONF_FILES[@]} == 0)); then
     rm -f "$CONFIG_DIR/Enable.sh" "$CONFIG_DIR/Disable.sh" "$CONFIG_FILE"
@@ -357,6 +380,7 @@ delete_task() {
 
 modify_task() {
   need_cmd crontab
+  ensure_aliyun
   while true; do
     list_saved_domains || true
     if ((${#ALL_CONF_FILES[@]} == 0)); then
@@ -380,7 +404,6 @@ modify_task() {
     local name
     name="$(awk -F= '/^DOMAIN_NAME=/{sub(/^[^=]*=/,""); gsub(/^\047|\047$/,"",$0); print; exit}' "$SELECTED_CONFIG")"
 
-    # 子菜单：管理选中的域名（支持修改时间或直接删除）
     while true; do
       printf '\n【管理域名：%s】\n1) 修改启停时间\n2) 删除该任务\n0) 返回域名列表\n' "$name"
       local sub_choice
@@ -388,13 +411,12 @@ modify_task() {
       case "$sub_choice" in
         1)
           printf '\n修改 %s 的启停时间：\n' "$name"
-          local on_hour off_hour
-          on_hour="$(read_hour '输入开启小时（0-23）> ')"
-          while true; do
-            off_hour="$(read_hour '输入关闭小时（0-23）> ')"
-            [[ "$on_hour" != "$off_hour" ]] && break
-            printf '开启和关闭时间不能相同，请重新输入关闭时间。\n'
-          done
+          local hours on_hour off_hour
+          if ! hours="$(read_hours_pair '输入开启和关闭时间（例如 18 2 表示 18点开 2点关，输入 0 返回）> ')"; then
+            printf '已取消修改。\n'
+            break
+          fi
+          read -r on_hour off_hour <<<"$hours"
           local config="$SELECTED_CONFIG"
           local config_name="${config##*/}"
           local current
@@ -429,10 +451,45 @@ modify_task() {
   done
 }
 
+batch_modify_tasks() {
+  need_cmd crontab
+  ensure_aliyun
+  list_saved_domains || true
+  if ((${#ALL_CONF_FILES[@]} == 0)); then
+    printf '\n当前暂无已配置的启停任务，请先创建任务。\n'
+    return
+  fi
+  printf '\n========== 统一修改所有任务启停时间 ==========\n'
+  list_tasks
+  printf '\n将统一设置以上所有任务（共 %d 个）的开启与关闭时间。\n' "${#ALL_CONF_FILES[@]}"
+  local hours on_hour off_hour
+  if ! hours="$(read_hours_pair '输入统一开启和关闭时间（例如 18 2 表示 18点开 2点关，输入 0 返回）> ')"; then
+    printf '已取消统一修改。\n'
+    return
+  fi
+  read -r on_hour off_hour <<<"$hours"
+
+  make_job_script Enable
+  make_job_script Disable
+
+  local current f conf_name
+  current="$(crontab -l 2>/dev/null || true)"
+  {
+    printf '%s\n' "$current" | awk -v tag="$CRON_TAG" 'index($0,tag)==0 && $0!=""'
+    for f in "${ALL_CONF_FILES[@]}"; do
+      conf_name="${f##*/}"
+      printf '0 * * * * TZ=Asia/Shanghai %s/Enable.sh %s %s >> %s/%s.log 2>&1 %s\n' "$CONFIG_DIR" "$f" "$on_hour" "$CONFIG_DIR" "$conf_name" "$CRON_TAG"
+      printf '0 * * * * TZ=Asia/Shanghai %s/Disable.sh %s %s >> %s/%s.log 2>&1 %s\n' "$CONFIG_DIR" "$f" "$off_hour" "$CONFIG_DIR" "$conf_name" "$CRON_TAG"
+    done
+  } | crontab -
+
+  printf '\n已成功统一修改所有任务（共 %d 个）：每天北京时间 %02d:00 开启、%02d:00 关闭。\n' "${#ALL_CONF_FILES[@]}" "$on_hour" "$off_hour"
+}
+
 list_tasks() {
   list_saved_domains || true
   if ((${#ALL_CONF_FILES[@]} == 0)); then
-    printf '当前没有任何启停任务。\n'
+    printf '\n当前暂无已配置的启停任务。\n'
     return
   fi
   local current name on_line off_line on_h off_h f
@@ -454,13 +511,15 @@ list_tasks() {
 main() {
   local choice
   while true; do
-    printf '\n========== 阿里 DNS 分流启停管理1.0.1 ==========\n1、创建启停任务\n2、删除任务\n3、修改任务\n4、查看任务\n0、退出\n'
+    printf '\n========== 阿里 DNS 分流启停管理 1.0.2 ==========\n'
+    list_tasks
+    printf '\n1、创建启停任务\n2、删除任务\n3、修改任务\n4、统一修改\n0、退出\n'
     choice="$(read_input '请选择> ')"
     case "$choice" in
       1) create_task ;;
       2) delete_task ;;
       3) modify_task ;;
-      4) list_tasks ;;
+      4) batch_modify_tasks ;;
       0) printf '再见。\n'; return 0 ;;
       *) printf '无效选项，请输入 0-4。\n' >&2 ;;
     esac
