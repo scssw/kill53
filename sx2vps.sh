@@ -106,6 +106,93 @@ def peer_status():
 def apply_peer_unbind():
     disable_units()
     CONFIG.unlink(missing_ok=True)
+    for p in (STATE / 'ledger.json', STATE / 'watch-signature'):
+        p.unlink(missing_ok=True)
+
+
+def restart_ssr():
+    for cmd in (
+        ['systemctl', 'restart', 'ssr-bash-python.service'],
+        ['service', 'ssr-bash-python', 'restart'],
+        ['/etc/init.d/ssr-bash-python', 'restart'],
+    ):
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0:
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if Path('/usr/local/shadowsocksr/logrun.sh').is_file():
+        if Path('/usr/local/shadowsocksr/stop.sh').is_file():
+            subprocess.run(['bash', '/usr/local/shadowsocksr/stop.sh'], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(['bash', '/usr/local/shadowsocksr/logrun.sh'], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    return False
+
+
+def reset_traffic():
+    if not MUD.is_file():
+        return
+    try:
+        data = rows(MUD.read_text())
+        for item in data:
+            item['u'] = 0
+            item['d'] = 0
+        write_json(MUD, data)
+        restart_ssr()
+        print('副机 SSR 流量已重置为 0。')
+    except Exception as e:
+        print('重置副机 SSR 流量失败：%s' % e, file=sys.stderr)
+
+
+def sync_bin_to_peer(peer):
+    try:
+        bin_path = Path(BIN)
+        if bin_path.is_file():
+            ssh(peer, 'cat > ' + BIN + ' && chmod 0755 ' + BIN, stdin=bin_path.read_bytes())
+    except Exception:
+        pass
+
+
+def reset_peer_traffic(peer):
+    sync_bin_to_peer(peer)
+    try:
+        ssh(peer, BIN + ' reset-traffic')
+        return
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    py_cmd = (
+        "python3 -c \""
+        "import json, subprocess, os; "
+        "p = '/usr/local/shadowsocksr/mudb.json'; "
+        "d = json.load(open(p)) if os.path.exists(p) else []; "
+        "[x.update({'u': 0, 'd': 0}) for x in d if isinstance(x, dict)]; "
+        "open(p, 'w').write(json.dumps(d)) if d else None; "
+        "subprocess.run(['systemctl', 'restart', 'ssr-bash-python.service'], check=False); "
+        "subprocess.run(['bash', '/usr/local/shadowsocksr/stop.sh'], check=False); "
+        "subprocess.run(['bash', '/usr/local/shadowsocksr/logrun.sh'], check=False)"
+        "\""
+    )
+    try:
+        ssh(peer, py_cmd)
+    except (OSError, subprocess.CalledProcessError):
+        pass
+
+
+def reset_traffic_cmd():
+    c = config()
+    if c.get('role') == 'master' and c.get('peer'):
+        try:
+            reset_peer_traffic(c['peer'])
+            ledger_path = STATE / 'ledger.json'
+            ledger_path.unlink(missing_ok=True)
+            print('副机 SSR 流量已成功重置为 0，主机同步记账已重置。')
+        except Exception as e:
+            print('重置副机 SSR 流量失败：%s' % e, file=sys.stderr)
+    else:
+        reset_traffic()
 
 
 def enforce_limits(data):
@@ -199,6 +286,7 @@ def apply_config():
         item['d'] = previous.get('d', 0)
     write_json(MUD, incoming)
     atomic_write(TIME, base64.b64decode(payload['timelimit_b64'], validate=True), 0o600)
+    restart_ssr()
     print('配置已应用。')
 
 
@@ -230,15 +318,21 @@ def merge_traffic():
         if key not in local:
             continue
         matched += 1
-        last = ledger.get(key, {})
+        is_new_user = (key not in ledger)
+        last = ledger.setdefault(key, {})
         for field in ('u', 'd'):
             current = max(0, int(peer_row.get(field, 0) or 0))
+            if is_new_user or field not in last:
+                last[field] = current
+                continue
             previous = max(0, int(last.get(field, 0) or 0))
+            if current < previous:
+                last[field] = current
+                continue
             delta = max(0, current - previous)
             local[key][field] = int(local[key].get(field, 0) or 0) + delta
             added[field] += delta
             last[field] = current
-        ledger[key] = last
     write_json(MUD, master)
     write_json(ledger_path, ledger)
     print('副机流量已合并：匹配用户 %d 个，上传 +%d 字节，下载 +%d 字节。' %
@@ -275,15 +369,20 @@ def setup(role):
             data['peer_port'] = port
         save_config(data)
         install_units()
+        for p in (STATE / 'ledger.json', STATE / 'watch-signature'):
+            p.unlink(missing_ok=True)
+        reset_peer_traffic(peer)
         push()
         try:
             ssh(peer, BIN + ' register-master-ip')
         except (OSError, subprocess.CalledProcessError):
             print('无法获取副机看到的主机 IP。', file=sys.stderr)
+        print('主机已设置完成，副机流量计数已恢复为 0。')
     else:
         disable_units()
         save_config(data)
-        print('副机已设置。请在主机选择“设为主机”并填写本机 SSH 地址。')
+        reset_traffic()
+        print('副机已设置，本地流量计数已恢复为 0。请在主机选择“设为主机”并填写本机 SSH 地址。')
 
 
 def unbind():
@@ -380,12 +479,14 @@ def menu():
     print('2、设为副机')
     print('3、取消绑定系统')
     print('4、一键同步副机流量到主机')
+    print('5、一键重置副机流量为 0')
     print('0、退出')
     choice = input('请选择: ').strip()
     if choice == '1': setup('master')
     elif choice == '2': setup('replica')
     elif choice == '3': unbind()
     elif choice == '4': merge_traffic()
+    elif choice == '5': reset_traffic_cmd()
     elif choice == '0': return
     else: print('无效选项')
 
@@ -398,6 +499,7 @@ def main():
         elif cmd == 'apply-config': apply_config()
         elif cmd == 'snapshot': snapshot()
         elif cmd == 'merge-traffic': merge_traffic()
+        elif cmd == 'reset-traffic': reset_traffic_cmd()
         elif cmd == 'status': print(config().get('role', 'unbound'))
         elif cmd == 'status-report': status_report()
         elif cmd == 'set-interval': set_interval()
@@ -405,7 +507,7 @@ def main():
         elif cmd == 'peer-status': peer_status()
         elif cmd == 'watch-check': watch_check()
         elif cmd == 'unbind-peer': apply_peer_unbind()
-        else: raise RuntimeError('用法: ssr2vps [menu|push|apply-config|snapshot|merge-traffic]')
+        else: raise RuntimeError('用法: ssr2vps [menu|push|apply-config|snapshot|merge-traffic|reset-traffic]')
     except (OSError, ValueError, KeyError, subprocess.CalledProcessError, RuntimeError) as e:
         print('错误: ' + str(e), file=sys.stderr)
         if isinstance(e, subprocess.CalledProcessError) and e.stderr:
@@ -505,6 +607,62 @@ def apply_peer_unbind():
     CONFIG.unlink(missing_ok=True)
     for p in (STATE / 'last_sync.json', STATE / 'config.sha256', STATE / 'ledger.json'):
         p.unlink(missing_ok=True)
+
+
+def reset_traffic():
+    if not DB.is_file():
+        return
+    try:
+        with open_db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                ib_cols = table_columns(db, 'inbounds')
+                ct_cols = table_columns(db, 'client_traffics')
+                ib_resets = [c for c in INBOUND_COUNTERS if c in ib_cols]
+                if ib_resets:
+                    db.execute('UPDATE inbounds SET ' + ','.join('"%s"=0' % c for c in ib_resets))
+                ct_resets = [c for c in CLIENT_COUNTERS if c in ct_cols and c != 'last_online']
+                if ct_resets:
+                    db.execute('UPDATE client_traffics SET ' + ','.join('"%s"=0' % c for c in ct_resets))
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+        subprocess.run(['systemctl', 'restart', 'x-ui'], check=False)
+        print('副机 x-ui 流量已重置为 0。')
+    except Exception as e:
+        print('重置副机 x-ui 流量失败：%s' % e, file=sys.stderr)
+
+
+def sync_bin_to_peer(peer):
+    try:
+        bin_path = Path(BIN)
+        if bin_path.is_file():
+            ssh(peer, 'cat > ' + BIN + ' && chmod 0755 ' + BIN, stdin=bin_path.read_bytes())
+    except Exception:
+        pass
+
+
+def reset_peer_traffic(peer):
+    sync_bin_to_peer(peer)
+    try:
+        ssh(peer, BIN + ' reset-traffic')
+    except (OSError, subprocess.CalledProcessError):
+        pass
+
+
+def reset_traffic_cmd():
+    c = config()
+    if c.get('role') == 'master' and c.get('peer'):
+        try:
+            reset_peer_traffic(c['peer'])
+            ledger_path = STATE / 'ledger.json'
+            ledger_path.unlink(missing_ok=True)
+            print('副机 x-ui 流量已成功重置为 0，主机同步记账已重置。')
+        except Exception as e:
+            print('重置副机 x-ui 流量失败：%s' % e, file=sys.stderr)
+    else:
+        reset_traffic()
 
 
 def ssh(target, command, stdin=None):
@@ -1332,7 +1490,8 @@ def setup(role):
         database_snapshot()
         disable_units()
         save_config({'role': role})
-        print('副机已设置。请在主机选择“设为主机”并填写本机 SSH 地址。')
+        reset_traffic()
+        print('副机已设置，本地流量计数已恢复为 0。请在主机选择“设为主机”并填写本机 SSH 地址。')
         return
     database_snapshot()
     host = input('副机 IP: ').strip()
@@ -1347,11 +1506,13 @@ def setup(role):
     install_units()
     for p in (STATE / 'last_sync.json', STATE / 'config.sha256', STATE / 'ledger.json'):
         p.unlink(missing_ok=True)
+    reset_peer_traffic(peer)
     push(force=True)
     try:
         ssh(peer, BIN + ' register-master-ip')
     except (OSError, subprocess.CalledProcessError):
         print('无法获取副机看到的主机 IP。', file=sys.stderr)
+    print('主机已设置完成，副机流量计数已恢复为 0。')
 
 
 def unbind():
@@ -1449,6 +1610,7 @@ def menu():
     print('3、取消绑定系统')
     print('4、一键同步副机流量到主机')
     print('5、一键修复异常数据（校准端口流量、解除误禁用客户端）')
+    print('6、一键重置副机流量为 0')
     print('0、退出')
     choice = input('请选择: ').strip()
     if choice == '1': setup('master')
@@ -1456,6 +1618,7 @@ def menu():
     elif choice == '3': unbind()
     elif choice == '4': merge_traffic()
     elif choice == '5': repair_cmd()
+    elif choice == '6': reset_traffic_cmd()
     elif choice == '0': return
     else: print('无效选项')
 
@@ -1469,13 +1632,14 @@ def main():
         elif cmd == 'apply-config': apply_config()
         elif cmd == 'snapshot': snapshot()
         elif cmd == 'merge-traffic': merge_traffic()
+        elif cmd == 'reset-traffic': reset_traffic_cmd()
         elif cmd == 'repair': repair_cmd()
         elif cmd == 'status': print(config().get('role', 'unbound'))
         elif cmd == 'status-report': status_report()
         elif cmd == 'set-interval': set_interval()
         elif cmd == 'register-master-ip': register_master_ip()
         elif cmd == 'unbind-peer': apply_peer_unbind()
-        else: raise RuntimeError('用法: xui2vps [menu|push|apply-config|snapshot|merge-traffic|repair]')
+        else: raise RuntimeError('用法: xui2vps [menu|push|apply-config|snapshot|merge-traffic|reset-traffic|repair]')
     except (OSError, ValueError, KeyError, sqlite3.Error,
             subprocess.CalledProcessError, RuntimeError) as e:
         print('错误: ' + str(e), file=sys.stderr)
@@ -1494,7 +1658,7 @@ trap - EXIT HUP INT TERM
 printf '\n当前同步状态：\n'
 /usr/local/bin/ssr2vps status-report
 /usr/local/bin/xui2vps status-report
-printf '\n主菜单 v1.0.5：\n1、SSR 同步\n2、XUI 同步\n3、同步时间修改\n0、退出\n请选择: '
+printf '\n主菜单 v1.0.6：\n1、SSR 同步\n2、XUI 同步\n3、同步时间修改\n0、退出\n请选择: '
 IFS= read -r choice || choice=
 case "$choice" in
     1) exec /usr/local/bin/ssr2vps menu ;;
