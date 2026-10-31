@@ -421,6 +421,30 @@ EOF
     update-rc.d ssr-bash-python defaults 95
 fi
 
+# 配置原生 systemd 服务单元（具备 Restart=always 自愈重启机制，防止进程异常退出后端口死锁）
+if [ -d /etc/systemd/system ]; then
+    cat > /etc/systemd/system/ssr-bash-python.service << 'EOF'
+[Unit]
+Description=ShadowsocksR Multiuser Service
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/bin/bash /usr/local/shadowsocksr/logrun.sh
+ExecStop=/bin/bash /usr/local/shadowsocksr/stop.sh
+Restart=always
+RestartSec=3s
+LimitNOFILE=512000
+TasksMax=infinity
+TimeoutSec=15s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable ssr-bash-python.service >/dev/null 2>&1 || true
+fi
+
 if [[ ${OS} == CentOS ]];then
     echo "
 ${SSR_IPTABLES_RESTORE:-iptables-restore} < /etc/iptables.up.rules
@@ -567,27 +591,40 @@ else
     echo "BBR 已启用，无需重复设置"
 fi
 
-# 系统并发网络与高句柄调优（支持200+用户顺畅运行）
-if ! grep -q "fs.file-max = 512000" /etc/sysctl.conf 2>/dev/null; then
-    cat >> /etc/sysctl.conf << 'EOF'
+# 系统并发网络、防SYN洪泛与高句柄调优（保障200+用户并发与抗攻击能力）
+cat > /etc/sysctl.d/99-ssr-tuning.conf << 'EOF'
 fs.file-max = 512000
-net.core.somaxconn = 4096
-net.ipv4.tcp_max_syn_backlog = 8192
+net.core.somaxconn = 8192
+net.ipv4.tcp_max_syn_backlog = 16384
 net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_fin_timeout = 20
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_syn_retries = 2
+net.ipv4.tcp_synack_retries = 2
 EOF
-    sysctl -p >/dev/null 2>&1 || true
-fi
+sysctl -p /etc/sysctl.d/99-ssr-tuning.conf >/dev/null 2>&1 || sysctl -p >/dev/null 2>&1 || true
 
 # 检查是否已存在每小时删除的任务
-if crontab -l | grep -q "/usr/local/SSR-Bash-Python/timelimit.sh"; then
+if crontab -l 2>/dev/null | grep -q "/usr/local/SSR-Bash-Python/timelimit.sh"; then
     # 如果存在任务，先删除
-    crontab -l | grep -v "/usr/local/SSR-Bash-Python/timelimit.sh" | crontab -
+    crontab -l 2>/dev/null | grep -v "/usr/local/SSR-Bash-Python/timelimit.sh" | crontab -
 fi
 
 # 添加新的任务
-(crontab -l ; echo "*/6 * * * * /bin/bash /usr/local/SSR-Bash-Python/timelimit.sh c > /dev/null 2>&1") | crontab -
+(crontab -l 2>/dev/null ; echo "*/6 * * * * /bin/bash /usr/local/SSR-Bash-Python/timelimit.sh c > /dev/null 2>&1") | crontab -
 echo "已添加或更新为每6分钟执行删除任务"
+
+# 自动健康巡检看门狗：每 2 分钟检测一次 SSR 主进程，如遇异常瞬时拉起，确保 100% 不掉线
+if ! crontab -l 2>/dev/null | grep -q "server\.py m"; then
+    (crontab -l 2>/dev/null ; echo "*/2 * * * * pgrep -f \"server\.py m\" >/dev/null 2>&1 || (bash /usr/local/shadowsocksr/logrun.sh >/dev/null 2>&1)") | crontab -
+    echo "已添加 SSR 主进程健康自愈巡检任务 (每2分钟)"
+fi
+
+# 每日凌晨 4:00 低峰期自动执行一次优雅内存整理
+if ! crontab -l 2>/dev/null | grep -q "ssr-daily-gc"; then
+    (crontab -l 2>/dev/null ; echo "0 4 * * * bash /usr/local/shadowsocksr/logrun.sh >/dev/null 2>&1 #ssr-daily-gc") | crontab -
+    echo "已添加每日凌晨 4:00 内存重整任务"
+fi
 
 # 设置为北京时间
 timedatectl set-timezone Asia/Shanghai
