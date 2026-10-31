@@ -16,6 +16,9 @@ REMOTE_CERT_DIR="/root/cert"
 # 本地和远程额外证书目录路径
 LOCAL_EXTRA_CERT_DIR="/usr/local/h-ui/my_acme_dir/certificates/acme.zerossl.com-v2-dv90"
 REMOTE_EXTRA_CERT_DIR="/usr/local/h-ui/my_acme_dir/certificates/acme.zerossl.com-v2-dv90"
+# 本地和远程 v2bx 数据目录路径
+LOCAL_V2BX_DIR="/etc/V2bX"
+REMOTE_V2BX_DIR="/etc/V2bX"
 HOSTS_FILE="$HOME/.config/kill53-transfer/hosts"
 
 # 检查命令是否存在
@@ -136,24 +139,28 @@ port_open() {
 }
 
 choose_host() {
-  local entries=() choice
+  local entries=() input
   if [[ -f "$HOSTS_FILE" ]]; then
     mapfile -t entries < <(awk 'NF && !seen[$0]++' "$HOSTS_FILE")
   fi
   if (( ${#entries[@]} )); then
     echo "已保存的目标 IP："
-    for i in "${!entries[@]}"; do echo "$((i+1))) ${entries[$i]}"; done
-    echo "$(( ${#entries[@]} + 1 ))) 输入新的 IP"
-    read -r -p "输入编号选择目标: " choice
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#entries[@]} )); then
-      remote_ip="${entries[$((choice-1))]}"
-      return
-    elif [[ "$choice" != "$(( ${#entries[@]} + 1 ))" ]]; then
-      echo "无效选择。" >&2; exit 1
+    for i in "${!entries[@]}"; do
+      echo "$((i+1))) ${entries[$i]}"
+    done
+    read -r -p "请输入目标 IP 地址或选择编号: " input
+    input="$(echo "$input" | xargs)"
+    [[ -n "$input" ]] || { echo "远程 IP 地址是必需的。" >&2; exit 1; }
+    if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= ${#entries[@]} )); then
+      remote_ip="${entries[$((input-1))]}"
+    else
+      remote_ip="$input"
     fi
+  else
+    read -r -p "远程 IP 地址: " remote_ip
+    remote_ip="$(echo "$remote_ip" | xargs)"
+    [[ -n "$remote_ip" ]] || { echo "远程 IP 地址是必需的。" >&2; exit 1; }
   fi
-  read -r -p "远程 IP 地址: " remote_ip
-  [[ -n "$remote_ip" ]] || { echo "远程 IP 地址是必需的。" >&2; exit 1; }
 }
 
 save_host() {
@@ -194,13 +201,14 @@ main() {
   setup_key_auth "$remote_user" "$remote_ip" "$remote_port"
   save_host
 
-  # 选择传输类型（支持多个数字，用空格分隔，如 "1 3 4"）
+  # 选择传输类型（支持多个数字，用空格分隔，如 "1 3 5"）
   echo "选择传输类型:"
   echo "1) ssr 包"
   echo "2) hui 包"
   echo "3) 证书目录"
   echo "4) xui 数据库"
-  read -r -p "输入要转移的类型编号（多个用空格分隔，如 1 3 4）: " choices
+  echo "5) v2bx 数据"
+  read -r -p "输入要转移的类型编号（多个用空格分隔，如 1 3 5）: " choices
 
   # 将输入拆分为数组并去重
   read -r -a choice_array <<< "$choices"
@@ -215,8 +223,8 @@ main() {
 
   # 验证输入是否有效
   for c in "${unique_choices[@]}"; do
-    if [[ "$c" != "1" && "$c" != "2" && "$c" != "3" && "$c" != "4" ]]; then
-      echo "无效选择: $c。请输入 1-4 之间的数字。" >&2
+    if [[ "$c" != "1" && "$c" != "2" && "$c" != "3" && "$c" != "4" && "$c" != "5" ]]; then
+      echo "无效选择: $c。请输入 1-5 之间的数字。" >&2
       exit 1
     fi
   done
@@ -278,6 +286,16 @@ main() {
         ssh -p "$remote_port" "${remote_user}@${remote_ip}" "mkdir -p /etc/x-ui; if [ -f '$REMOTE_XUI' ]; then cp -a '$REMOTE_XUI' '$REMOTE_XUI.before-transfer.'\$(date +%Y%m%d%H%M%S); fi"
         rsync -avz -e "ssh -p $remote_port" "$LOCAL_XUI" "${remote_user}@${remote_ip}:$REMOTE_XUI"
         remote_restart x-ui
+        ;;
+      5)
+        echo "=== 正在转移 v2bx 数据 ==="
+        if [[ ! -d "$LOCAL_V2BX_DIR" ]]; then
+          echo "本地目录未找到: $LOCAL_V2BX_DIR" >&2
+          exit 1
+        fi
+        ssh -p "$remote_port" "${remote_user}@${remote_ip}" "mkdir -p '$REMOTE_V2BX_DIR'; if [ -d '$REMOTE_V2BX_DIR' ] && [ \"\$(ls -A '$REMOTE_V2BX_DIR' 2>/dev/null)\" ]; then cp -a '$REMOTE_V2BX_DIR' '${REMOTE_V2BX_DIR}.before-transfer.'\$(date +%Y%m%d%H%M%S); fi"
+        rsync -avz -e "ssh -p $remote_port" "${LOCAL_V2BX_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_V2BX_DIR}/"
+        ssh -p "$remote_port" "${remote_user}@${remote_ip}" "/bin/systemctl restart V2bX 2>/dev/null || /bin/systemctl restart v2bx 2>/dev/null || true"
         ;;
     esac
   done
