@@ -610,6 +610,9 @@ echo "系统时区已设置为北京时间"
 SetupSSRSystemdService(){
     if [ -d /etc/systemd/system ]; then
         echo "配置原生 systemd 服务单元 (/etc/systemd/system/ssr-bash-python.service)..."
+        # 清理可能存在的旧 SysV init 脚本，避免 systemd-sysv-generator 产生同名冲突
+        rm -f /etc/init.d/ssr-bash-python 2>/dev/null || true
+        update-rc.d -f ssr-bash-python remove >/dev/null 2>&1 || true
         cat > /etc/systemd/system/ssr-bash-python.service << 'EOF'
 [Unit]
 Description=ShadowsocksR Multiuser Service
@@ -629,6 +632,7 @@ TimeoutSec=15s
 WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
+        systemctl reset-failed >/dev/null 2>&1 || true
         systemctl reset-failed ssr-bash-python.service >/dev/null 2>&1 || true
         systemctl enable ssr-bash-python.service >/dev/null 2>&1 || true
     fi
