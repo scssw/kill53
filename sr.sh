@@ -421,30 +421,6 @@ EOF
     update-rc.d ssr-bash-python defaults 95
 fi
 
-# 配置原生 systemd 服务单元（具备 Restart=always 自愈重启机制，防止进程异常退出后端口死锁）
-if [ -d /etc/systemd/system ]; then
-    cat > /etc/systemd/system/ssr-bash-python.service << 'EOF'
-[Unit]
-Description=ShadowsocksR Multiuser Service
-After=network.target
-
-[Service]
-Type=forking
-ExecStart=/bin/bash /usr/local/shadowsocksr/logrun.sh
-ExecStop=/bin/bash /usr/local/shadowsocksr/stop.sh
-Restart=always
-RestartSec=3s
-LimitNOFILE=512000
-TasksMax=infinity
-TimeoutSec=15s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable ssr-bash-python.service >/dev/null 2>&1 || true
-fi
-
 if [[ ${OS} == CentOS ]];then
     echo "
 ${SSR_IPTABLES_RESTORE:-iptables-restore} < /etc/iptables.up.rules
@@ -630,8 +606,47 @@ fi
 timedatectl set-timezone Asia/Shanghai
 echo "系统时区已设置为北京时间"
 
+# 配置原生 systemd 服务单元（具备 Restart=always 自愈重启机制，防止进程异常退出后端口死锁）
+SetupSSRSystemdService(){
+    if [ -d /etc/systemd/system ]; then
+        echo "配置原生 systemd 服务单元 (/etc/systemd/system/ssr-bash-python.service)..."
+        cat > /etc/systemd/system/ssr-bash-python.service << 'EOF'
+[Unit]
+Description=ShadowsocksR Multiuser Service
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/bin/bash /usr/local/shadowsocksr/logrun.sh
+ExecStop=/bin/bash /usr/local/shadowsocksr/stop.sh
+Restart=always
+RestartSec=3s
+LimitNOFILE=512000
+TasksMax=infinity
+TimeoutSec=15s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl reset-failed ssr-bash-python.service >/dev/null 2>&1 || true
+        systemctl enable ssr-bash-python.service >/dev/null 2>&1 || true
+    fi
+}
+SetupSSRSystemdService
+
 # 重启 SSR 服务使更新的代码立即生效
-if [ -f /usr/local/shadowsocksr/logrun.sh ]; then
+if [ -d /etc/systemd/system ] && [ -f /etc/systemd/system/ssr-bash-python.service ]; then
+    echo "正在通过 systemd 重启 ShadowsocksR 服务以激活 Restart=always 自愈守护..."
+    systemctl restart ssr-bash-python.service
+    sleep 1.5
+    if systemctl is-active --quiet ssr-bash-python.service; then
+        echo "ShadowsocksR 服务已成功通过 systemd 启动并处于 active 守护中！"
+    else
+        bash /usr/local/shadowsocksr/logrun.sh
+        echo "ShadowsocksR 服务已成功重启并生效！"
+    fi
+elif [ -f /usr/local/shadowsocksr/logrun.sh ]; then
     echo "正在重启 ShadowsocksR 服务以加载最新优化代码..."
     bash /usr/local/shadowsocksr/logrun.sh
     echo "ShadowsocksR 服务已成功重启并生效！"
