@@ -479,19 +479,31 @@ sed -i "s/sspanelv2/mudbjson/g" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/
 sed -i "s/UPDATE_TIME = 60/UPDATE_TIME = 60/g" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/null || true
 sed -i "s/SERVER_PUB_ADDR = '${nowip}'/SERVER_PUB_ADDR = '$(wget -4 -qO- -t1 -T2 ipinfo.io/ip)'/" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/null || true
 
-# 根据本机网络环境自动配置 IPv6 (无 IPv6 则禁用以减半端口与定时器负载)
+# 根据本机网络环境自动配置 IPv6 (无可用公网 IPv6 则禁用以避免断网并节省系统资源)
 ConfigSSR_IPv6(){
+    local has_ipv6=false
+    # 必须拥有全球单播 IPv6 地址 (排除仅有 fe80:: 链路本地地址或 RA 虚拟网关)
+    if command -v ip >/dev/null 2>&1 && ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
+        # 进一步检测外网 IPv6 真实连通性 (避免分配了 IPv6 但路由黑洞或无公网出口)
+        if ping6 -c 1 -w 2 2606:4700:4700::1111 >/dev/null 2>&1 || \
+           ping -6 -c 1 -w 2 2001:4860:4860::8888 >/dev/null 2>&1 || \
+           curl -6 -s -m 2 --head http://www.google.com >/dev/null 2>&1 || \
+           python3 -c "import socket; s=socket.socket(socket.AF_INET6, socket.SOCK_STREAM); s.settimeout(2); s.connect(('2606:4700:4700::1111', 53)); s.close()" >/dev/null 2>&1; then
+            has_ipv6=true
+        fi
+    fi
+
     for cfg in "/usr/local/shadowsocksr/config.json"; do
         [ -f "$cfg" ] || continue
         # 自动修复 fast_open 与 verbose 之间的逗号语法
         sed -i 's/"fast_open"[[:space:]]*:[[:space:]]*false[[:space:]]*$/"fast_open": false,/' "$cfg" 2>/dev/null || true
         sed -i 's/"fast_open"[[:space:]]*:[[:space:]]*true[[:space:]]*$/"fast_open": true,/' "$cfg" 2>/dev/null || true
-        if command -v ip >/dev/null 2>&1 && (ip -6 route show default 2>/dev/null | grep -q . || ip -6 addr show scope global 2>/dev/null | grep -q inet6); then
-            echo "检测到本机支持 IPv6，已开启 SSR IPv6 监听与解析 (::)"
+        if [ "$has_ipv6" = true ]; then
+            echo "检测到本机具备完整且连通的外网 IPv6，已开启 SSR IPv6 监听与解析 (::)"
             sed -i 's/"server_ipv6"[[:space:]]*:[[:space:]]*"[^"]*"/"server_ipv6": "::"/' "$cfg"
             sed -i 's/"dns_ipv6"[[:space:]]*:[[:space:]]*[a-zA-Z]*/"dns_ipv6": true/' "$cfg"
         else
-            echo "未检测到可用 IPv6，已禁用 SSR IPv6 监听与解析以节省系统与端口资源"
+            echo "未检测到有效公网 IPv6 或 IPv6 外网无法连通，已禁用 SSR IPv6 监听与解析以避免断网并节省系统资源"
             sed -i 's/"server_ipv6"[[:space:]]*:[[:space:]]*"[^"]*"/"server_ipv6": ""/' "$cfg"
             sed -i 's/"dns_ipv6"[[:space:]]*:[[:space:]]*[a-zA-Z]*/"dns_ipv6": false/' "$cfg"
         fi
