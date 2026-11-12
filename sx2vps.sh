@@ -299,6 +299,7 @@ def push():
     mud_raw = MUD.read_text()
     time_bytes = TIME.read_bytes()
     payload = {'mudb': mud_raw, 'timelimit_b64': base64.b64encode(time_bytes).decode()}
+    sync_bin_to_peer(c['peer'])
     ssh(c['peer'], BIN + ' apply-config', json.dumps(payload).encode())
     digest = ssr_config_signature(mud_raw, time_bytes)
     atomic_write(WATCH_STATE, (digest + '\n').encode())
@@ -1733,7 +1734,7 @@ trap - EXIT HUP INT TERM
 printf '\n当前同步状态：\n'
 /usr/local/bin/ssr2vps status-report
 /usr/local/bin/xui2vps status-report
-printf '\n主菜单 v1.0.7：\n1、SSR 同步\n2、XUI 同步\n3、同步时间修改\n0、退出\n请选择: '
+printf '\n主菜单 v1.0.8：\n1、SSR 同步\n2、XUI 同步\n3、同步时间修改\n0、退出\n请选择: '
 IFS= read -r choice || choice=
 case "$choice" in
     1) exec /usr/local/bin/ssr2vps menu ;;
