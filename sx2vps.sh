@@ -110,11 +110,32 @@ def apply_peer_unbind():
         p.unlink(missing_ok=True)
 
 
-def restart_ssr():
+def stop_ssr():
     for cmd in (
-        ['systemctl', 'restart', 'ssr-bash-python.service'],
-        ['service', 'ssr-bash-python', 'restart'],
-        ['/etc/init.d/ssr-bash-python', 'restart'],
+        ['systemctl', 'stop', 'ssr-bash-python.service'],
+        ['service', 'ssr-bash-python', 'stop'],
+        ['/etc/init.d/ssr-bash-python', 'stop'],
+    ):
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0:
+                time.sleep(1)
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if Path('/usr/local/shadowsocksr/stop.sh').is_file():
+        subprocess.run(['bash', '/usr/local/shadowsocksr/stop.sh'], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)
+        return True
+    return False
+
+
+def start_ssr():
+    for cmd in (
+        ['systemctl', 'start', 'ssr-bash-python.service'],
+        ['service', 'ssr-bash-python', 'start'],
+        ['/etc/init.d/ssr-bash-python', 'start'],
     ):
         try:
             res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -123,13 +144,15 @@ def restart_ssr():
         except (OSError, subprocess.SubprocessError):
             pass
     if Path('/usr/local/shadowsocksr/logrun.sh').is_file():
-        if Path('/usr/local/shadowsocksr/stop.sh').is_file():
-            subprocess.run(['bash', '/usr/local/shadowsocksr/stop.sh'], check=False,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(['bash', '/usr/local/shadowsocksr/logrun.sh'], check=False,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     return False
+
+
+def restart_ssr():
+    stop_ssr()
+    return start_ssr()
 
 
 def reset_traffic():
@@ -246,6 +269,23 @@ def connect_peer(peer):
     return int(port)
 
 
+def ssr_config_signature(mud_raw, time_raw):
+    """仅对用户配置属性进行哈希，忽略易变流量计数器 (u, d)"""
+    try:
+        data = rows(mud_raw)
+        stable = []
+        for row in data:
+            if isinstance(row, dict):
+                stable.append({k: v for k, v in row.items() if k not in ('u', 'd')})
+            else:
+                stable.append(row)
+        encoded_mud = json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
+    except Exception:
+        encoded_mud = mud_raw if isinstance(mud_raw, bytes) else str(mud_raw).encode()
+    time_bytes = time_raw if isinstance(time_raw, bytes) else str(time_raw).encode()
+    return hashlib.sha256(encoded_mud + b'\0' + time_bytes).hexdigest()
+
+
 def push():
     c = config()
     if c.get('role') != 'master':
@@ -256,15 +296,38 @@ def push():
     master_rows = rows(MUD.read_text())
     enforce_limits(master_rows)
     mud_raw = MUD.read_text()
-    payload = {'mudb': mud_raw, 'timelimit_b64': base64.b64encode(TIME.read_bytes()).decode()}
+    time_bytes = TIME.read_bytes()
+    payload = {'mudb': mud_raw, 'timelimit_b64': base64.b64encode(time_bytes).decode()}
     ssh(c['peer'], BIN + ' apply-config', json.dumps(payload).encode())
+    digest = ssr_config_signature(mud_raw, time_bytes)
+    atomic_write(WATCH_STATE, (digest + '\n').encode())
+
+    # 新建用户基准线初始化为 0，防止首次在副机跑出的流量被当成历史遗留流量吞掉
+    ledger_path = STATE / 'ledger.json'
+    try:
+        ledger = json.loads(ledger_path.read_text())
+    except (FileNotFoundError, ValueError):
+        ledger = {}
+    ledger_changed = False
+    for r in master_rows:
+        k = user_key(r)
+        if k and k not in ledger:
+            ledger[k] = {'u': 0, 'd': 0}
+            ledger_changed = True
+    if ledger_changed:
+        write_json(ledger_path, ledger)
+
     print('主机用户配置和到期数据已同步到副机。')
 
 
 def watch_check():
     if config().get('role') != 'master':
         return
-    digest = hashlib.sha256(MUD.read_bytes() + b'\0' + TIME.read_bytes()).hexdigest()
+    if not MUD.is_file() or not TIME.is_file():
+        return
+    mud_raw = MUD.read_text()
+    time_bytes = TIME.read_bytes()
+    digest = ssr_config_signature(mud_raw, time_bytes)
     try:
         previous = WATCH_STATE.read_text().strip()
     except FileNotFoundError:
@@ -277,6 +340,10 @@ def watch_check():
 def apply_config():
     payload = json.load(sys.stdin)
     incoming = rows(payload['mudb'])
+
+    # 先平稳停止 SSR 服务，确保 SSR 将内存中的实时最新流量完整刷盘到 mudb.json
+    stop_ssr()
+
     existing = rows(MUD.read_text()) if MUD.exists() else []
     old = {user_key(x): x for x in existing}
     # The replica's local traffic counters must not be replaced by master's values.
@@ -286,7 +353,7 @@ def apply_config():
         item['d'] = previous.get('d', 0)
     write_json(MUD, incoming)
     atomic_write(TIME, base64.b64decode(payload['timelimit_b64'], validate=True), 0o600)
-    restart_ssr()
+    start_ssr()
     print('配置已应用。')
 
 
@@ -322,9 +389,13 @@ def merge_traffic():
         last = ledger.setdefault(key, {})
         for field in ('u', 'd'):
             current = max(0, int(peer_row.get(field, 0) or 0))
-            if is_new_user or field not in last:
-                last[field] = current
-                continue
+            if field not in last:
+                # 新建用户且本地流量为 0 时，初始基准线设为 0，避免吞掉副机新跑的流量
+                if is_new_user and int(local[key].get(field, 0) or 0) == 0:
+                    last[field] = 0
+                else:
+                    last[field] = current
+                    continue
             previous = max(0, int(last.get(field, 0) or 0))
             if current < previous:
                 last[field] = current
@@ -1267,11 +1338,14 @@ def merge_traffic_counters(db, remote):
                 current = max(0, int(peer_row.get(field) or 0))
 
                 # IF FIRST TIME ENCOUNTERED:
-                # Set baseline to current replica traffic. Delta is ZERO!
-                # Prevents replica's historical traffic from doubling/summing into master!
+                # If master local traffic is 0 (newly added user/client), baseline is 0 so newly generated traffic is kept!
+                # Otherwise set baseline to current replica traffic to prevent historical traffic from doubling.
                 if is_new_in_ledger or field not in old:
-                    old[field] = current
-                    continue
+                    if is_new_in_ledger and int(local_row.get(field) or 0) == 0:
+                        old[field] = 0
+                    else:
+                        old[field] = current
+                        continue
 
                 previous = max(0, int(old.get(field, 0) or 0))
 
@@ -1658,7 +1732,7 @@ trap - EXIT HUP INT TERM
 printf '\n当前同步状态：\n'
 /usr/local/bin/ssr2vps status-report
 /usr/local/bin/xui2vps status-report
-printf '\n主菜单 v1.0.6：\n1、SSR 同步\n2、XUI 同步\n3、同步时间修改\n0、退出\n请选择: '
+printf '\n主菜单 v1.0.7：\n1、SSR 同步\n2、XUI 同步\n3、同步时间修改\n0、退出\n请选择: '
 IFS= read -r choice || choice=
 case "$choice" in
     1) exec /usr/local/bin/ssr2vps menu ;;
