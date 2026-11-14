@@ -19,6 +19,9 @@ REMOTE_EXTRA_CERT_DIR="/usr/local/h-ui/my_acme_dir/certificates/acme.zerossl.com
 # 本地和远程 v2bx 数据目录路径
 LOCAL_V2BX_DIR="/etc/V2bX"
 REMOTE_V2BX_DIR="/etc/V2bX"
+# 本地和远程 s-ui 数据目录路径
+LOCAL_SUI_DIR="/usr/local/s-ui/db"
+REMOTE_SUI_DIR="/usr/local/s-ui/db"
 HOSTS_FILE="$HOME/.config/kill53-transfer/hosts"
 
 # 检查命令是否存在
@@ -208,6 +211,7 @@ main() {
   echo "3) 证书目录"
   echo "4) xui 数据库"
   echo "5) v2bx 数据"
+  echo "6) sui 数据"
   read -r -p "输入要转移的类型编号（多个用空格分隔，如 1 3 5）: " choices
 
   # 将输入拆分为数组并去重
@@ -223,8 +227,8 @@ main() {
 
   # 验证输入是否有效
   for c in "${unique_choices[@]}"; do
-    if [[ "$c" != "1" && "$c" != "2" && "$c" != "3" && "$c" != "4" && "$c" != "5" ]]; then
-      echo "无效选择: $c。请输入 1-5 之间的数字。" >&2
+    if [[ "$c" != "1" && "$c" != "2" && "$c" != "3" && "$c" != "4" && "$c" != "5" && "$c" != "6" ]]; then
+      echo "无效选择: $c。请输入 1-6 之间的数字。" >&2
       exit 1
     fi
   done
@@ -296,6 +300,16 @@ main() {
         ssh -p "$remote_port" "${remote_user}@${remote_ip}" "mkdir -p '$REMOTE_V2BX_DIR'; if [ -d '$REMOTE_V2BX_DIR' ] && [ \"\$(ls -A '$REMOTE_V2BX_DIR' 2>/dev/null)\" ]; then cp -a '$REMOTE_V2BX_DIR' '${REMOTE_V2BX_DIR}.before-transfer.'\$(date +%Y%m%d%H%M%S); fi"
         rsync -avz -e "ssh -p $remote_port" "${LOCAL_V2BX_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_V2BX_DIR}/"
         ssh -p "$remote_port" "${remote_user}@${remote_ip}" "/bin/systemctl restart V2bX 2>/dev/null || /bin/systemctl restart v2bx 2>/dev/null || true"
+        ;;
+      6)
+        echo "=== 正在转移 sui 数据 ==="
+        if [[ ! -d "$LOCAL_SUI_DIR" ]]; then
+          echo "本地目录未找到: $LOCAL_SUI_DIR" >&2
+          exit 1
+        fi
+        ssh -p "$remote_port" "${remote_user}@${remote_ip}" "mkdir -p '$REMOTE_SUI_DIR'; if [ -d '$REMOTE_SUI_DIR' ] && [ \"\$(ls -A '$REMOTE_SUI_DIR' 2>/dev/null)\" ]; then cp -a '$REMOTE_SUI_DIR' '${REMOTE_SUI_DIR}.before-transfer.'\$(date +%Y%m%d%H%M%S); fi"
+        rsync -avz -e "ssh -p $remote_port" "${LOCAL_SUI_DIR}/" "${remote_user}@${remote_ip}:${REMOTE_SUI_DIR}/"
+        ssh -p "$remote_port" "${remote_user}@${remote_ip}" "/bin/systemctl restart sui 2>/dev/null || /bin/systemctl restart s-ui 2>/dev/null || true"
         ;;
     esac
   done
