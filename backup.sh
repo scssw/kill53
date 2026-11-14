@@ -6,7 +6,7 @@
 # 2. 自动检测并安装 rsync、cron、curl 等必要依赖
 # 3. 自动识别本机公网 IP 并提取末两位
 # 4. 使用标准的 ssh-keygen 与 ssh-copy-id 原生交互免密方式记住密码
-# 5. 菜单支持 1~3 多选 (如 "1 2") 以及 4 自定义目录
+# 5. 菜单支持 1、2、3、5 多选组合，以及 4 自定义目录
 # 6. 自动写入 crontab 定时备份任务并在远程主机预建目录
 # ==============================================================================
 
@@ -232,11 +232,12 @@ choose_backup_tasks() {
     echo " 2、备份xui        (/etc/x-ui/ -> /root/backup/x-ui/${IP_TAIL}xui)"
     echo " 3、备份hui        (/usr/local/h-ui/data/ -> /root/backup/hui/${IP_TAIL}hui)"
     echo " 4、备份指定目录   (如 /usr/share/awk -> /root/backup/usr/share/awk/${IP_TAIL}any)"
+    echo " 5、备份sui        (/usr/local/s-ui/db/ -> /root/backup/s-ui/${IP_TAIL}sui)"
     echo "========================================================"
-    echo "说明: 1~3 选项可组合多选，例如输入 '1 2' 或 '1 3' 即可同时配置多个任务"
+    echo "说明: 1~3、5 选项可组合多选，例如输入 '1 2'、'1 5' 或 '1 2 3 5' 即可同时配置多个任务"
     echo ""
 
-    read_input -rp "请输入选项编号 (如 1 或 1 2 或 4): " user_choice
+    read_input -rp "请输入选项编号 (如 1 或 1 2 或 1 5 或 4): " user_choice
 
     if [[ -z "$user_choice" ]]; then
         echo_err "未输入任何选项，退出。"
@@ -292,6 +293,13 @@ choose_backup_tasks() {
                 remote_mkdir "$dest_dir"
                 local cron_cmd="3 */4 * * * rsync -avz ${rsync_ssh_arg}${src} ${REMOTE_USER}@${REMOTE_HOST}:${dest_dir}"
                 add_cron_job "$cron_cmd" "4、备份指定目录 ${custom_dir} (每4小时第3分钟)"
+                ;;
+            5)
+                local src="/usr/local/s-ui/db/"
+                local dest_dir="/root/backup/s-ui/${IP_TAIL}sui"
+                remote_mkdir "$dest_dir"
+                local cron_cmd="3 */5 * * * rsync -avz ${rsync_ssh_arg}${src} ${REMOTE_USER}@${REMOTE_HOST}:${dest_dir}"
+                add_cron_job "$cron_cmd" "5、备份sui (每5小时第3分钟)"
                 ;;
             *)
                 echo_warn "忽略未知选项: $c"
