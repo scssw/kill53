@@ -250,18 +250,40 @@ sync_iptables_rules_file() {
         return 0
     fi
 
-    tmp_file="$(mktemp)"
-    backup_file="${IPTABLES_RULES_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+    # Never replace the whole SSR rules file with iptables-save output: it may
+    # contain persistent rules which are not currently loaded. Add only the
+    # SSH allow rule, keeping every other line intact.
+    if grep -Eq '^-A INPUT .*--dport 22.*-j ACCEPT([[:space:]]|$)' "$IPTABLES_RULES_FILE"; then
+        echo "$IPTABLES_RULES_FILE 已有 TCP/22 放行规则，未改动其他规则。"
+        return 0
+    fi
 
-    if iptables_save_cmd > "$tmp_file"; then
-        cp -a "$IPTABLES_RULES_FILE" "$backup_file"
+    tmp_file="$(mktemp "${IPTABLES_RULES_FILE}.tmp.XXXXXX")"
+    backup_file="${IPTABLES_RULES_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a "$IPTABLES_RULES_FILE" "$backup_file"
+    if awk '
+        BEGIN { in_filter = 0; inserted = 0 }
+        /^\*filter[[:space:]]*$/ { in_filter = 1; print; next }
+        /^\*/ && $0 !~ /^\*filter[[:space:]]*$/ { in_filter = 0 }
+        in_filter && !inserted && /^-A INPUT[[:space:]]/ {
+            print "-A INPUT -p tcp --dport 22 -j ACCEPT"
+            inserted = 1
+        }
+        in_filter && !inserted && /^COMMIT[[:space:]]*$/ {
+            print "-A INPUT -p tcp --dport 22 -j ACCEPT"
+            inserted = 1
+        }
+        { print }
+        END { if (!inserted) exit 2 }
+    ' "$IPTABLES_RULES_FILE" > "$tmp_file"; then
+        chmod --reference="$IPTABLES_RULES_FILE" "$tmp_file" 2>/dev/null || chmod 600 "$tmp_file"
+        chown --reference="$IPTABLES_RULES_FILE" "$tmp_file" 2>/dev/null || true
         mv "$tmp_file" "$IPTABLES_RULES_FILE"
-        chmod 600 "$IPTABLES_RULES_FILE" 2>/dev/null || true
-        echo "已同步当前 iptables 规则到：$IPTABLES_RULES_FILE"
-        echo "旧规则备份为：$backup_file"
+        echo "已仅向 $IPTABLES_RULES_FILE 的 filter/INPUT 增补 TCP/22 放行规则。"
+        echo "原文件备份为：$backup_file"
     else
         rm -f "$tmp_file"
-        echo "警告：同步 $IPTABLES_RULES_FILE 失败，请检查 iptables-save。"
+        echo "警告：未能在 $IPTABLES_RULES_FILE 的 filter 表中安全添加 TCP/22；原文件保持不变。"
     fi
 }
 
@@ -438,6 +460,12 @@ restore_open() {
         iptables_cmd -F "$CHAIN"
         iptables_cmd -X "$CHAIN"
     fi
+
+    # Put an unconditional SSH allow before any later INPUT restrictions.
+    while iptables_cmd -C INPUT -p tcp --dport "$PORT" -j ACCEPT >/dev/null 2>&1; do
+        iptables_cmd -D INPUT -p tcp --dport "$PORT" -j ACCEPT
+    done
+    iptables_cmd -I INPUT 1 -p tcp --dport "$PORT" -j ACCEPT
 
     rm -f "$WHITELIST_FILE" "$RESTORE_HOOK" "$APPLY_SCRIPT"
     echo "已恢复：22 端口不再使用白名单限制。"
