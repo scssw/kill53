@@ -415,11 +415,11 @@ def merge_traffic():
 def install_units():
     systemd = '''[Unit]\nDescription=Push SSR2VPS master configuration after local data changes\n\n[Path]\nPathChanged=/usr/local/shadowsocksr/mudb.json\nPathChanged=/usr/local/SSR-Bash-Python/timelimit.db\nUnit=ssr2vps-watch.service\n\n[Install]\nWantedBy=multi-user.target\n'''
     service = '''[Unit]\nDescription=Synchronize SSR2VPS configuration\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/ssr2vps watch-check\n'''
-    timer = '''[Unit]\nDescription=Merge replica SSR traffic every 66 minutes\n\n[Timer]\nOnBootSec=66min\nOnUnitActiveSec=66min\nAccuracySec=1s\nUnit=ssr2vps-traffic.service\n\n[Install]\nWantedBy=timers.target\n'''
+    timer = '''[Unit]\nDescription=Merge replica SSR traffic every 10 minutes\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=10min\nAccuracySec=1s\nUnit=ssr2vps-traffic.service\n\n[Install]\nWantedBy=timers.target\n'''
     night = '''[Unit]\nDescription=Merge SSR2VPS replica traffic\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/ssr2vps merge-traffic\n'''
-    sync_timer = '''[Unit]\nDescription=Check whether SSR2VPS peer remains bound\n\n[Timer]\nOnBootSec=15s\nOnUnitActiveSec=30s\nUnit=ssr2vps-sync.service\n\n[Install]\nWantedBy=timers.target\n'''
+    sync_timer = '''[Unit]\nDescription=Check whether SSR2VPS peer remains bound\n\n[Timer]\nOnBootSec=1min\nOnUnitActiveSec=5min\nUnit=ssr2vps-sync.service\n\n[Install]\nWantedBy=timers.target\n'''
     sync_service = '''[Unit]\nDescription=Check SSR2VPS peer binding\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/ssr2vps peer-status\n'''
-    watch_timer = '''[Unit]\nDescription=Check SSR2VPS master data for missed file events\n\n[Timer]\nOnBootSec=10s\nOnUnitActiveSec=10s\nAccuracySec=1s\nUnit=ssr2vps-watch.service\n\n[Install]\nWantedBy=timers.target\n'''
+    watch_timer = '''[Unit]\nDescription=Check SSR2VPS master data for missed file events\n\n[Timer]\nOnBootSec=30s\nOnUnitActiveSec=30s\nAccuracySec=1s\nUnit=ssr2vps-watch.service\n\n[Install]\nWantedBy=timers.target\n'''
     for path, content in ((PATH_UNIT, systemd), (SERVICE_UNIT, service), (WATCH_TIMER_UNIT, watch_timer), (TIMER_UNIT, timer), (NIGHT_UNIT, night), (SYNC_TIMER_UNIT, sync_timer), ('/etc/systemd/system/ssr2vps-sync.service', sync_service)):
         Path(path).write_text(content)
     subprocess.run(['systemctl', 'daemon-reload'], check=True)
@@ -1546,8 +1546,8 @@ def merge_traffic():
 def install_units():
     path_content = '''[Unit]\nDescription=Watch x-ui SQLite database for xui2vps changes\n\n[Path]\nPathChanged=/etc/x-ui/x-ui.db\nPathModified=/etc/x-ui/x-ui.db\nPathChanged=/etc/x-ui/x-ui.db-wal\nPathModified=/etc/x-ui/x-ui.db-wal\nUnit=xui2vps-watch.service\n\n[Install]\nWantedBy=multi-user.target\n'''
     service = '''[Unit]\nDescription=Synchronize x-ui configuration to xui2vps replica\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/xui2vps push-if-changed\n'''
-    timer = '''[Unit]\nDescription=Merge xui2vps replica traffic every 64 minutes\n\n[Timer]\nOnBootSec=64min\nOnUnitActiveSec=64min\nAccuracySec=1s\nUnit=xui2vps-traffic.service\n\n[Install]\nWantedBy=timers.target\n'''
-    sync_timer = '''[Unit]\nDescription=Retry xui2vps configuration sync\n\n[Timer]\nOnBootSec=10s\nOnUnitActiveSec=15s\nUnit=xui2vps-watch.service\n\n[Install]\nWantedBy=timers.target\n'''
+    timer = '''[Unit]\nDescription=Merge xui2vps replica traffic every 10 minutes\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=10min\nAccuracySec=1s\nUnit=xui2vps-traffic.service\n\n[Install]\nWantedBy=timers.target\n'''
+    sync_timer = '''[Unit]\nDescription=Retry xui2vps configuration sync\n\n[Timer]\nOnBootSec=30s\nOnUnitActiveSec=30s\nUnit=xui2vps-watch.service\n\n[Install]\nWantedBy=timers.target\n'''
     night = '''[Unit]\nDescription=Merge xui2vps replica traffic\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/xui2vps merge-traffic\n'''
     for path, content in ((PATH_UNIT, path_content), (SERVICE_UNIT, service),
                           (TIMER_UNIT, timer), (NIGHT_UNIT, night),
@@ -1734,7 +1734,7 @@ trap - EXIT HUP INT TERM
 printf '\n当前同步状态：\n'
 /usr/local/bin/ssr2vps status-report
 /usr/local/bin/xui2vps status-report
-printf '\n主菜单 v1.0.8：\n1、SSR 同步\n2、XUI 同步\n3、同步时间修改\n0、退出\n请选择: '
+printf '\n主菜单 v1.0.9：\n1、SSR 同步\n2、XUI 同步\n3、同步时间修改\n0、退出\n请选择: '
 IFS= read -r choice || choice=
 case "$choice" in
     1) exec /usr/local/bin/ssr2vps menu ;;
