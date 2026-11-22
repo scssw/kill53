@@ -8,6 +8,7 @@
 # 4. 使用标准的 ssh-keygen 与 ssh-copy-id 原生交互免密方式记住密码
 # 5. 菜单支持 1、2、3、5 多选组合，以及 4 自定义目录
 # 6. 自动写入 crontab 定时备份任务并在远程主机预建目录
+# 7. 首次设置时立即执行一次远程全量同步备份
 # ==============================================================================
 
 # 颜色输出定义
@@ -200,6 +201,32 @@ remote_mkdir() {
     ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$REMOTE_PORT" -o StrictHostKeyChecking=no "${REMOTE_USER}@${REMOTE_HOST}" "mkdir -p '$target_dir'" 2>/dev/null
 }
 
+# 辅助函数：首次设置时立即执行一次远程备份
+perform_initial_backup() {
+    local src="$1"
+    local dest_dir="$2"
+    local title="$3"
+
+    echo_info "正在执行首次备份到远程主机: [${title}]..."
+    if [ ! -d "$src" ]; then
+        echo_warn "本地目录 ${src} 尚不存在，正在为您自动创建..."
+        mkdir -p "$src"
+    fi
+
+    local sync_cmd=(rsync -avz)
+    if [ "$REMOTE_PORT" != "22" ]; then
+        sync_cmd+=(-e "ssh -p ${REMOTE_PORT}")
+    fi
+    sync_cmd+=("${src}" "${REMOTE_USER}@${REMOTE_HOST}:${dest_dir}")
+
+    if "${sync_cmd[@]}"; then
+        echo_success "首次备份完成: [${title}]"
+    else
+        echo_warn "首次备份未能完全成功，请检查网络或权限。定时任务仍已添加，后续将按计划继续尝试备份。"
+    fi
+    echo ""
+}
+
 # 辅助函数：添加定时任务到 crontab（避免重复）
 add_cron_job() {
     local cron_line="$1"
@@ -261,23 +288,29 @@ choose_backup_tasks() {
             1)
                 local src="/root/backup/"
                 local dest_dir="/root/backup/${IP_TAIL}ssr"
+                local desc="1、备份ssr (每1小时第3分钟)"
                 remote_mkdir "$dest_dir"
                 local cron_cmd="3 */1 * * * rsync -avz ${rsync_ssh_arg}${src} ${REMOTE_USER}@${REMOTE_HOST}:${dest_dir}"
-                add_cron_job "$cron_cmd" "1、备份ssr (每1小时第3分钟)"
+                add_cron_job "$cron_cmd" "$desc"
+                perform_initial_backup "$src" "$dest_dir" "1、备份ssr"
                 ;;
             2)
                 local src="/etc/x-ui/"
                 local dest_dir="/root/backup/x-ui/${IP_TAIL}xui"
+                local desc="2、备份xui (每2小时第3分钟)"
                 remote_mkdir "$dest_dir"
                 local cron_cmd="3 */2 * * * rsync -avz ${rsync_ssh_arg}${src} ${REMOTE_USER}@${REMOTE_HOST}:${dest_dir}"
-                add_cron_job "$cron_cmd" "2、备份xui (每2小时第3分钟)"
+                add_cron_job "$cron_cmd" "$desc"
+                perform_initial_backup "$src" "$dest_dir" "2、备份xui"
                 ;;
             3)
                 local src="/usr/local/h-ui/data/"
                 local dest_dir="/root/backup/hui/${IP_TAIL}hui"
+                local desc="3、备份hui (每3小时第3分钟)"
                 remote_mkdir "$dest_dir"
                 local cron_cmd="3 */3 * * * rsync -avz ${rsync_ssh_arg}${src} ${REMOTE_USER}@${REMOTE_HOST}:${dest_dir}"
-                add_cron_job "$cron_cmd" "3、备份hui (每3小时第3分钟)"
+                add_cron_job "$cron_cmd" "$desc"
+                perform_initial_backup "$src" "$dest_dir" "3、备份hui"
                 ;;
             4)
                 echo ""
@@ -290,16 +323,20 @@ choose_backup_tasks() {
                 local clean_dir="${custom_dir%/}"
                 local src="${clean_dir}/"
                 local dest_dir="/root/backup${clean_dir}/${IP_TAIL}any"
+                local desc="4、备份指定目录 ${custom_dir} (每4小时第3分钟)"
                 remote_mkdir "$dest_dir"
                 local cron_cmd="3 */4 * * * rsync -avz ${rsync_ssh_arg}${src} ${REMOTE_USER}@${REMOTE_HOST}:${dest_dir}"
-                add_cron_job "$cron_cmd" "4、备份指定目录 ${custom_dir} (每4小时第3分钟)"
+                add_cron_job "$cron_cmd" "$desc"
+                perform_initial_backup "$src" "$dest_dir" "4、备份指定目录 (${custom_dir})"
                 ;;
             5)
                 local src="/usr/local/s-ui/db/"
                 local dest_dir="/root/backup/s-ui/${IP_TAIL}sui"
+                local desc="5、备份sui (每5小时第3分钟)"
                 remote_mkdir "$dest_dir"
                 local cron_cmd="3 */5 * * * rsync -avz ${rsync_ssh_arg}${src} ${REMOTE_USER}@${REMOTE_HOST}:${dest_dir}"
-                add_cron_job "$cron_cmd" "5、备份sui (每5小时第3分钟)"
+                add_cron_job "$cron_cmd" "$desc"
+                perform_initial_backup "$src" "$dest_dir" "5、备份sui"
                 ;;
             *)
                 echo_warn "忽略未知选项: $c"
@@ -321,7 +358,7 @@ main() {
 
     echo ""
     echo "========================================================"
-    echo_success "所有选定的备份任务已配置完成！"
+    echo_success "所有选定的备份任务已配置完成，并已执行首次同步！"
     echo "当前 VPS 的 Crontab 任务列表如下："
     echo "--------------------------------------------------------"
     crontab -l | grep rsync || echo "未找到 rsync 任务"
