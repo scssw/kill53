@@ -523,7 +523,7 @@ sync_data() {
     fi
   else
     for path in "${paths[@]}"; do
-      ssh -p "$port" "$remote" "rsync -aHAX --numeric-ids -e 'ssh -p ${LOCAL_SSH_PORT}' '${path}' 'root@${LOCAL_IP}:${path}'"
+      rsync -aHAX --numeric-ids -e "ssh -p ${port}" "${remote}:${path}" "$path"
     done
     if [ "$TRANSFER_MODE" = "ssr" ] || [ "$TRANSFER_MODE" = "both" ]; then
       systemctl restart ssr-bash-python.service
@@ -686,7 +686,7 @@ prompt_local_ip() {
   done
 
   while true; do
-    read -r -p "请输入 A/本机 SSH 端口（B 机传回数据到此端口） [当前: ${default_port}] (直接回车保持不变)：" port_input
+    read -r -p "请输入 A/本机 SSH 端口 [当前: ${default_port}] (直接回车保持不变)：" port_input
     port_input="${port_input:-$default_port}"
     if [[ "$port_input" =~ ^[0-9]+$ ]] && [ "$port_input" -ge 1 ] && [ "$port_input" -le 65535 ]; then
       LOCAL_SSH_PORT="$port_input"
@@ -981,7 +981,7 @@ change_local_ip() {
   echo "=========================================="
   echo "A/本机信息已修改为：${LOCAL_IP} (SSH 端口: ${LOCAL_SSH_PORT})"
   echo "后续定时任务传回时会将 ${DOMAINS:-$DOMAIN} 的 A 记录指向 ${LOCAL_IP}。"
-  echo "注意：B 机传回数据时会连接 A 机的 ${LOCAL_SSH_PORT} 端口，请确保防火墙已放行对应端口。"
+  echo "数据传回将由本机（A 机）直接从目标服务器（B 机）拉取同步。"
   echo "=========================================="
 }
 
