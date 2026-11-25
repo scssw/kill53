@@ -1,8 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ACME="$HOME/.acme.sh/acme.sh"
+ACME_HOME="$HOME/.acme.sh"
+ACME="$ACME_HOME/acme.sh"
+PORT80_LIB="$ACME_HOME/port80_lib.sh"
+RENEW_SCRIPT="$ACME_HOME/renew_port80.sh"
+RENEW_LOG="$ACME_HOME/renew_port80.log"
 
+if [ ! -x "$ACME" ]; then
+  echo "Installing acme.sh..."
+  curl https://get.acme.sh | sh
+fi
+
+mkdir -p "$ACME_HOME"
+
+write_port80_lib() {
+  cat > "$PORT80_LIB" <<'EOF'
 PAUSED_KEYS=()
 PAUSED_LABELS=()
 PAUSED_START_CMDS=()
@@ -73,8 +86,6 @@ cleanup_on_signal() {
   fi
   exit 130
 }
-
-trap cleanup_on_signal INT TERM
 
 is_port80_in_use() {
   if command -v ss >/dev/null 2>&1; then
@@ -459,16 +470,167 @@ ensure_port80_free() {
       echo "Paused service(s) can be started manually with:"
       print_paused_start_commands
     fi
-    exit 1
+    return 1
   fi
 
   echo "Port 80 is now free."
 }
+EOF
+}
+
+write_renew_script() {
+  local q_acme_home q_acme q_lib
+  printf -v q_acme_home '%q' "$ACME_HOME"
+  printf -v q_acme '%q' "$ACME"
+  printf -v q_lib '%q' "$PORT80_LIB"
+
+  cat > "$RENEW_SCRIPT" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\${PATH:-}"
+
+ACME_HOME=$q_acme_home
+ACME=$q_acme
+PORT80_LIB=$q_lib
+
+# shellcheck source=/dev/null
+source "\$PORT80_LIB"
+EOF
+
+  cat >> "$RENEW_SCRIPT" <<'EOF'
+
+force_mode=0
+if [ "${1:-}" = "--force" ]; then
+  force_mode=1
+fi
+
+has_due_certs() {
+  local now conf next_renew cert_file
+  now="$(date +%s)"
+  shopt -s nullglob
+  for conf in "$ACME_HOME"/*/*.conf; do
+    [ -f "$conf" ] || continue
+    grep -q '^Le_Domain=' "$conf" 2>/dev/null || continue
+    next_renew="$(sed -n 's/^Le_NextRenewTime=//p' "$conf" | tr -d "'\"[:space:]" | head -n1)"
+    if [ -n "$next_renew" ] && [ "$next_renew" -eq "$next_renew" ] 2>/dev/null; then
+      if [ "$now" -ge "$next_renew" ]; then
+        shopt -u nullglob
+        return 0
+      fi
+    else
+      cert_file="${conf%.conf}.cer"
+      if [ -f "$cert_file" ] && command -v openssl >/dev/null 2>&1; then
+        if ! openssl x509 -in "$cert_file" -noout -checkend $((30 * 86400)) >/dev/null 2>&1; then
+          shopt -u nullglob
+          return 0
+        fi
+      fi
+    fi
+  done
+  shopt -u nullglob
+  return 1
+}
 
 if [ ! -x "$ACME" ]; then
-  echo "Installing acme.sh..."
-  curl https://get.acme.sh | sh
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] acme.sh not found at $ACME"
+  exit 1
 fi
+
+if [ "$force_mode" -eq 0 ] && ! has_due_certs; then
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] No certificates due for renewal."
+  exit 0
+fi
+
+echo "=== [$(date '+%Y-%m-%d %H:%M:%S')] Starting certificate renewal ==="
+trap 'resume_paused_services' EXIT INT TERM
+
+if ! ensure_port80_free; then
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] Could not free port 80 for renewal."
+  exit 1
+fi
+
+rc=0
+if [ "$force_mode" -eq 1 ]; then
+  "$ACME" --cron --home "$ACME_HOME" --force || rc=$?
+else
+  "$ACME" --cron --home "$ACME_HOME" || rc=$?
+fi
+
+resume_paused_services
+echo "=== [$(date '+%Y-%m-%d %H:%M:%S')] Renewal finished (exit: $rc) ==="
+exit "$rc"
+EOF
+  chmod +x "$RENEW_SCRIPT"
+}
+
+setup_auto_renew_task() {
+  local q_script q_log cron_line existing_cron filtered_cron new_cron
+  write_renew_script
+
+  printf -v q_script '%q' "$RENEW_SCRIPT"
+  printf -v q_log '%q' "$RENEW_LOG"
+  cron_line="15 3 * * * /bin/bash $q_script >> $q_log 2>&1 # acme-port80-auto-renew"
+
+  if command -v crontab >/dev/null 2>&1; then
+    existing_cron="$(crontab -l 2>/dev/null || true)"
+    filtered_cron="$(printf '%s\n' "$existing_cron" | grep -v '# acme-port80-auto-renew' | grep -v 'acme\.sh --cron' || true)"
+    if [ -n "$filtered_cron" ]; then
+      new_cron="${filtered_cron}"$'\n'"${cron_line}"
+    else
+      new_cron="${cron_line}"
+    fi
+    if printf '%s\n' "$new_cron" | crontab -; then
+      echo "Auto-renewal cron task configured (daily at 03:15):"
+      echo "  $cron_line"
+      echo "Renewal script: $RENEW_SCRIPT"
+      echo "Renewal log:    $RENEW_LOG"
+      return 0
+    fi
+  fi
+
+  if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
+    cat > /etc/systemd/system/acme-port80-renew.service <<EOF
+[Unit]
+Description=Renew acme.sh certificates with port 80 management
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $q_script
+StandardOutput=append:$RENEW_LOG
+StandardError=append:$RENEW_LOG
+EOF
+
+    cat > /etc/systemd/system/acme-port80-renew.timer <<'EOF'
+[Unit]
+Description=Daily acme.sh certificate renewal with port 80 management
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=1800
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now acme-port80-renew.timer
+    echo "Auto-renewal systemd timer configured (acme-port80-renew.timer)."
+    echo "Renewal script: $RENEW_SCRIPT"
+    echo "Renewal log:    $RENEW_LOG"
+    return 0
+  fi
+
+  echo "[WARN] Could not configure crontab or systemd timer automatically."
+  echo "Add the following cron job manually:"
+  echo "  $cron_line"
+}
+
+write_port80_lib
+# shellcheck source=/dev/null
+source "$PORT80_LIB"
+trap cleanup_on_signal INT TERM
 
 read -r -p "Enter domain: " domain
 if [ -z "${domain}" ]; then
@@ -476,7 +638,7 @@ if [ -z "${domain}" ]; then
   exit 1
 fi
 
-if [ ! -f "$HOME/.acme.sh/account.conf" ]; then
+if [ ! -f "$ACME_HOME/account.conf" ]; then
   email_prefix=$(tr -dc 'a-z0-9' </dev/urandom | head -c 8)
   email="${email_prefix}@gmail.com"
   "$ACME" --register-account -m "$email"
@@ -485,7 +647,9 @@ else
   echo "Account already exists. Skipping account registration."
 fi
 
-ensure_port80_free
+if ! ensure_port80_free; then
+  exit 1
+fi
 
 echo "Issuing certificate for $domain..."
 if "$ACME" --issue -d "$domain" --standalone; then
@@ -534,6 +698,20 @@ else
   echo "Set reload command manually if needed."
 fi
 
-"$ACME" --renew-all --force >/dev/null 2>&1 || true
+echo ""
+setup_renew=""
+read -r -p "是否自动建立到期续期任务（自动检测并暂停/恢复80端口服务）？[Y/n] (直接回车默认建立): " setup_renew || setup_renew=""
+setup_renew="${setup_renew:-Y}"
+case "$setup_renew" in
+  [Yy]|[Yy][Ee][Ss])
+    setup_auto_renew_task
+    ;;
+  [Nn]|[Nn][Oo])
+    echo "Skipped auto-renewal task setup."
+    ;;
+  *)
+    echo "Unrecognized choice '$setup_renew', skipping auto-renewal task setup."
+    ;;
+esac
 
 echo "Done."
