@@ -502,100 +502,27 @@ sync_file_to_target() {
 }
 
 restore_ssr_iptables_ports() {
-  local direction="$1"
-  local mudb_file="$2"
-  local port="${TARGET_PORT:-22}"
-  local remote="root@${TARGET_IP}"
-  local py_script
-
-  # 仅按 mudb.json 增量补放行缺失的 SSR 端口（TCP/UDP），绝不清空或覆盖现有规则，
-  # 并将新规则插在「IP 限制/黑名单/安全链」之后、无条件兜底 DROP/REJECT 之前，
-  # 最后以当前完整 live 规则持久化到 /etc/iptables.up.rules。
-  read -r -d '' py_script <<'PY' || true
-import json
-import os
-import re
-import shutil
-import subprocess
-import sys
-
-mudb_file = sys.argv[1]
-if not os.path.isfile(mudb_file):
-    print(f"[WARN] 未找到 SSR 配置文件，跳过端口放行：{mudb_file}", file=sys.stderr)
-    sys.exit(0)
-
-if not shutil.which("iptables"):
-    print("[WARN] 系统未安装 iptables，跳过端口放行。", file=sys.stderr)
-    sys.exit(0)
-
-with open(mudb_file, "r", encoding="utf-8") as f:
-    data = json.load(f)
-
-ports = sorted({
-    int(item["port"])
-    for item in data
-    if isinstance(item, dict) and str(item.get("port", "")).isdigit() and 1 <= int(item["port"]) <= 65535
-})
-
-if not ports:
-    print("[INFO] mudb.json 中未发现有效 SSR 端口，跳过防火墙更新。")
-    sys.exit(0)
-
-def find_catchall_line():
-    res = subprocess.run(["iptables", "-S", "INPUT"], capture_output=True, text=True, check=False)
-    if res.returncode != 0:
-        return None
-    rule_idx = 0
-    for line in res.stdout.splitlines():
-        line = line.strip()
-        if not line.startswith("-A INPUT "):
-            continue
-        rule_idx += 1
-        if re.fullmatch(r"-A INPUT -j (?:DROP|REJECT)(?:\s+--reject-with\s+\S+)?", line):
-            return rule_idx
-    return None
-
-def rule_exists(proto, port):
-    candidates = [
-        ["iptables", "-C", "INPUT", "-m", "state", "--state", "NEW", "-m", proto, "-p", proto, "--dport", str(port), "-j", "ACCEPT"],
-        ["iptables", "-C", "INPUT", "-p", proto, "-m", proto, "--dport", str(port), "-m", "state", "--state", "NEW", "-j", "ACCEPT"],
-        ["iptables", "-C", "INPUT", "-p", proto, "-m", "conntrack", "--ctstate", "NEW", "--dport", str(port), "-j", "ACCEPT"],
-        ["iptables", "-C", "INPUT", "-p", proto, "--dport", str(port), "-j", "ACCEPT"],
-    ]
-    for cmd in candidates:
-        if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-            return True
-    return False
-
-added = 0
-for port in ports:
-    for proto in ("tcp", "udp"):
-        if rule_exists(proto, port):
-            continue
-        insert_pos = find_catchall_line()
-        if insert_pos is not None:
-            cmd = ["iptables", "-I", "INPUT", str(insert_pos), "-m", "state", "--state", "NEW", "-m", proto, "-p", proto, "--dport", str(port), "-j", "ACCEPT"]
-        else:
-            cmd = ["iptables", "-A", "INPUT", "-m", "state", "--state", "NEW", "-m", proto, "-p", proto, "--dport", str(port), "-j", "ACCEPT"]
-        subprocess.run(cmd, check=True)
-        added += 1
-
-if shutil.which("iptables-save"):
-    res = subprocess.run(["iptables-save"], capture_output=True, text=True, check=True)
-    tmp_path = "/etc/iptables.up.rules.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(res.stdout)
-    os.replace(tmp_path, "/etc/iptables.up.rules")
-
-print(f"[OK] 已校验 {len(ports)} 个 SSR 端口，补放行 {added} 条规则（已保留原有 IP 限制及安全规则），并同步保存至 /etc/iptables.up.rules。")
-PY
-
+  local direction="$1" mudb="$2" port="${TARGET_PORT:-22}" remote="root@${TARGET_IP}" cmd
+  read -r -d '' cmd <<'EOF' || true
+command -v iptables >/dev/null 2>&1 || exit 0
+[ -f "$1" ] || exit 0
+for p in $(python3 -c 'import json,sys;print(" ".join(sorted({str(u["port"]) for u in json.load(open(sys.argv[1])) if isinstance(u,dict) and str(u.get("port","")).isdigit() and 1<=int(u["port"])<=65535})))' "$1"); do
+  for t in tcp udp; do
+    iptables -C INPUT -m state --state NEW -m "$t" -p "$t" --dport "$p" -j ACCEPT 2>/dev/null && continue
+    pos=$(iptables -S INPUT | awk '/^-A INPUT /{n++} /^-A INPUT -j (DROP|REJECT)( --reject-with [^ ]+)?$/{print n; exit}')
+    if [ -n "$pos" ]; then
+      iptables -I INPUT "$pos" -m state --state NEW -m "$t" -p "$t" --dport "$p" -j ACCEPT
+    else
+      iptables -A INPUT -m state --state NEW -m "$t" -p "$t" --dport "$p" -j ACCEPT
+    fi
+  done
+done
+command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.up.rules
+EOF
   if [ "$direction" = "out" ]; then
-    local quoted_file
-    printf -v quoted_file '%q' "$mudb_file"
-    ssh -p "$port" "$remote" "python3 - ${quoted_file}" <<< "$py_script"
+    ssh -p "$port" "$remote" bash -s -- "$mudb" <<< "$cmd"
   else
-    python3 - "$mudb_file" <<< "$py_script"
+    bash -s -- "$mudb" <<< "$cmd"
   fi
 }
 
@@ -1212,9 +1139,11 @@ show_menu() {
   echo "8、启动定时转移"
   echo "9、修改转移数据"
   echo "10、修改 A/本机 IP 及端口"
+  echo "11、立即传送到目标"
+  echo "12、立即从目标传回"
   echo "0、退出"
   echo
-  read -r -p "请输入选项 [0-10]：" choice
+  read -r -p "请输入选项 [0-12]：" choice
 
   case "$choice" in
     1) setup_switch ;;
@@ -1227,6 +1156,8 @@ show_menu() {
     8) resume_transfer ;;
     9) change_transfer_mode ;;
     10) change_local_ip ;;
+    11) run_job out ;;
+    12) run_job back ;;
     0) exit 0 ;;
     *) echo "无效选项。" && exit 1 ;;
   esac
