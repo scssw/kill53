@@ -59,31 +59,31 @@ urlencode() {
 json_first_id() {
   python3 -c 'import json, sys
 try:
-    d = json.load(sys.stdin)
-    r = d.get("result") or []
-    print(r[0].get("id", "") if d.get("success") and r else "")
+  d = json.load(sys.stdin)
+  r = d.get("result") or []
+  print(r[0].get("id", "") if d.get("success") and r else "")
 except Exception:
-    print("")'
+  print("")'
 }
 
 json_success() {
   python3 -c 'import json, sys
 try:
-    d = json.load(sys.stdin)
-    print("1" if d.get("success") else "0")
+  d = json.load(sys.stdin)
+  print("1" if d.get("success") else "0")
 except Exception:
-    print("0")'
+  print("0")'
 }
 
 json_errors() {
   python3 -c 'import json, sys
 try:
-    d = json.load(sys.stdin)
-    errors = d.get("errors") or []
-    messages = [e.get("message", str(e)) for e in errors]
-    print("; ".join(messages) if messages else "未知错误")
+  d = json.load(sys.stdin)
+  errors = d.get("errors") or []
+  messages = [e.get("message", str(e)) for e in errors]
+  print("; ".join(messages) if messages else "未知错误")
 except Exception:
-    print("解析返回结果失败")'
+  print("解析返回结果失败")'
 }
 
 cf_api() {
@@ -188,7 +188,7 @@ normalize_domains() {
     item="${item#https://}"
     item="${item%%/*}"
     item="${item%,}"
-    item="${item,,}"
+    item="${item#,}"
     [[ "$item" == *.* ]] || item="${item}.ssrr.today"
     [[ "$item" =~ ^[a-z0-9.-]+$ ]] || return 1
     [[ "$item" == *.* ]] || return 1
@@ -300,7 +300,7 @@ check_cron_status() {
     display_line="${display_line%% #*}"
     echo "运行中 (${display_line})"
   elif is_cron_paused; then
-    echo "已暂停 (可按 8 恢复启动)"
+    echo "已暂停（可按 8 恢复启动）"
   else
     echo "未设置"
   fi
@@ -414,7 +414,7 @@ setup_ssh_login() {
   local port="${TARGET_PORT:-22}"
 
   echo
-  echo "开始配置 SSH 免密登录：${target} (端口: ${port})"
+  echo "开始配置 SSH 免密登录：${target}（端口：${port}）"
   echo "下面可能会要求输入一次目标服务器 root 密码，用来写入公钥。"
 
   ensure_ssh_key
@@ -498,7 +498,105 @@ sync_file_to_target() {
   fi
 
   rsync -avz -e "ssh -p ${port}" "$source_file" "root@${TARGET_IP}:${source_file}"
-  echo "${label} 已同步到：root@${TARGET_IP}:${source_file} (端口: ${port})"
+  echo "${label} 已同步到：root@${TARGET_IP}:${source_file}（端口：${port}）"
+}
+
+restore_ssr_iptables_ports() {
+  local direction="$1"
+  local mudb_file="$2"
+  local port="${TARGET_PORT:-22}"
+  local remote="root@${TARGET_IP}"
+  local py_script
+
+  # 仅按 mudb.json 增量补放行缺失的 SSR 端口（TCP/UDP），绝不清空或覆盖现有规则，
+  # 并将新规则插在「IP 限制/黑名单/安全链」之后、无条件兜底 DROP/REJECT 之前，
+  # 最后以当前完整 live 规则持久化到 /etc/iptables.up.rules。
+  read -r -d '' py_script <<'PY' || true
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+mudb_file = sys.argv[1]
+if not os.path.isfile(mudb_file):
+    print(f"[WARN] 未找到 SSR 配置文件，跳过端口放行：{mudb_file}", file=sys.stderr)
+    sys.exit(0)
+
+if not shutil.which("iptables"):
+    print("[WARN] 系统未安装 iptables，跳过端口放行。", file=sys.stderr)
+    sys.exit(0)
+
+with open(mudb_file, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+ports = sorted({
+    int(item["port"])
+    for item in data
+    if isinstance(item, dict) and str(item.get("port", "")).isdigit() and 1 <= int(item["port"]) <= 65535
+})
+
+if not ports:
+    print("[INFO] mudb.json 中未发现有效 SSR 端口，跳过防火墙更新。")
+    sys.exit(0)
+
+def find_catchall_line():
+    res = subprocess.run(["iptables", "-S", "INPUT"], capture_output=True, text=True, check=False)
+    if res.returncode != 0:
+        return None
+    rule_idx = 0
+    for line in res.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("-A INPUT "):
+            continue
+        rule_idx += 1
+        if re.fullmatch(r"-A INPUT -j (?:DROP|REJECT)(?:\s+--reject-with\s+\S+)?", line):
+            return rule_idx
+    return None
+
+def rule_exists(proto, port):
+    candidates = [
+        ["iptables", "-C", "INPUT", "-m", "state", "--state", "NEW", "-m", proto, "-p", proto, "--dport", str(port), "-j", "ACCEPT"],
+        ["iptables", "-C", "INPUT", "-p", proto, "-m", proto, "--dport", str(port), "-m", "state", "--state", "NEW", "-j", "ACCEPT"],
+        ["iptables", "-C", "INPUT", "-p", proto, "-m", "conntrack", "--ctstate", "NEW", "--dport", str(port), "-j", "ACCEPT"],
+        ["iptables", "-C", "INPUT", "-p", proto, "--dport", str(port), "-j", "ACCEPT"],
+    ]
+    for cmd in candidates:
+        if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            return True
+    return False
+
+added = 0
+for port in ports:
+    for proto in ("tcp", "udp"):
+        if rule_exists(proto, port):
+            continue
+        insert_pos = find_catchall_line()
+        if insert_pos is not None:
+            cmd = ["iptables", "-I", "INPUT", str(insert_pos), "-m", "state", "--state", "NEW", "-m", proto, "-p", proto, "--dport", str(port), "-j", "ACCEPT"]
+        else:
+            cmd = ["iptables", "-A", "INPUT", "-m", "state", "--state", "NEW", "-m", proto, "-p", proto, "--dport", str(port), "-j", "ACCEPT"]
+        subprocess.run(cmd, check=True)
+        added += 1
+
+if shutil.which("iptables-save"):
+    res = subprocess.run(["iptables-save"], capture_output=True, text=True, check=True)
+    tmp_path = "/etc/iptables.up.rules.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(res.stdout)
+    os.replace(tmp_path, "/etc/iptables.up.rules")
+
+print(f"[OK] 已校验 {len(ports)} 个 SSR 端口，补放行 {added} 条规则（已保留原有 IP 限制及安全规则），并同步保存至 /etc/iptables.up.rules。")
+PY
+
+  if [ "$direction" = "out" ]; then
+    local quoted_file
+    printf -v quoted_file '%q' "$mudb_file"
+    ssh -p "$port" "$remote" "python3 - ${quoted_file}" <<< "$py_script"
+  else
+    python3 - "$mudb_file" <<< "$py_script"
+  fi
 }
 
 sync_data() {
@@ -513,9 +611,10 @@ sync_data() {
   if [ "$direction" = "out" ]; then
     for path in "${paths[@]}"; do
       [ -e "$path" ] || { echo "待同步路径不存在：$path" >&2; return 1; }
-      rsync -aHAX --numeric-ids -e "ssh -p ${port}" "$path" "${remote}:$path"
+      rsync -aHAX --numeric-ids -e "ssh -p ${port}" "$path" "${remote}:${path}"
     done
     if [ "$TRANSFER_MODE" = "ssr" ] || [ "$TRANSFER_MODE" = "both" ]; then
+      restore_ssr_iptables_ports out "$SSR_FILE"
       ssh -p "$port" "$remote" "systemctl restart ssr-bash-python.service"
     fi
     if [ "$TRANSFER_MODE" = "xui" ] || [ "$TRANSFER_MODE" = "both" ]; then
@@ -526,6 +625,7 @@ sync_data() {
       rsync -aHAX --numeric-ids -e "ssh -p ${port}" "${remote}:${path}" "$path"
     done
     if [ "$TRANSFER_MODE" = "ssr" ] || [ "$TRANSFER_MODE" = "both" ]; then
+      restore_ssr_iptables_ports back "$SSR_FILE"
       systemctl restart ssr-bash-python.service
     fi
     if [ "$TRANSFER_MODE" = "xui" ] || [ "$TRANSFER_MODE" = "both" ]; then
@@ -558,7 +658,7 @@ run_job() {
 prompt_switch_time() {
   local current="${1:-}"
   local input time_res
-  local prompt_str="请输入每天切换时间的小时 (0-23，如 16 为 16:00)"
+  local prompt_str="请输入每天切换时间的小时（0-23，如 16 为 16:00）"
   if [ -n "$current" ]; then
     prompt_str+=" [当前记录: ${current}] (直接回车保持不变)"
   fi
@@ -574,7 +674,7 @@ prompt_switch_time() {
       printf '%s\n' "$time_res"
       return 0
     fi
-    echo "时间输入无效！只需输入小时 (0-23，如 16 表示 16:00) 或 HH:MM。"
+    echo "时间输入无效！只需输入小时（0-23，如 16 表示 16:00）或 HH:MM。"
   done
 }
 
@@ -584,7 +684,7 @@ prompt_domain() {
   if [ -n "${DOMAINS:-${DOMAIN:-}}" ]; then
     domain_prompt+=" [当前记录: ${DOMAINS:-$DOMAIN}] (直接回车保持不变)"
   else
-    domain_prompt+=" (例 uscn2 natus，或输入完整域名)"
+    domain_prompt+="（例 uscn2 natus，或输入完整域名）"
   fi
   domain_prompt+="："
 
@@ -670,7 +770,7 @@ prompt_local_ip() {
   local ip_input port_input
 
   while true; do
-    local ip_prompt="请输入 A/本机公网 IPv4（传回时域名将指向此地址）"
+    local ip_prompt="请输入 A/本机公网 IPv4 (传回时域名将指向此地址)"
     if [ -n "$default_ip" ]; then
       ip_prompt+=" [当前: ${default_ip}] (直接回车保持不变)"
     fi
@@ -704,7 +804,7 @@ prompt_cf_api() {
   fi
 
   while true; do
-    local api_prompt="请输入域名 API (Cloudflare API Token 或 Global API Key)"
+    local api_prompt="请输入域名 API（Cloudflare API Token 或 Global API Key）"
     if [ "$has_saved" -eq 1 ]; then
       api_prompt+=" [当前已保存] (直接回车保持不变)"
     fi
@@ -745,7 +845,7 @@ prompt_cf_api() {
           read -r -p "是否仍然保存该 API？(y/n) [y]: " confirm_save
           confirm_save="${confirm_save:-y}"
           if [[ ! "$confirm_save" =~ ^[Yy]$ ]]; then
-            echo "请重新输入域名 API！"
+            echo "请重新输入域名 API ！"
             continue
           fi
         fi
@@ -792,12 +892,12 @@ prompt_cf_api() {
         if zone_id="$(find_zone_id "$DOMAIN" 2>/dev/null)"; then
           echo "[OK] 域名匹配成功，Zone ID: ${zone_id}"
         else
-          echo "警告：Global API Key 校验通过，但未找到域名 ${DOMAIN} 的有效 Zone。"
+          echo "警告：Global API Key 校验通过，但未能找到域名 ${DOMAIN} 的有效 Zone。"
           echo "请确保该域名已接入此 Cloudflare 账号。"
           read -r -p "是否仍然保存该 API？(y/n) [y]: " confirm_save
           confirm_save="${confirm_save:-y}"
           if [[ ! "$confirm_save" =~ ^[Yy]$ ]]; then
-            echo "请重新输入域名 API！"
+            echo "请重新输入域名 API ！"
             continue
           fi
         fi
@@ -823,7 +923,7 @@ prompt_target_ip_and_port() {
     if [ -n "$current_ip" ]; then
       ip_prompt+=" [当前记录: ${current_ip}] (直接回车保持不变)"
     else
-      ip_prompt+=" (例 38.76.188.74)"
+      ip_prompt+="（例 38.76.188.74）"
     fi
     ip_prompt+="："
 
@@ -839,7 +939,7 @@ prompt_target_ip_and_port() {
 
     TARGET_IP="$ip_input"
     while true; do
-      read -r -p "请输入 B 机 SSH 端口（传送和回传都会使用） [当前: ${current_port}]：" port_input
+      read -r -p "请输入 B 机 SSH 端口（传送和回传都会使用） [当前: ${current_port}]:" port_input
       port_input="${port_input:-$current_port}"
       if ! [[ "$port_input" =~ ^[0-9]+$ ]] || [ "$port_input" -lt 1 ] || [ "$port_input" -gt 65535 ]; then
         echo "端口号无效，请输入 1-65535 之间的数字。"
@@ -852,7 +952,7 @@ prompt_target_ip_and_port() {
         return 0
       fi
       echo "警告：目标 ${TARGET_IP}:${port_input} 无法连通。"
-      read -r -p "仍然使用此端口？(y 使用 / n 重输端口 / r 重输 IP) [n]：" retry_choice
+      read -r -p "仍然使用此端口？(y 使用 / n 重输端口 / r 重输 IP) [n]:" retry_choice
       case "${retry_choice:-n}" in
         [Yy]) TARGET_PORT="$port_input"; return 0 ;;
         [Rr]) break ;;
@@ -866,9 +966,9 @@ setup_switch() {
   require_base_cmds
   load_config_silent
 
-  echo "=========================================="
-  echo "        配置定时切换与数据同步"
-  echo "=========================================="
+  echo "========================================"
+  echo "          配置定时切换与数据同步"
+  echo "========================================"
 
   # A 机负责传送与传回两个定时动作。
   read -r SWITCH_TIME RETURN_TIME <<< "$(prompt_schedule_times)"
@@ -893,16 +993,16 @@ setup_switch() {
   install_cron "$SWITCH_TIME" "$RETURN_TIME"
 
   echo
-  echo "=========================================="
+  echo "========================================"
   echo "设置完成！配置信息已保存至 ${CONFIG_PATH}"
-  echo "每天北京时间 ${SWITCH_TIME}：同步 ${TRANSFER_MODE} 到 B (${TARGET_IP})、重启 B 上对应服务，再将域名 ${DOMAINS} 指向 B。"
-  echo "每天北京时间 ${RETURN_TIME}：从 B 同步回 A (${LOCAL_IP})、重启 A 上对应服务，再将域名 ${DOMAINS} 指回 A。"
+  echo "每天北京时间 ${SWITCH_TIME}：同步 ${TRANSFER_MODE} 到 B (${TARGET_IP})、补放行 SSR 端口并重启 B 上对应服务，再将域名 ${DOMAINS} 指向 B。"
+  echo "每天北京时间 ${RETURN_TIME}：从 B 同步回 A (${LOCAL_IP})、补放行 SSR 端口并重启 A 上对应服务，再将域名 ${DOMAINS} 指向 A。"
   echo
   echo "配置文件：$CONFIG_PATH"
   echo "执行脚本：$INSTALL_PATH"
   echo "日志文件：$LOG_PATH"
-  echo "手动执行传送：$INSTALL_PATH --out；传回：$INSTALL_PATH --back（当前为 root 时直接运行）"
-  echo "=========================================="
+  echo "手动执行传送：$INSTALL_PATH --out ; 传回：$INSTALL_PATH --back (当前为 root 时直接运行)"
+  echo "========================================"
 
   setup_ssh_login || true
 }
@@ -954,7 +1054,7 @@ change_target_ip() {
   install_self
   write_config "${TRANSFER_ENABLED:-1}"
 
-  echo "目标信息已修改为：${TARGET_IP} (SSH 端口: ${TARGET_PORT:-22})"
+  echo "目标信息已修改为：${TARGET_IP} (SSH 端口：${TARGET_PORT:-22})"
   echo "后续定时任务会将 ${DOMAINS:-$DOMAIN} 的 A 记录切换到 ${TARGET_IP}。"
 
   if [ "${TRANSFER_ENABLED:-1}" = "1" ]; then
@@ -972,17 +1072,17 @@ change_local_ip() {
     return 1
   fi
 
-  echo "当前 A/本机地址：${LOCAL_IP:-未设置} (SSH 端口: ${LOCAL_SSH_PORT:-22})"
+  echo "当前 A/本机地址：${LOCAL_IP:-未设置} (SSH 端口：${LOCAL_SSH_PORT:-22})"
   prompt_local_ip
 
   install_self
   write_config "${TRANSFER_ENABLED:-1}"
 
-  echo "=========================================="
-  echo "A/本机信息已修改为：${LOCAL_IP} (SSH 端口: ${LOCAL_SSH_PORT})"
+  echo "========================================"
+  echo "A/本机信息已修改为：${LOCAL_IP} (SSH 端口：${LOCAL_SSH_PORT})"
   echo "后续定时任务传回时会将 ${DOMAINS:-$DOMAIN} 的 A 记录指向 ${LOCAL_IP}。"
   echo "数据传回将由本机（A 机）直接从目标服务器（B 机）拉取同步。"
-  echo "=========================================="
+  echo "========================================"
 }
 
 upgrade_script_only() {
@@ -1043,11 +1143,11 @@ pause_transfer() {
   CRON_PAUSED="1"
   write_config "${TRANSFER_ENABLED:-1}"
 
-  echo "=========================================="
+  echo "========================================"
   echo "定时转移任务已暂停！"
   echo "定时任务在 crontab 中已注释保留（未丢失），配置信息已完整保留。"
   echo "随时可以通过菜单【8、启动定时转移】一键恢复运行。"
-  echo "=========================================="
+  echo "========================================"
 }
 
 resume_transfer() {
@@ -1071,37 +1171,37 @@ resume_transfer() {
   write_config "${TRANSFER_ENABLED:-1}"
   install_cron "$SWITCH_TIME" "$RETURN_TIME"
 
-  echo "=========================================="
+  echo "========================================"
   echo "定时转移任务已启动！"
   echo "每天北京时间 ${SWITCH_TIME} 传送、${RETURN_TIME} 传回。"
   echo "当前状态：$(check_cron_status)"
-  echo "=========================================="
+  echo "========================================"
 }
 
 show_menu() {
   load_config_silent
 
-  echo "=========================================="
+  echo "========================================"
   echo "      定时切换服务器域名和 SSR 数据"
-  echo "=========================================="
+  echo "========================================"
   if [ -n "${DOMAINS:-${DOMAIN:-}}" ] && [ -n "${TARGET_IP:-}" ]; then
     echo "【当前配置记录】"
-    echo "  • 切换域名: ${DOMAINS:-$DOMAIN}"
-    echo "  • 目标地址: ${TARGET_IP} (SSH 端口: ${TARGET_PORT:-22})"
-    echo "  • 传送时间: 每天 ${SWITCH_TIME:-未设置}（北京时间）"
-    echo "  • 传回时间: 每天 ${RETURN_TIME:-未设置}（北京时间）"
-    echo "  • A 机地址: ${LOCAL_IP:-未设置} (SSH 端口: ${LOCAL_SSH_PORT:-22})"
+    echo "  • 切换域名：${DOMAINS:-$DOMAIN}"
+    echo "  • 目标地址：${TARGET_IP} (SSH 端口：${TARGET_PORT:-22})"
+    echo "  • 传送时间：每天 ${SWITCH_TIME:-未设置} (北京时间)"
+    echo "  • 传回时间：每天 ${RETURN_TIME:-未设置} (北京时间)"
+    echo "  • A 机地址：${LOCAL_IP:-未设置} (SSH 端口：${LOCAL_SSH_PORT:-22})"
     if [ "${CF_AUTH_TYPE:-token}" = "global_key" ]; then
-      echo "  • 认证方式: Global API Key (${CF_EMAIL})"
+      echo "  • 认证方式：Global API Key (${CF_EMAIL})"
     else
-      echo "  • 认证方式: API Token"
+      echo "  • 认证方式：API Token"
     fi
-    echo "  • 数据同步: ${TRANSFER_MODE:-ssr}"
-    echo "  • 定时任务: $(check_cron_status)"
+    echo "  • 数据同步：${TRANSFER_MODE:-ssr}"
+    echo "  • 定时任务：$(check_cron_status)"
   else
     echo "【当前配置记录】暂无保存的配置记录"
   fi
-  echo "=========================================="
+  echo "========================================"
   echo "1、设置定时切换域名和数据"
   echo "2、取消转移数据设置"
   echo "3、取消所有所有设置"
