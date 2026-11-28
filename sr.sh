@@ -476,7 +476,7 @@ fi
 nowip=$(grep -E -o "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/null || echo "127.0.0.1")
 sed -i "s/API_INTERFACE[[:space:]]*=.*/API_INTERFACE = 'mudbjson'/" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/null || true
 sed -i "s/sspanelv2/mudbjson/g" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/null || true
-sed -i "s/UPDATE_TIME = 10/UPDATE_TIME = 10/g" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/null || true
+sed -i "s/UPDATE_TIME = .*/UPDATE_TIME = 10/g" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/null || true
 sed -i "s/SERVER_PUB_ADDR = '${nowip}'/SERVER_PUB_ADDR = '$(wget -4 -qO- -t1 -T2 ipinfo.io/ip)'/" /usr/local/shadowsocksr/userapiconfig.py 2>/dev/null || true
 
 # 根据本机网络环境自动配置 IPv6 (无可用公网 IPv6 则禁用以避免断网并节省系统资源)
